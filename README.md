@@ -87,3 +87,21 @@ Next step before spending another hardware cycle: capture a fresh crash
 dump under this exact session's build (same FIT, same trampoline, same
 `appsbl-ram-boot.bin`) and re-derive `TARGET_STACK_ADDR`/
 `MEMCPY_OWN_LR_ADDR` from that, instead of reusing an older dump's `sp`.
+
+**Update:** `make run-04` (`04-full-frame-redirect`) rules out one
+candidate explanation. It reproduces the *exact* real frame shapes -
+`memcpy_sim` (`push {r4,r5,lr}` / `pop {r4,r5,pc}`) called from
+`handle_upfile_sim` (`push {r4,r5,r6,r7,r8,lr}` / `pop {r4,r5,r6,r7,r8,pc}`)
+- and applies the real payload's exact byte pattern (memcpy's own saved-lr
+left untouched, the 20-byte r4-r8 gap filled with `0xFF`, redirect planted
+at handle_upfile's saved-pc slot) to the live nested stack. The redirect
+reaches `stub` every time, even with r4-r8 clobbered - so the control-flow
+mechanic and the "0xFF over unused saved registers is harmless" assumption
+are both sound in isolation. The real-hardware failure isn't explained by
+the frame-shape mechanic being wrong; it's either an offset-precision issue
+(the live `sp` not matching what the offsets assume as precisely as the
+19-byte-close `bytes_acked` stall suggested) or the write onto that live
+region triggering *some* hazard independent of content, the same way the
+appsbl project's `.text`-overlay test showed a write-triggered (not
+value-triggered) hazard. Unresolved - needs either a fresh, session-exact
+crash dump or hardware instrumentation QEMU can't provide.
