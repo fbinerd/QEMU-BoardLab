@@ -65,3 +65,25 @@ make run-02  # stack-redirect proof of concept
 
 Each experiment prints PASS/FAIL plus an explanation to stdout via ARM
 semihosting, then exits QEMU.
+
+## Status: `03-trampoline` tested on real hardware, crashes identically (offsets need a fresh baseline)
+
+The current `src/03-trampoline/gen_payload.py` (which preserves `memcpy()`'s
+own saved-lr, fixing the first hardware attempt's bug) was tested 4x on real
+hardware - identical crash every time (`pc=00000002`, `lr=0x4a97f6af`,
+`sp=0x4a822860`, matching the un-fixed overlay approach exactly). Full
+writeup in the sibling `appsbl` project's `CLEAN_ROOM_STATUS.md` ("trampolim
+testado em hardware" section), but the key finding: instrumenting the upload
+with `ss -tin` (TCP socket stats, no root needed) shows the transfer's
+`bytes_acked` stalls within 19 bytes of `gen_payload.py`'s calculated
+`TARGET_UPFILE_COUNT` - not near `text_base` like the original overlay
+theory predicted. The stall point tracks *our chosen target*, not a fixed
+hardware address, which points at hitting the CPU's actual live stack (only
+32 bytes from the `sp` in the crash dump the offsets were derived from) with
+a 4-byte value that isn't landing cleanly - not the `.text` self-overwrite
+hazard experiment 01/02 were modeling.
+
+Next step before spending another hardware cycle: capture a fresh crash
+dump under this exact session's build (same FIT, same trampoline, same
+`appsbl-ram-boot.bin`) and re-derive `TARGET_STACK_ADDR`/
+`MEMCPY_OWN_LR_ADDR` from that, instead of reusing an older dump's `sp`.
