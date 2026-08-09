@@ -43,7 +43,14 @@
 #define MR80X_UART_SIZE     0x1000
 
 #define MR80X_GCC_BASE      0x01800000
-#define MR80X_GCC_SIZE      (256 * KiB)
+/* Sized to cover every GCC_* register seen in ipq5018.h from
+ * 0x01800000 up through the PCIe clock block at 0x01876050 (GEPHY
+ * clock/reset at 0x01856000+, the whole GMAC clock block at
+ * 0x01868000+, SDCC1 at 0x01842004, QPIC_IO_MACRO at 0x01857010, USB
+ * at 0x0183E0xx) - all plain read-modify-write or CMD_RCGR-poll
+ * registers, no special per-register modeling needed beyond the
+ * generic latch-and-readback + always-clear-bit0 behavior below. */
+#define MR80X_GCC_SIZE      (1 * MiB)
 
 /* ---- SMEM (arch/arm/cpu/armv7/qca/common/smem.c) ----
  * Real hardware has SBL populate this before appsbl ever runs; since we
@@ -69,6 +76,51 @@
  * real machid among ~18 near-identical board DTS files (BRINGUP-NOTES.md
  * section 7). */
 #define MR80X_TARGET_MACHID       0x0F040000
+
+/* SMEM_BOOT_FLASH_TYPE and friends (board/qca/arm/ipq5018/ipq5018.h's
+ * smem_mem_type_t) - board_f.c's enable_caches() only calls
+ * dcache_enable() (which sets up the MMU with an identity-mapped page
+ * table - a VMSA/ARMv7-A prerequisite for treating RAM as Normal
+ * rather than Device memory) when smem_get_boot_flash()'s flash_type
+ * comes back nonzero; the vendor's own comment there says "Skips
+ * dcache_enable during JTAG recovery" - i.e. this IS the real,
+ * intentional degraded-boot path for "no valid flash info available",
+ * which is exactly our situation without faking it. Without the MMU,
+ * QEMU's VMSA translation-disabled model architecturally treats all
+ * memory as Device type, which enforces alignment unconditionally
+ * regardless of SCTLR.A - this is *why* an unaligned STRH inside
+ * lib/uip/dns.c's dns_init() (a struct uip_udp_conn field landing on
+ * an odd address - sizeof(struct uip_udp_conn)==9, so every other
+ * array slot is unaligned) took a genuine alignment fault. Confirmed
+ * this isn't a QEMU CPU-model quirk (tried both cortex-a15 and
+ * cortex-a7, identical fault) and is architecturally correct behavior
+ * per target/arm/tcg/hflags.c's aprofile_require_alignment() - the fix
+ * is getting appsbl to enable its own MMU the same way it would on
+ * real hardware (which always has valid SMEM flash info), not working
+ * around the alignment check. */
+#define MR80X_SMEM_FLASH_TYPE_TYPE         498
+#define MR80X_SMEM_FLASH_INDEX_TYPE        499
+#define MR80X_SMEM_FLASH_CHIP_SELECT_TYPE  500
+#define MR80X_SMEM_FLASH_BLOCK_SIZE_TYPE   501
+#define MR80X_SMEM_FLASH_DENSITY_TYPE      502
+#define MR80X_SMEM_BOOT_NAND_FLASH         2
+#define MR80X_SMEM_FLASH_DATA_OFF 0x4100 /* clear of the machid data slot */
+
+/* SMEM_AARM_PARTITION_TABLE (=9) - a nonzero flash_type routes
+ * board_init() into the `default:` switch case (see board_init.c),
+ * which calls smem_ptable_init() and treats *that* failing as fatal
+ * ("cdp: SMEM init failed", aborts the whole initcall sequence) -
+ * unlike the flash_type read itself, which fails softly. struct
+ * smem_ptable { u32 magic[2]; u32 version; u32 len; struct smem_ptn
+ * parts[32]; } (arch/arm/cpu/armv7/qca/common/smem.c) - only the
+ * magic needs to be right and len can stay 0 (no partitions - nothing
+ * downstream needs to actually resolve one by name for this board's
+ * boot to keep going, only for smem_ptable_init() to return success). */
+#define MR80X_SMEM_PTABLE_TYPE      9
+#define MR80X_SMEM_PTABLE_DATA_OFF  0x4200
+#define MR80X_SMEM_PTABLE_SIZE      912
+#define MR80X_SMEM_PTABLE_MAGIC_1   0x55ee73aa
+#define MR80X_SMEM_PTABLE_MAGIC_2   0xe35ebddb
 
 /* GCC BLSP1 UART1 clock registers (ipq5018.h) - offsets are absolute
  * addresses in the vendor header; store relative to MR80X_GCC_BASE. */
@@ -172,9 +224,19 @@ static uint64_t mr80x_gcc_read(void *opaque, hwaddr offset, unsigned size)
     MR80XGccState *s = opaque;
     uint32_t val = s->regs[offset / 4];
 
-    if (offset == GCC_BLSP1_UART1_APPS_CMD_RCGR) {
-        val &= ~UART1_CMD_RCGR_UPDATE_BIT;
-    }
+    /* Bit 0 (UPDATE) is the busy/in-progress flag every *_CMD_RCGR
+     * register in this whole GCC block uses (ipq5018.h has ~18 of
+     * them - UART, GMAC x4, SDCC1, QPIC_IO_MACRO, USB x4, PCIe x4 -
+     * same convention throughout, not worth enumerating each one by
+     * address). Always reporting it clear means every driver's
+     * "trigger update, wait for hardware to finish" loop (e.g.
+     * uart1_trigger_update(), the GMAC clock equivalent) exits on its
+     * first read instead of spinning - fine since we have no real
+     * clock tree to actually finish switching. Registers that aren't
+     * a CMD_RCGR don't have driver code that depends on their bit 0
+     * meaning "busy", so clearing it unconditionally is harmless for
+     * them too. */
+    val &= ~UART1_CMD_RCGR_UPDATE_BIT;
     return val;
 }
 
@@ -234,6 +296,98 @@ static void mr80x_timer_write(void *opaque, hwaddr offset, uint64_t value,
 static const MemoryRegionOps mr80x_timer_ops = {
     .read = mr80x_timer_read,
     .write = mr80x_timer_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/* ============================================================
+ * IPQ5018 MDIO controller (drivers/net/ipq5018/ipq5018_mdio.c/.h) -
+ * base 0x88000 (this is what the boot log's "Invalid read/write at
+ * addr 0x88040/0x88044/0x88050" was: MDIO_CTRL_0/1/4_REG unmapped).
+ * board_eth_init() -> ipq_gmac_init() identifies each PHY by reading
+ * its MII_PHYSID1/2 (regnum 2/3) over this controller and switching on
+ * the result; returning the GEPHY ID (0x004DD0C0, from
+ * arch-ipq5018/ipq5018_gmac.h) for the phy_address gmac1_cfg uses (7,
+ * same in both ipq5018-emulation.dts and every real board dts checked)
+ * makes it take the simple internal-PHY init path
+ * (ipq_gephy_phy_init()) instead of needing the external RTL8367
+ * switch chip - deliberately NOT emulating that chip (BRINGUP-NOTES.md
+ * section 6 originally scoped Ethernet as DesignWare-only; this MDIO
+ * detour turned out to be the actual gate, discovered empirically, not
+ * anticipated from static reading alone).
+ * Any other phy_address gets 0xFFFF (standard "nothing answered"
+ * value) - GMAC1/gmac2_cfg's switch-dependent path is left to fail
+ * the same way it already was.
+ * ============================================================ */
+
+#define MR80X_MDIO_BASE   0x88000
+#define MR80X_MDIO_SIZE   0x1000
+#define MDIO_CTRL_0_REG   0x40
+#define MDIO_CTRL_1_REG   0x44
+#define MDIO_CTRL_2_REG   0x48
+#define MDIO_CTRL_3_REG   0x4c
+#define MDIO_CTRL_4_REG   0x50
+#define MDIO_CTRL_4_ACCESS_BUSY 0x10000
+
+#define MR80X_GEPHY_PHY_ADDR 7
+#define MR80X_GEPHY_ID       0x004DD0C0
+
+typedef struct MR80XMdioState {
+    MemoryRegion iomem;
+    uint32_t ctrl1;   /* holds (mii_id << 8 | regnum) from the last write */
+    uint32_t result;  /* precomputed read result, latched on CTRL_4 START */
+} MR80XMdioState;
+
+static uint64_t mr80x_mdio_read(void *opaque, hwaddr offset, unsigned size)
+{
+    MR80XMdioState *s = opaque;
+
+    switch (offset) {
+    case MDIO_CTRL_3_REG:
+        return s->result;
+    case MDIO_CTRL_4_REG:
+        return 0; /* never busy - the wait_busy() poll loop exits immediately */
+    default:
+        return 0;
+    }
+}
+
+static void mr80x_mdio_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    MR80XMdioState *s = opaque;
+
+    switch (offset) {
+    case MDIO_CTRL_1_REG:
+        s->ctrl1 = (uint32_t)value;
+        break;
+    case MDIO_CTRL_4_REG: {
+        unsigned mii_id = (s->ctrl1 >> 8) & 0x1f;
+        unsigned regnum = s->ctrl1 & 0xff;
+
+        if (mii_id == MR80X_GEPHY_PHY_ADDR && regnum == 2) {
+            s->result = (MR80X_GEPHY_ID >> 16) & 0xffff;
+        } else if (mii_id == MR80X_GEPHY_PHY_ADDR && regnum == 3) {
+            s->result = MR80X_GEPHY_ID & 0xffff;
+        } else if (mii_id == MR80X_GEPHY_PHY_ADDR && regnum == 17) {
+            /* GEPHY_PHY_SPEC_STATUS (drivers/net/ipq_common/ipq_gephy.h):
+             * report link up, full duplex, 100Mbps -
+             * GEPHY_STATUS_LINK_PASS(0x400) | FULL_DUPLEX(0x2000) |
+             * SPEED_100MBS(0x80). */
+            s->result = 0x2480;
+        } else {
+            s->result = 0xffff;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps mr80x_mdio_ops = {
+    .read = mr80x_mdio_read,
+    .write = mr80x_mdio_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
@@ -354,6 +508,28 @@ static void mr80x_uart_event(void *opaque, QEMUChrEvent event) {}
  * Machine init
  * ============================================================ */
 
+/* Writes one smem_alloc_info entry (allocated=1, offset, size=8) plus
+ * a single little-endian uint32 payload at that offset - the shape
+ * every SMEM_BOOT_FLASH_* read uses (smem_read_alloc_entry() is always
+ * called with len=sizeof(uint32_t), padded to 8 by its own
+ * (len+7)&~7 formula). */
+static void mr80x_smem_fake_u32_entry(unsigned type, hwaddr data_off,
+                                       uint32_t value)
+{
+    uint32_t v;
+    hwaddr entry = MR80X_SMEM_BASE + MR80X_SMEM_ALLOC_INFO_OFF + type * 16;
+
+    v = cpu_to_le32(1);
+    cpu_physical_memory_write(entry + 0, &v, 4);
+    v = cpu_to_le32(data_off);
+    cpu_physical_memory_write(entry + 4, &v, 4);
+    v = cpu_to_le32(8);
+    cpu_physical_memory_write(entry + 8, &v, 4);
+
+    v = cpu_to_le32(value);
+    cpu_physical_memory_write(MR80X_SMEM_BASE + data_off, &v, 4);
+}
+
 static void mr80x_reset(void *opaque)
 {
     ARMCPU *cpu = opaque;
@@ -396,6 +572,68 @@ static void mr80x_init(MachineState *machine)
             MR80X_SMEM_BASE + MR80X_SMEM_MACHID_DATA_OFF + 4, &v, 4);
     }
 
+    /* Fake SMEM_BOOT_FLASH_* so enable_caches() actually enables the
+     * MMU/D-cache instead of taking the "JTAG recovery" no-MMU path -
+     * see the comment by MR80X_SMEM_FLASH_TYPE_TYPE above. */
+    mr80x_smem_fake_u32_entry(MR80X_SMEM_FLASH_TYPE_TYPE,
+                               MR80X_SMEM_FLASH_DATA_OFF,
+                               MR80X_SMEM_BOOT_NAND_FLASH);
+    mr80x_smem_fake_u32_entry(MR80X_SMEM_FLASH_INDEX_TYPE,
+                               MR80X_SMEM_FLASH_DATA_OFF + 0x10, 0);
+    mr80x_smem_fake_u32_entry(MR80X_SMEM_FLASH_CHIP_SELECT_TYPE,
+                               MR80X_SMEM_FLASH_DATA_OFF + 0x20, 0);
+    mr80x_smem_fake_u32_entry(MR80X_SMEM_FLASH_BLOCK_SIZE_TYPE,
+                               MR80X_SMEM_FLASH_DATA_OFF + 0x30, 0x20000);
+    mr80x_smem_fake_u32_entry(MR80X_SMEM_FLASH_DENSITY_TYPE,
+                               MR80X_SMEM_FLASH_DATA_OFF + 0x40,
+                               128 * 1024 * 1024);
+
+    /* SMEM_AARM_PARTITION_TABLE - see the comment by
+     * MR80X_SMEM_PTABLE_TYPE above. Rest of the 912-byte struct
+     * (len=0 partitions) is left as already-zeroed fresh RAM. */
+    {
+        uint32_t v;
+        hwaddr entry = MR80X_SMEM_BASE + MR80X_SMEM_ALLOC_INFO_OFF +
+                        MR80X_SMEM_PTABLE_TYPE * 16;
+        hwaddr data = MR80X_SMEM_BASE + MR80X_SMEM_PTABLE_DATA_OFF;
+
+        v = cpu_to_le32(1);
+        cpu_physical_memory_write(entry + 0, &v, 4);
+        v = cpu_to_le32(MR80X_SMEM_PTABLE_DATA_OFF);
+        cpu_physical_memory_write(entry + 4, &v, 4);
+        v = cpu_to_le32(MR80X_SMEM_PTABLE_SIZE);
+        cpu_physical_memory_write(entry + 8, &v, 4);
+
+        v = cpu_to_le32(MR80X_SMEM_PTABLE_MAGIC_1);
+        cpu_physical_memory_write(data + 0, &v, 4);
+        v = cpu_to_le32(MR80X_SMEM_PTABLE_MAGIC_2);
+        cpu_physical_memory_write(data + 4, &v, 4);
+        v = cpu_to_le32(1); /* version */
+        cpu_physical_memory_write(data + 8, &v, 4);
+        v = cpu_to_le32(1); /* len - one partition: 0:APPSBLENV */
+        cpu_physical_memory_write(data + 12, &v, 4);
+
+        /* struct smem_ptn { char name[16]; u32 start; u32 size; u32 attr; }
+         * (packed, 28 bytes) - board_init() hard-requires finding
+         * "0:APPSBLENV" via smem_getpart() (offset/size returned in
+         * units of flash_block_size, 0x20000 - see
+         * MR80X_SMEM_FLASH_BLOCK_SIZE_TYPE above) or it aborts boot
+         * the same fatal way ptable itself did. Real offset/size
+         * (0x300000/0x80000) from the actual flash dump - see
+         * BRINGUP-NOTES.md section 4b's partition table. */
+        {
+            static const char name[16] = "0:APPSBLENV";
+            hwaddr part = data + 16;
+            cpu_physical_memory_write(part + 0, name, 16);
+            v = cpu_to_le32(0x300000 / 0x20000); /* start, in blocks */
+            cpu_physical_memory_write(part + 16, &v, 4);
+            v = cpu_to_le32(0x80000 / 0x20000); /* size, in blocks */
+            cpu_physical_memory_write(part + 20, &v, 4);
+            v = cpu_to_le32(0);
+            cpu_physical_memory_write(part + 24, &v, 4); /* attr */
+        }
+    }
+
     if (!machine->kernel_filename) {
         error_report("mr80x: use -kernel to load appsbl.unpadded.elf "
                       "(or an -kernel-compatible raw appsbl.bin via "
@@ -434,6 +672,12 @@ static void mr80x_init(MachineState *machine)
                            "mr80x.timer", MR80X_TIMER_SIZE);
     memory_region_add_subregion(sysmem, MR80X_TIMER_BASE, &timer->iomem);
 
+    /* MDIO controller - see the MR80X_MDIO_BASE comment block */
+    MR80XMdioState *mdio = g_new0(MR80XMdioState, 1);
+    memory_region_init_io(&mdio->iomem, NULL, &mr80x_mdio_ops, mdio,
+                           "mr80x.mdio", MR80X_MDIO_SIZE);
+    memory_region_add_subregion(sysmem, MR80X_MDIO_BASE, &mdio->iomem);
+
     /* UART */
     MR80XUartState *uart = g_new0(MR80XUartState, 1);
     memory_region_init_io(&uart->iomem, NULL, &mr80x_uart_ops, uart,
@@ -467,7 +711,7 @@ static void mr80x_machine_class_init(ObjectClass *oc, void *data)
     mc->desc = "QCA IPQ5018 / Mercusys MR80X v5 research machine "
                "(minimal - see BRINGUP-NOTES.md)";
     mc->init = mr80x_init;
-    mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a15");
+    mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a7");
     mc->default_ram_size = MR80X_RAM_SIZE;
     mc->default_ram_id = "mr80x.ram";
     mc->ignore_memory_transaction_failures = true;

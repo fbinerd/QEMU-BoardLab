@@ -23,4 +23,8 @@ RUN ./configure --target-list=arm-softmmu --disable-docs --disable-tools \
         --enable-tcg --enable-slirp \
     && ninja -C build qemu-system-arm -j"$(nproc)"
 
+RUN DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gdb-multiarch \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /src

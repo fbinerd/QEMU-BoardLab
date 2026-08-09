@@ -338,6 +338,124 @@ wall-clock time - intentional, since fast/deterministic boot matters
 more here than timing accuracy for delays that are typically
 microsecond-scale on real hardware anyway.
 
+## 9. MILESTONE (2026-08-09): Ethernet link-up + past the MMU/alignment wall
+
+Continuing from section 8: with the MDIO/GEPHY PHY-ID model in place
+(section 10 below), `eth0` reports `up Speed :100 Full duplex` - real
+progress through `board_eth_init()` - but then hit a genuine ARM data
+abort inside `lib/uip/dns.c`'s `dns_init()`.
+
+Root-caused with `gdb-multiarch` attached to QEMU's `-s -S` gdbstub (now
+baked into the Dockerfile) rather than continuing log archaeology - this
+turned out to be architecturally subtle and not something log-reading
+alone would have resolved:
+
+- `DFAR` (Data Fault Address Register) at the fault was `0x4a9ed603`,
+  and `DFSR=0x801` decodes to Fault Status = 1 = **Alignment fault**.
+- `struct uip_udp_conn` is 9 bytes (4+2+2+1, no padding) - `uip_udp_conns[1]`
+  (the DNS resolver's connection, since slot 0 is always taken by
+  `dhcpd_init()`'s own socket, called first) lands at an address ending
+  in `...5ff`, and its `rport` field 4 bytes in lands on an *odd*
+  address - `strh` (halfword store) to an odd address.
+- This is **not a QEMU CPU-model bug** - tried both `cortex-a15` and
+  `cortex-a7`, identical fault. It's correct ARMv7-A VMSA architectural
+  behavior: `target/arm/tcg/hflags.c`'s `aprofile_require_alignment()`
+  enforces alignment unconditionally whenever the MMU is disabled
+  (`SCTLR.M=0`), because translation-disabled memory defaults to Device
+  type architecturally, regardless of `SCTLR.A`.
+- The MMU was disabled because `board_init.c`'s `enable_caches()` only
+  calls `dcache_enable()` (which sets up an identity-mapped MMU, a
+  VMSA prerequisite for treating RAM as cacheable Normal memory) when
+  `smem_get_boot_flash()` reports a nonzero flash type - the vendor's
+  own comment there says **"Skips dcache_enable during JTAG recovery"**,
+  i.e. a real, intentional degraded-boot mode for exactly our situation
+  (no valid SMEM flash info), not a bug in appsbl.
+- Fixed by faking `SMEM_BOOT_FLASH_TYPE`/`_INDEX`/`_CHIP_SELECT`/
+  `_BLOCK_SIZE`/`_DENSITY` (types 498-502) as NAND, matching the real
+  device.
+
+That fix unlocked a *different* code path in `board/qca/arm/common/board_init.c`'s
+`board_init()`: a nonzero flash type routes through `smem_ptable_init()`
+(reads `SMEM_AARM_PARTITION_TABLE`=9, validates a `$TOC`-style magic) -
+previously bypassed entirely by the `SMEM_BOOT_NO_FLASH` case, now
+mandatory and its failure is **fatal** ("cdp: SMEM init failed", aborts
+the whole `initcall_sequence`). Faked a minimal valid `struct smem_ptable`
+(correct magic, version=1). That in turn revealed `board_init()` also
+hard-requires resolving a `"0:APPSBLENV"` partition via `smem_getpart()`
+("cdp: get environment part failed" otherwise) - added one real
+`smem_ptn` entry matching the actual flash dump's appsblenv location
+(offset `0x300000`, size `0x80000` - see section 4b's partition table).
+
+After all three fixes: **no more data abort, no more fatal SMEM errors** -
+boot proceeds straight into real DesignWare-style DMA descriptor setup
+for GMAC1 (writes to offsets `0x100c`/`0x1010` - TX/RX descriptor ring
+base addresses - and `0x1018`/`0x0`/`0x4`/`0x18`, a plausible
+MAC-config + DMA-control register layout). This is genuine forward
+progress into the territory this emulator actually needs to model next
+(section 10's remaining item: real packet TX/RX, not just link
+detection) - not another blocker to route around.
+
+Also noted in passing: `"No ART partition found"` prints and boot
+continues (uses the default MAC `00:11:22:33:44:55`) - confirms ART
+lookup failure is one of the *soft*-fail SMEM paths, unlike
+`APPSBLENV`, consistent with everything else observed about which SMEM
+reads are fatal vs. gracefully defaulted.
+
+## 10. MDIO controller + GEPHY internal PHY (the actual Ethernet gate)
+
+`board_eth_init()` doesn't use `drivers/net/designware.c` at all -
+IPQ5018 has its own `drivers/net/ipq5018/ipq5018_gmac.c`, which
+*additionally* `#include`s the RTL8367 switch driver headers directly.
+Real boards configure `s17c_switch_enable` in their DTB's `gmac_cfg`
+node for the switch-connected port; `ipq5018-emulation.dts` (our
+target profile, section 7) configures neither a switch nor a
+`phy_type` for either GMAC - Qualcomm's own bring-up environment
+apparently has no real PHY/switch attached either.
+
+The driver doesn't trust a DTB `phy_type` value directly - it reads
+the PHY's `MII_PHYSID1`/`MII_PHYSID2` (regnum 2/3) over MDIO and
+switches on the *result* (`ipq5018_gmac.c` around line 1024). Returning
+the internal GEPHY's ID (`0x004DD0C0`, from `arch-ipq5018/ipq5018_gmac.h`)
+for the `phy_address` `gmac1_cfg` uses (7, consistent across every DTB
+checked) makes it take the simple internal-PHY path
+(`ipq_gephy_phy_init()` in `drivers/net/ipq_common/ipq_gephy.c`)
+instead of needing the RTL8367 switch chip modeled - deliberately out
+of scope (section 6). GMAC2/`gmac2_cfg` (`phy_address` 1) gets `0xffff`
+(standard "nothing answered") for any register and is left to fail the
+same "not mapped" way it already did.
+
+MDIO controller (`drivers/net/ipq5018/ipq5018_mdio.c`/`.h`) - base
+`0x88000` (this is what the very first boot log's "Invalid read/write
+at addr 0x88040/0x88044/0x88050" actually was). Registers:
+`CTRL_0`=+0x40, `CTRL_1`=+0x44 (holds `mii_id<<8 | regnum` from the
+last write), `CTRL_2`=+0x48, `CTRL_3`=+0x4c (read result), `CTRL_4`=+0x50
+(command + busy bit `1<<16`, cleared instantly in the model - same
+"exits the poll loop on first read" trick as the GCC `CMD_RCGR`
+registers). Modeled: writes to `CTRL_1` latch the `(mii_id, regnum)`
+pair; a `CTRL_4` write with the START bit computes and latches the
+response into `CTRL_3` immediately.
+
+`ipq_gephy_phy_init()`'s three PHY ops (`get_link_status`/`get_speed`/
+`get_duplex`) all read a *single* vendor register,
+`GEPHY_PHY_SPEC_STATUS` (regnum 17, `drivers/net/ipq_common/ipq_gephy.h`),
+which packs link/speed/duplex into one word. Returning
+`GEPHY_STATUS_LINK_PASS(0x400) | FULL_DUPLEX(0x2000) | SPEED_100MBS(0x80)
+= 0x2480` for `(phy_address=7, regnum=17)` produced the
+`"eth0 up Speed :100 Full duplex"` boot message - real driver logic,
+not a bypass.
+
+Along the way, discovered `ipq5018_enable_gephy()`'s clock/reset block
+(`GCC_GEPHY_BCR/MISC/RX_CBCR/TX_CBCR` at `0x01856000`+) and the whole
+GMAC clock block (`GCC_GMAC_CMD_RCGR` etc. at `0x01868000`+) are
+*outside* the original 256KiB `MR80X_GCC_SIZE`. Rather than widen the
+region piecemeal for every newly-discovered GCC sub-block (SDCC1, PCIe,
+USB, QPIC_IO_MACRO are all in the same address family per
+`ipq5018.h`), widened it once to 1MiB and **generalized the `CMD_RCGR`
+busy-bit-clear-on-read behavior to every register in the block**
+instead of enumerating each of the ~18 `*_CMD_RCGR` addresses by name -
+harmless for non-`CMD_RCGR` registers since nothing reads their bit 0
+back expecting anything else.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
@@ -348,22 +466,32 @@ microsecond-scale on real hardware anyway.
    `hw/arm/mr80x.c` wired into `hw/arm/Kconfig` + `hw/arm/meson.build`
    under `arm_ss` - NOT `system_ss`, that was the first build error,
    `system_ss` files don't get the `-I` path for `cpu.h`).
-4. Next: QPIC NAND backed by `FULL_FIRMWARE.bin` (section 4b/5) -
+4. [done] MDIO + GEPHY PHY-ID/link-status model (section 10) -
+   `eth0 up Speed :100 Full duplex`, genuine driver logic, not a bypass.
+5. [done] SMEM flash-type + partition-table + `0:APPSBLENV` fakes
+   (section 9) - cleared the MMU/alignment wall, no more fatal SMEM
+   errors or data aborts. Boot now reaches real GMAC1 DMA descriptor
+   setup (writes to `0x100c`/`0x1010`/`0x1018`/`0x0`/`0x4`/`0x18` -
+   TX/RX descriptor ring addresses + MAC config/DMA control, a
+   DesignWare-ish layout).
+6. Next: real GMAC1 DMA TX/RX (descriptor rings, MAC config, wired to
+   QEMU's `slirp` usermode networking so a host-side `curl` can reach
+   the emulated HTTP recovery server) - the actual remaining gate for
+   testing an upload end-to-end. GMAC2 can stay a stub.
+7. Next: QPIC NAND backed by `FULL_FIRMWARE.bin` (section 4b/5) -
    currently falls through to "Unknown flash type" / "Qpic controller
    not support serial NAND", gracefully non-fatal but means no real
-   partition data is reachable yet.
-5. Next: DesignWare Ethernet (section 6) - currently the GMAC init
-   writes land in the catch-all stub and link-state polling always
-   fails ("Link status/Get speed/Get duplex not mapped FAIL"), so the
-   auto-triggered HTTP recovery server (see section 8) can start but
-   can't actually serve anything yet.
-6. GPIO/TLMM currently an unmodeled catch-all stub that happens to
+   partition data (ART, rootfs, etc.) is reachable yet - and the fake
+   `smem_ptable` (section 9) only has one partition (`APPSBLENV`), not
+   the full real layout, so partition lookups other than the env one
+   will also come up empty until this is backed by real NAND.
+8. GPIO/TLMM currently an unmodeled catch-all stub that happens to
    return 0 for everything, including GPIO14 (reset button) - that's
    why recovery mode auto-triggers on every boot right now. Worth a
    real (if simple) GPIO model once NAND/Ethernet are in, so boot mode
    is deliberately selectable instead of an accident of the stub's
    default return value.
-7. Once NAND + Ethernet work: test `out/appsbl-custom.bin` and
+9. Once NAND + Ethernet work: test `out/appsbl-custom.bin` and
    `out/appsbl-dual-key.bin` (not just plain `appsbl.bin`), then
    finally a `tplink-cloud-sign.py`-signed image through the actual
    HTTP recovery upload path - the original point of building this.
