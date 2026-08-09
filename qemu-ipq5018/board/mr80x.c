@@ -44,6 +44,8 @@
 #include "elf.h"
 #include "net/net.h"
 #include "hw/qdev-properties.h"
+#include "hw/intc/arm_gic.h"
+#include "target/arm/gtimer.h"
 
 /* ---- memory map (appsbl/CLEAN_ROOM_STATUS.md, ipq5018.h) ---- */
 
@@ -1014,6 +1016,12 @@ static const MemoryRegionOps mr80x_bam_ops = {
  * the same way it already was.
  * ============================================================ */
 
+/* GICv2 - see the comment block in mr80x_init() where it's instantiated. */
+#define MR80X_GIC_DIST_BASE 0x0B000000
+#define MR80X_GIC_CPU_BASE  0x0B002000
+#define MR80X_GIC_NUM_IRQ   256
+#define MR80X_UART_IRQ      0x6b /* SPI number, per the DT's serial@78af000 */
+
 #define MR80X_MDIO_BASE   0x88000
 #define MR80X_MDIO_SIZE   0x1000
 #define MDIO_CTRL_0_REG   0x40
@@ -1101,6 +1109,18 @@ typedef struct MR80XUartState {
     uint8_t rx_buf[UART_RX_BUF_SIZE];
     unsigned rx_head, rx_tail;
     bool tx_eol_pending;
+    uint32_t nchar_remaining;
+    /* Only used by the *kernel*'s msm_serial driver (section 25) -
+     * u-boot's own qca_uart.c never enables interrupts, it's a pure
+     * polling loop, so this stayed NULL/unused for this whole
+     * project until the GIC existed at all. Best-effort: raised
+     * whenever RX data is pending, matching the same "is there a
+     * byte waiting" condition UART_MISR/RXSTALE already reports for
+     * u-boot's tstc() (see that comment) - the exact IMR-masking/ack
+     * semantics msm_serial.c expects aren't independently confirmed
+     * (no kernel source here to grep, unlike appsbl), so this covers
+     * the RX-has-data case specifically, not a full interrupt model. */
+    qemu_irq irq;
 } MR80XUartState;
 
 static bool mr80x_uart_rx_empty(MR80XUartState *s)
@@ -1111,6 +1131,13 @@ static bool mr80x_uart_rx_empty(MR80XUartState *s)
 static unsigned mr80x_uart_rx_count(MR80XUartState *s)
 {
     return (s->rx_head + UART_RX_BUF_SIZE - s->rx_tail) % UART_RX_BUF_SIZE;
+}
+
+static void mr80x_uart_update_irq(MR80XUartState *s)
+{
+    if (s->irq) {
+        qemu_set_irq(s->irq, !mr80x_uart_rx_empty(s));
+    }
 }
 
 static uint64_t mr80x_uart_read(void *opaque, hwaddr offset, unsigned size)
@@ -1148,6 +1175,7 @@ static uint64_t mr80x_uart_read(void *opaque, hwaddr offset, unsigned size)
         if (!mr80x_uart_rx_empty(s)) {
             uint8_t c = s->rx_buf[s->rx_tail];
             s->rx_tail = (s->rx_tail + 1) % UART_RX_BUF_SIZE;
+            mr80x_uart_update_irq(s);
             return c;
         }
         return 0;
@@ -1156,57 +1184,81 @@ static uint64_t mr80x_uart_read(void *opaque, hwaddr offset, unsigned size)
     }
 }
 
+/* qca_uart.c's msm_boot_uart_dm_write() path
+ * (msm_boot_uart_replace_lr_with_cr()) blindly expands every '\n' to
+ * "\r\n" - but several call sites already printf literal "\r\n"
+ * themselves, so this exact binary's real output contains line
+ * endings like bare "\r" with no '\n' at all, or runs of 2-4 '\r' in
+ * a row - confirmed byte-for-byte via plain shell redirection (no
+ * pty/terminal involved), so this is the real binary's own output,
+ * not something introduced between it and a terminal. A real
+ * terminal receiving a bare '\r' just returns the cursor to column 0
+ * without moving down a line, so *every* one of these makes the next
+ * text overwrite the current line instead of starting a new one.
+ *
+ * Normalize instead of forwarding verbatim: the first '\r' or '\n'
+ * of a line ending is expanded to a proper "\r\n"; any '\r'/'\n'
+ * immediately following (the redundant partner of that same logical
+ * line break, or a repeat of it) is swallowed. Anything else clears
+ * the pending state and is forwarded untouched - this deliberately
+ * leaves other control characters (e.g. '\b' backspace, used by the
+ * "Hit any key to stop autoboot" countdown to rewrite a single digit
+ * in place) alone, since those aren't line endings. */
+static void mr80x_uart_putc(MR80XUartState *s, uint8_t c)
+{
+    if (c == '\r' || c == '\n') {
+        if (s->tx_eol_pending) {
+            return;
+        }
+        s->tx_eol_pending = true;
+        qemu_chr_fe_write_all(&s->chr, (const uint8_t *)"\r\n", 2);
+        return;
+    }
+    s->tx_eol_pending = false;
+
+    qemu_chr_fe_write_all(&s->chr, &c, 1);
+}
+
 static void mr80x_uart_write(void *opaque, hwaddr offset, uint64_t value,
                               unsigned size)
 {
     MR80XUartState *s = opaque;
 
     switch (offset) {
+    case UART_NCHAR:
+        /* NO_CHARS_FOR_TX - real hardware requires this written before
+         * each TF push, giving the byte count that write (or run of
+         * wide writes) actually carries. u-boot's own qca_uart.c
+         * always writes 1 before a single char (see the TF0 comment
+         * below) - the *kernel*'s msm_serial driver, discovered only
+         * once real interrupt-driven output started flowing at all
+         * (BRINGUP-NOTES.md section 25/26), instead batches up to 4
+         * characters into one 32-bit TF write for throughput. Without
+         * tracking this, this model was blindly taking just the low
+         * byte of every TF write - silently dropping 3 of every 4
+         * kernel console characters, producing garbled/scrambled
+         * dmesg output that still *looked* superficially like output
+         * was happening, which is what actually surfaced the bug. */
+        s->nchar_remaining = (uint32_t)value;
+        return;
     case UART_TF0:
     case UART_TF0 + 4:
     case UART_TF0 + 8:
     case UART_TF0 + 12: {
-        /* Real HW packs up to 4 chars per 32-bit TF write for wide
-         * transfers, but qca_uart.c's putc path (single_char, see
-         * ipq_serial_putc) always writes one character as a byte at
-         * TF0 preceded by NO_CHARS_FOR_TX=1 - handle the common case
-         * directly, extend if a wider write shows up in practice. */
-        uint8_t c = (uint8_t)value;
+        /* Forward however many of this write's up-to-4 packed bytes
+         * NCHAR says are actually valid (low byte first, matching
+         * real hardware's FIFO push order) - defaults to 1 if NCHAR
+         * was never written (e.g. a hypothetical caller that skips
+         * it), preserving this model's original single-char behavior
+         * for that case. */
+        unsigned n = s->nchar_remaining ? MIN(s->nchar_remaining, 4u) : 1u;
 
-        /* qca_uart.c's msm_boot_uart_dm_write() path
-         * (msm_boot_uart_replace_lr_with_cr()) blindly expands every
-         * '\n' to "\r\n" - but several call sites already printf
-         * literal "\r\n" themselves, so this exact binary's real
-         * output contains line endings like bare "\r" with no '\n' at
-         * all, or runs of 2-4 '\r' in a row - confirmed byte-for-byte
-         * via plain shell redirection (no pty/terminal involved), so
-         * this is the real binary's own output, not something
-         * introduced between it and a terminal. A real terminal
-         * receiving a bare '\r' just returns the cursor to column 0
-         * without moving down a line, so *every* one of these makes
-         * the next text overwrite the current line instead of
-         * starting a new one.
-         *
-         * Normalize instead of forwarding verbatim: the first '\r' or
-         * '\n' of a line ending is expanded to a proper "\r\n"; any
-         * '\r'/'\n' immediately following (the redundant partner of
-         * that same logical line break, or a repeat of it) is
-         * swallowed. Anything else clears the pending state and is
-         * forwarded untouched - this deliberately leaves other
-         * control characters (e.g. '\b' backspace, used by the "Hit
-         * any key to stop autoboot" countdown to rewrite a single
-         * digit in place) alone, since those aren't line endings. */
-        if (c == '\r' || c == '\n') {
-            if (s->tx_eol_pending) {
-                return;
-            }
-            s->tx_eol_pending = true;
-            qemu_chr_fe_write_all(&s->chr, (const uint8_t *)"\r\n", 2);
-            return;
+        for (unsigned i = 0; i < n; i++) {
+            mr80x_uart_putc(s, (uint8_t)(value >> (i * 8)));
         }
-        s->tx_eol_pending = false;
-
-        qemu_chr_fe_write_all(&s->chr, &c, 1);
+        if (s->nchar_remaining) {
+            s->nchar_remaining -= n;
+        }
         return;
     }
     case UART_SR:
@@ -1236,6 +1288,7 @@ static void mr80x_uart_rx(void *opaque, const uint8_t *buf, int size)
         s->rx_buf[s->rx_head] = buf[i];
         s->rx_head = next;
     }
+    mr80x_uart_update_irq(s);
 }
 
 static int mr80x_uart_can_rx(void *opaque)
@@ -2022,6 +2075,68 @@ static void mr80x_init(MachineState *machine)
     object_property_set_bool(cpuobj, "reset-hivecs", false, &error_fatal);
     qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
 
+    /* ============================================================
+     * GICv2 interrupt controller - required for the *kernel* (u-boot
+     * never enables interrupts at all, its drivers are pure polling
+     * loops, so this machine ran without any interrupt controller at
+     * all until now - see BRINGUP-NOTES.md section 25). Without a
+     * working GIC, Linux's own boot has no working timer tick (the
+     * CPU's built-in architected timer, already correctly emulated by
+     * QEMU's cortex-a7 model, delivers its expiry as a *PPI line into
+     * the GIC* - with no GIC, that signal has nowhere to go) and no
+     * way to receive interrupt-driven device IRQs (msm_serial, this
+     * board's console driver on the kernel side, is interrupt-driven,
+     * unlike u-boot's own bare-register-polling qca_uart.c).
+     *
+     * Real IPQ5018 hardware's GIC ("qcom,msm-qgic2" in the DT dumped
+     * from live guest RAM - see section 25) is at GICD=0xb000000,
+     * GICC=0xb002000 - a plain GICv2 layout QEMU's existing, reusable
+     * `arm_gic` device (the same one hw/arm/highbank.c and others use)
+     * models directly, no custom device needed.
+     *
+     * The DT's `timer { compatible = "arm,armv8-timer"; interrupts =
+     * <1 2 0xf08 1 3 0xf08 1 4 0xf08 1 1 0xf08>; ... }` node gives the
+     * PPI numbers this *specific* SoC's GIC wiring uses for the
+     * architected timer's four interrupt lines (secure-phys=PPI2,
+     * non-secure-phys=PPI3, virtual=PPI4, hyp=PPI1) - notably NOT the
+     * generic ARM "virt" machine's convention (29/30/27/26,
+     * include/hw/arm/bsa.h) QEMU's other boards use, so those generic
+     * constants don't apply here; wired directly to the DT's own
+     * numbers below instead. All four are wired regardless of which
+     * one the kernel actually ends up using (harmless if unused) since
+     * it isn't fully confirmed whether this boot chain ever flips the
+     * CPU to Non-secure state at all (nothing in this minimal
+     * emulator's boot path does that switch - see section 21/25). */
+    DeviceState *gic = qdev_new(gic_class_name());
+    qdev_prop_set_uint32(gic, "num-cpu", 1);
+    qdev_prop_set_uint32(gic, "num-irq", MR80X_GIC_NUM_IRQ);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(gic), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(gic), 0, MR80X_GIC_DIST_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(gic), 1, MR80X_GIC_CPU_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(gic), 0,
+                        qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ));
+    sysbus_connect_irq(SYS_BUS_DEVICE(gic), 1,
+                        qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_FIQ));
+    {
+        /* GICv2 (single CPU) gpio-in layout: indices
+         * [0, num_irq-32) are the SPIs (index N = SPI N, i.e. INTID
+         * N+32); indices [num_irq-32, num_irq) that follow are this
+         * one CPU's private SGI/PPI bank, indexed directly by their
+         * 0-31 local ID (== INTID for SGI/PPI, which live below 32).
+         * See the "unnamed GPIO inputs" doc comment in
+         * include/hw/intc/arm_gic.h. */
+        unsigned priv_base = MR80X_GIC_NUM_IRQ - 32;
+
+        qdev_connect_gpio_out(DEVICE(cpu), GTIMER_SEC,
+                               qdev_get_gpio_in(gic, priv_base + 18));
+        qdev_connect_gpio_out(DEVICE(cpu), GTIMER_PHYS,
+                               qdev_get_gpio_in(gic, priv_base + 19));
+        qdev_connect_gpio_out(DEVICE(cpu), GTIMER_VIRT,
+                               qdev_get_gpio_in(gic, priv_base + 20));
+        qdev_connect_gpio_out(DEVICE(cpu), GTIMER_HYP,
+                               qdev_get_gpio_in(gic, priv_base + 17));
+    }
+
     memory_region_add_subregion(sysmem, MR80X_RAM_BASE, machine->ram);
 
     if (!machine->kernel_filename && !getenv("MR80X_NAND_IMAGE")) {
@@ -2120,6 +2235,7 @@ static void mr80x_init(MachineState *machine)
     qemu_chr_fe_init(&uart->chr, serial_hd(0), &error_abort);
     qemu_chr_fe_set_handlers(&uart->chr, mr80x_uart_can_rx, mr80x_uart_rx,
                               mr80x_uart_event, NULL, uart, NULL, true);
+    uart->irq = qdev_get_gpio_in(gic, MR80X_UART_IRQ);
 
     /* MR80X_STOP_AUTOBOOT - a guaranteed, timing-independent way to
      * drop into the interactive u-boot console, for when the real

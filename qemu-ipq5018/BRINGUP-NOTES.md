@@ -1382,6 +1382,106 @@ kernel sees it - not just u-boot's simpler polling use of it, etc.) - a
 materially larger, more open-ended undertaking than the bootloader-focused
 scope this file has tracked so far.
 
+## 26. MILESTONE: a real, fully-readable Linux dmesg - added the GICv2 and fixed multi-char UART writes
+
+Picked up directly from section 25's "still open": chasing full kernel
+console output past the PSCI fix. Two structural gaps, both now closed:
+
+**1. No interrupt controller existed in this machine at all.** u-boot never
+needed one (every driver it uses - `qca_uart.c`, `qpic_nand.c`, the GMAC
+driver - is a pure polling loop, confirmed across this whole project), but
+Linux's boot absolutely requires one: the CPU's built-in architected timer
+(already correctly emulated by QEMU's cortex-a7 model - nothing to build
+there) delivers its expiry as a PPI line *into* the GIC, and the kernel's
+`msm_serial` console driver is interrupt-driven, unlike u-boot's own
+`qca_uart.c`. With no GIC, both have nowhere to signal at all.
+
+Added QEMU's existing, reusable `arm_gic` device (`hw/intc/arm_gic.c` -
+the same GICv2 model `hw/arm/highbank.c` and others already use, no custom
+device needed) in `mr80x_init()`, wired per the live in-RAM DT dumped in
+section 25 (`interrupt-controller@b000000`, `compatible = "qcom,msm-qgic2"`):
+GICD at `0xb000000`, GICC at `0xb002000`, single CPU. The DT's own
+`timer { compatible = "arm,armv8-timer"; interrupts = <1 2 0xf08 1 3 0xf08
+1 4 0xf08 1 1 0xf08>; ...}` node gives this *specific* SoC's PPI wiring for
+the architected timer's four lines (secure-phys=PPI2/INTID18,
+non-secure-phys=PPI3/INTID19, virtual=PPI4/INTID20, hyp=PPI1/INTID17) -
+notably *not* the generic ARM "virt" machine's convention
+(`include/hw/arm/bsa.h`: 29/30/27/26) other QEMU boards use, so those
+constants don't apply here. All four wired regardless of which one the
+kernel actually ends up using (harmless if unused - it isn't confirmed
+whether this boot chain ever flips the CPU to Non-secure state at all).
+The UART's own IRQ output (new, see below) is wired to SPI `0x6b` (107),
+matching the DT's `serial@78af000`'s `interrupts = <0 0x6b 4>`.
+
+**2. Even with the crash gone and the GIC in place, the very first kernel
+output was scrambled garbage** - `[ 00oni pi` where a clean line should
+read something like `[    0.123456] some message`. Root cause, found by
+comparing against the raw byte dump (not the terminal-rendered text, which
+was actively misleading): `mr80x_uart_write()`'s TF0 (transmit FIFO) case
+only ever forwarded `(uint8_t)value` - the *low byte* of whatever was
+written. u-boot's own `qca_uart.c` always writes one character per TF0
+write (confirmed, already documented in that function's comment), so this
+was never wrong for anything this emulator had produced output from before
+- but real MSM UART DM hardware's TF register can pack up to 4 characters
+into one 32-bit write for throughput, and the *kernel's* `msm_serial`
+driver, now running for the first time, does exactly that. Three of every
+four kernel console characters were being silently dropped, and the
+*first* surviving byte of each group also depends on how many chars were
+batched in the write before it - producing output that looked
+superficially like "something is happening" (a red herring at first
+glance) but was actually unrecoverably scrambled.
+
+Fixed by tracking `UART_NCHAR` (`NO_CHARS_FOR_TX`, offset `0x40`) - real
+hardware requires this written before each TF push to say how many of its
+bytes are valid, and u-boot's own driver already always writes 1 before
+each single-char TF write, so this needed no change on the u-boot side.
+`mr80x_uart_write()`'s TF0 case now forwards `min(nchar_remaining, 4)`
+bytes from the 32-bit value (low byte first, matching real hardware's FIFO
+push order), decrementing the counter, instead of unconditionally just the
+low byte.
+
+**Result, verified via a real (non-gdb) full boot from `FULL_FIRMWARE.bin`**:
+fully clean, readable kernel dmesg - real Qualcomm platform driver probing
+(coresight/ETM, clk framework, GMAC/PHY, etc.), for many kernel-log seconds
+of real boot activity. u-boot's own boot is unaffected (re-verified end to
+end: reaches the `IPQ5018#` prompt exactly as before).
+
+**New frontier, not a regression**: the kernel now hits a real, specific,
+well-characterized crash instead of silence:
+
+```
+Unable to handle kernel NULL pointer dereference at virtual address 00000000
+Internal error: Oops: 5 [#1] PREEMPT SMP ARM
+CPU: 0 PID: 1 Comm: swapper/0 Tainted: G        W       4.4.60 #1
+pc : [<814d85dc>]    lr : [<8165da20>]    psr: 60000113
+```
+
+happening repeatedly (same fault, different trace IDs) during early
+platform-driver probing (`swapper/0`/PID 1, i.e. still single-threaded
+kernel init, not yet a user process), shortly after a `coresight-etm4x:
+probe ... failed with error -22` line and a `drivers/clk/clk.c:578`
+`WARNING:` - suggestive of some driver's `probe()` proceeding past a failed
+clock/resource lookup without checking it and dereferencing a NULL result,
+though not confirmed since no symbol table matches this exact kernel build
+(the `System.map`/`vmlinux` available elsewhere in this workspace are for
+an unrelated, much newer aarch64 OpenWrt target - this device's own kernel
+is 32-bit ARM, Linux 4.4.60, extracted only as a raw decompressed binary
+from the FIT image, no debug symbols). Eventually panics
+(`Kernel panic - not syncing: Fatal exception`) and reboots via a genuine
+watchdog-style 5-second countdown, back to the u-boot banner - a clean,
+real reboot cycle, not a hang.
+
+Resolving *this* specific crash would most likely mean either building a
+symbol-matched kernel to identify the exact faulting driver, or
+iteratively disabling/stubbing suspect DT nodes (coresight/ETM is a
+plausible first guess, being debug-only silicon this emulator obviously
+can't model) - each fix likely to reveal the next unimplemented
+peripheral's driver hitting the same class of problem. This confirms
+section 25's scope assessment: getting u-boot to fully verify, load, and
+correctly hand off to the kernel (this project's original goal) is done;
+getting that kernel all the way to a userspace shell is open-ended further
+work emulating individual Qualcomm platform drivers one at a time.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
@@ -1472,21 +1572,31 @@ scope this file has tracked so far.
     `reset` command's second boot cycle) keep using the guest
     trampoline as before. Verified via `-d int`: no more abort, PSCI
     calls now show `...handled as PSCI call`.
-21. **Next, still open, and a materially bigger undertaking than
-    everything above**: even past the PSCI crash, no kernel console
-    output has been observed. Likely an ordinary "serial driver
-    register semantics"/`console=` bootarg gap rather than another
-    crash (no further exceptions seen), but chasing full Linux dmesg
-    output means emulating what a *kernel* needs (earlycon, GIC,
-    kernel-facing generic timer semantics), not just what *u-boot*
-    needs - a different, larger scope than this project has targeted
-    so far.
-22. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
+21. [done] MILESTONE (section 26): added a GICv2 (interrupt controller -
+    u-boot never needed one, the kernel absolutely does) and fixed
+    multi-character UART TF writes (kernel's `msm_serial` packs up to
+    4 chars/write, unlike u-boot's always-1; was silently dropping
+    3 of 4). Real, fully-readable kernel dmesg now flows for many
+    seconds of genuine platform-driver probing.
+22. **Next, still open, and open-ended**: the kernel now hits a real,
+    specific NULL-pointer-dereference Oops during early driver probing
+    (full register dump + backtrace in section 26) and panics/reboots
+    - not a hang or silence anymore, a concrete bug to chase, but
+    likely the first of several as each fixed driver probe reveals the
+    next unimplemented peripheral. No symbol table matches this exact
+    32-bit ARM Linux 4.4.60 kernel build to identify the faulting
+    function precisely (the `System.map`/`vmlinux` elsewhere in this
+    workspace are for an unrelated aarch64 target). This is
+    fundamentally a different, larger scope than "emulate what u-boot
+    needs" (this project's original, now-complete goal) - getting a
+    full Linux userspace shell means emulating individual Qualcomm
+    platform drivers one at a time, open-ended.
+23. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
     driven - real flashing after signature verification (section 16)
     still fails with "Attempt to write outside the flash area". Lower
     priority since it doesn't block the recovery/signing test flow
     (the HTTP response is "Upgrade Success" regardless).
-23. Once kernel handoff and NAND write both work: test `out/appsbl-dual-key.bin`
+24. Once kernel handoff and NAND write both work: test `out/appsbl-dual-key.bin`
     (accepts either the original vendor key or the swapped-in custom
     one) and a full-size real firmware image, not just a small test
     payload.
