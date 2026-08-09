@@ -874,11 +874,25 @@ fragility in this exact u-boot fork's `malloc()`/allocation pattern
 under specific conditions only reachable on a *second* pass through
 some init path (independent of memory freshness), or a subtler timing/
 register-state difference in this emulator's own peripherals between
-the first and second pass through the same code. Not yet root-caused
-further - would need a dedicated `gdb-multiarch` session tracing
-backward from the hang to find what's actually different about the
-second pass, which is a new, separate investigation from the one this
-section originally described. Kept as a known, still-open limitation;
+the first and second pass through the same code.
+
+**Attempted follow-up**: traced every `malloc()` call (breakpoint at
+its entry, `-S` so gdb attaches before the CPU ever runs, size + LR
+logged automatically for 400 consecutive calls via a generated
+`gdb-multiarch -x` script - `debug-session9.sh`/`gdbcmds.txt`) hoping
+to catch an anomalous request size right before the hang. All 400
+calls traced clean (small, sane sizes: 7-101 bytes, sensible-looking
+LRs) with **no hang reached at all** within that trace - meaning
+either the hang needs meaningfully more than 400 total `malloc()`
+calls to reach, or (more likely) heavy breakpoint/`continue` stepping
+via gdb itself perturbs timing enough that whatever triggers the hang
+under free-running TCG doesn't reproduce the same way - a real
+methodological wall for this specific bug, not just "hasn't been
+tried yet." Not root-caused further within this session; would need
+either a much longer trace, a conditional breakpoint closer to the
+hang site itself (`*0x4a93720e`) instead of tracing from `malloc()`'s
+entry, or a non-gdb approach (e.g. an in-emulator instruction counter/
+log) that doesn't alter timing. Kept as a known, still-open limitation;
 the RAM-repopulation-on-reset change is kept regardless since it's
 still a real correctness improvement (accurately mimics a real
 power-cycle) with zero observed regressions.
