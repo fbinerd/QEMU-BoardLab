@@ -737,6 +737,128 @@ was still "Upgrade Success" (`nm_upgradeFirmware()`'s return path
 apparently doesn't propagate this specific later NAND failure back
 into the immediate HTTP response).
 
+## 17. UART line-ending normalization + real NAND page reads (MR80X_NAND_IMAGE)
+
+Two more fixes from live interactive-TTL testing with the user:
+
+**a) Garbled interactive console.** Root-caused by capturing raw bytes
+with *zero* terminal/pty involvement (plain shell redirection, then
+later confirmed again through a real pty via `script`): the real
+appsbl binary's own serial output contains bare `\r` with no `\n` at
+all between most lines - a typical boot log had 66 `\r` vs only 2
+`\n`, zero `\r\n` pairs. This comes from `qca_uart.c`'s
+`msm_boot_uart_dm_write()` path
+(`msm_boot_uart_replace_lr_with_cr()`) unconditionally expanding every
+`\n` to `\r\n` on top of call sites that already `printf` literal
+`\r\n` themselves - genuine vendor behavior, not introduced by this
+emulator. An initial attempt to "fix" this by pacing UART TX to
+~115200 baud (`g_usleep(87)` per byte) addressed a real but
+*secondary* readability issue (TCG blasts the whole boot log through
+in milliseconds) but not the actual cause - confirmed still garbled
+even with pacing, since pacing only affects timing, not content. The
+real fix normalizes at the UART TX emulation layer (not vendor
+source): the first `\r` or `\n` of a line ending expands to a proper
+`\r\n`; anything immediately following that's also `\r`/`\n` (the
+redundant partner, or a repeat) is swallowed. Other control characters
+(`\b`, used by the "Hit any key to stop autoboot" countdown to rewrite
+a digit in place) are left untouched. Verified byte-for-byte: 27 CR,
+29 LF, 27 CRLF pairs, zero bare CR in a full boot log capture.
+
+**b) Real QPIC NAND page reads.** The user correctly diagnosed that
+"readenv() failed" (and, they suspected, the second-boot-cycle hang -
+see section 18) traced back to only NAND device ID detection ever
+being implemented (section 13), never real page *data*. Implemented
+`qpic_nand_page_scope_read()`'s actual data path:
+
+- Extended the BAM engine (previously only the cmd pipe, for register
+  access) to also drive the **data-producer pipe** (pipe 1, real page
+  reads) and **status pipe** (pipe 3, per-codeword auto-status).
+- Each codeword's data descriptor copies real bytes from
+  `MR80X_NAND_IMAGE` (an env var pointing at a raw full-flash dump,
+  e.g. `FULL_FIRMWARE.bin`, mmap'd read-only in `mr80x_init()`) at the
+  current page's file offset - tracked via a running byte counter
+  reset whenever `NAND_ADDR0` is written (start of a new page-scope
+  read) and advanced by each descriptor's length, so the driver's own
+  per-codeword destination-pointer math reconstructs the full page
+  correctly without this emulator needing to replicate the codeword
+  split itself. OOB/spare bytes past the main page size are filled
+  `0xFF` (not captured by a raw dump, and nothing that matters for
+  booting reads OOB data).
+- Status pipe descriptors always report a clean 12-byte record
+  (`flash_sts=buffer_sts=erased_cw_sts=0`), matching
+  `qpic_nand_check_read_status()`'s success path.
+- Generalized the kick (`EVNT_REGn` write) handler to process however
+  many descriptors were actually added since the last kick (previously
+  assumed exactly one - true for ID fetch, but page-scope-read's last
+  codeword batches 2 data descriptors in one kick), and to mask the
+  FIFO offset by the pipe's *real* configured size (from
+  `BAM_P_FIFO_SIZESn`) instead of a fixed 16-bit wrap. The fixed wrap
+  was a genuine bug caught mid-implementation: an early "status
+  ffffffff"/-EPERM failure traced to enough kicks accumulating past a
+  real (smaller) FIFO's size, so the wraparound math pointed at the
+  wrong descriptor and `dev->status_buff` was never actually written.
+
+**Confirmed working against the real dump**: NAND page reads no longer
+fail. `readenv()` now gets as far as a CRC check on genuinely-extracted
+bytes - "`bad CRC, using default environment`" - and checking the raw
+file directly (`xxd -s 0x300000 FULL_FIRMWARE.bin`) shows the
+APPSBLENV region is entirely `0xFF` (erased) in this specific captured
+dump, so "bad CRC" is *correct*, accurate behavior, not a bug - real
+hardware booting from this exact flash state would report the same
+thing. The `rootfs` partition (`0x640000`), by contrast, has a real
+UBI header (`55 42 49 23` = `"UBI#"`) at the expected offset,
+confirming the read path is byte-accurate against real data.
+
+## 18. Known limitation: second normal-boot cycle hangs in malloc()
+
+Normal (non-recovery) boot, when no valid kernel is found, cleanly
+resets (section 14) and retries - but the *second* attempt hangs
+inside u-boot's own `malloc()` (confirmed via `gdb-multiarch`: stuck
+in a tight loop around `malloc()+0x21e`, PC in the `bic.w
+r5,r5,#3`/`subs r7,r5,r4`/chunk-size-masking region of dlmalloc-style
+free-list logic). Reproduced identically **twice**, independently, with
+and without real NAND data backing (section 17b) - same heap address
+involved both times (`r1=0x4a9a7dd0`), meaning it's a deterministic
+corruption tied to the second boot cycle specifically, not randomness
+or missing NAND data.
+
+Root cause (understood, not yet fixed): `GCNT_PSHOLD` on *real*
+hardware triggers an actual power-cycle - the DRAM controller re-inits
+from scratch and RAM content is genuinely gone, not just CPU state.
+This emulator's PSHOLD handler (section 14) only does
+`qemu_system_reset_request()`, which resets CPU/device state but
+*preserves* RAM content (QEMU's normal, correct behavior for a "warm"
+reset - the mismatch is that PSHOLD isn't architecturally a warm
+reset). Real hardware's SBL re-runs on every power-cycle, re-loading
+appsbl into RAM and re-populating SMEM fresh before jumping in; this
+emulator only does that *once*, at `mr80x_init()` (QEMU machine
+creation), not on each subsequent reset. So the second boot cycle
+starts with real hardware's assumption "RAM/heap is fresh" violated -
+u-boot's own global data (BSS, malloc arena) still contains whatever
+the first cycle's `malloc()` usage left behind, which apparently isn't
+something the code tolerates.
+
+**Why this doesn't block the emulator's actual purpose**: recovery
+mode (`MR80X_RECOVERY=1`, sections 15-16) never reaches this code path
+at all - it stays in the httpd receive loop indefinitely, and that's
+the flow needed to test signed-image uploads. This only affects
+"normal boot repeatedly failing to find a kernel and retrying," a
+secondary scenario.
+
+**Correct fix** (not yet implemented - flagged as non-trivial, real
+regression risk, deferred rather than rushed): move RAM-clearing +
+ELF/image re-load + SMEM re-population + MVBAR trampoline re-write
+into `mr80x_reset()` itself (currently all one-time `mr80x_init()`
+work), so every reset - not just the first boot - accurately mimics a
+real SBL-driven cold power-cycle. Needs care: `mr80x_reset()` runs on
+the *very first* boot too (QEMU calls registered reset handlers once
+during initial startup, after `mr80x_init()`'s ELF load already
+happened), so naively clearing RAM there would destroy the
+just-loaded image on the first boot - the fix needs to either skip RAM
+clearing on the very first invocation, or (more correct) always
+clear-then-reload uniformly, treating the first boot the same as every
+subsequent one.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
@@ -773,17 +895,23 @@ into the immediate HTTP response).
     `out/appsbl-custom.bin`, passes real RSA-2048/PSS signature
     verification ("Firmware checking passed") - the original point of
     building this whole emulator.
-12. Next: QPIC NAND *page* reads (real data, not just ID) backed by
-    `FULL_FIRMWARE.bin` (section 4b/5) via the same BAM data pipes
-    (index 0/1, not yet driven - see section 13) - needed for (a)
-    `readenv()` to find the real environment (fixing the 192.168.1.1
-    vs 192.168.0.1 discrepancy at the source instead of via
-    `--guest-ip`), (b) the *normal* (non-recovery) boot path to find a
-    real kernel/rootfs instead of cleanly resetting forever, and (c)
-    NAND erase/write to actually succeed after signature verification
-    (section 16) instead of failing with "Attempt to write outside the
-    flash area".
-13. Once NAND page read/write works: also test `out/appsbl-dual-key.bin`
-    (accepts either the original vendor key or the swapped-in custom
-    one) and a full-size real firmware image, not just a small test
-    payload.
+12. [done] MILESTONE (section 17b): real QPIC NAND page reads, backed
+    by `MR80X_NAND_IMAGE` (e.g. `FULL_FIRMWARE.bin`) via the BAM
+    data-producer + status pipes. `readenv()` now reads genuinely
+    real bytes (confirmed: APPSBLENV really is blank/`0xFF` in this
+    dump, "bad CRC" is accurate; `rootfs`'s real UBI header reads back
+    correctly at the right offset).
+13. [done] Interactive TTL console readable - UART line-ending
+    normalization (section 17a).
+14. **In progress / next**: fix the second-normal-boot-cycle `malloc()`
+    hang (section 18) - move SMEM re-population + MVBAR trampoline
+    rewrite + ELF/image reload into `mr80x_reset()` so every reset
+    (not just the first boot) mimics a real SBL-driven power-cycle.
+15. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
+    driven - real flashing after signature verification (section 16)
+    still fails with "Attempt to write outside the flash area". Lower
+    priority than #14 since it doesn't block the recovery/signing test
+    flow (the HTTP response is "Upgrade Success" regardless).
+16. Once NAND write works too: test `out/appsbl-dual-key.bin` (accepts
+    either the original vendor key or the swapped-in custom one) and a
+    full-size real firmware image, not just a small test payload.
