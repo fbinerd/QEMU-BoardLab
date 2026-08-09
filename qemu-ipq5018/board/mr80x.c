@@ -814,6 +814,7 @@ typedef struct MR80XUartState {
     CharBackend chr;
     uint8_t rx_buf[UART_RX_BUF_SIZE];
     unsigned rx_head, rx_tail;
+    bool tx_eol_pending;
 } MR80XUartState;
 
 static bool mr80x_uart_rx_empty(MR80XUartState *s)
@@ -873,18 +874,45 @@ static void mr80x_uart_write(void *opaque, hwaddr offset, uint64_t value,
          * TF0 preceded by NO_CHARS_FOR_TX=1 - handle the common case
          * directly, extend if a wider write shows up in practice. */
         uint8_t c = (uint8_t)value;
+
+        /* qca_uart.c's msm_boot_uart_dm_write() path
+         * (msm_boot_uart_replace_lr_with_cr()) blindly expands every
+         * '\n' to "\r\n" - but several call sites already printf
+         * literal "\r\n" themselves, so this exact binary's real
+         * output contains line endings like bare "\r" with no '\n' at
+         * all, or runs of 2-4 '\r' in a row - confirmed byte-for-byte
+         * via plain shell redirection (no pty/terminal involved), so
+         * this is the real binary's own output, not something
+         * introduced between it and a terminal. A real terminal
+         * receiving a bare '\r' just returns the cursor to column 0
+         * without moving down a line, so *every* one of these makes
+         * the next text overwrite the current line instead of
+         * starting a new one.
+         *
+         * Normalize instead of forwarding verbatim: the first '\r' or
+         * '\n' of a line ending is expanded to a proper "\r\n"; any
+         * '\r'/'\n' immediately following (the redundant partner of
+         * that same logical line break, or a repeat of it) is
+         * swallowed. Anything else clears the pending state and is
+         * forwarded untouched - this deliberately leaves other
+         * control characters (e.g. '\b' backspace, used by the "Hit
+         * any key to stop autoboot" countdown to rewrite a single
+         * digit in place) alone, since those aren't line endings. */
+        if (c == '\r' || c == '\n') {
+            if (s->tx_eol_pending) {
+                return;
+            }
+            s->tx_eol_pending = true;
+            qemu_chr_fe_write_all(&s->chr, (const uint8_t *)"\r\n", 2);
+            g_usleep(87);
+            return;
+        }
+        s->tx_eol_pending = false;
+
         qemu_chr_fe_write_all(&s->chr, &c, 1);
         /* Pace output to roughly a real 115200-baud UART (~87us/byte,
-         * 8N1). Without this, TCG runs the whole boot log through in a
-         * few milliseconds - individual writes still land on the
-         * chardev in the right order, but a real terminal receiving
-         * thousands of \r\n-laden bytes in one burst can visibly
-         * mis-render (lines overwriting each other) even though the
-         * underlying byte stream is correct (confirmed by capturing
-         * boot logs to a file - always clean, never corrupted). This
-         * doesn't change what boots or how - only how readable it is
-         * live in an interactive terminal, matching what a real serial
-         * console's own throughput would look like anyway. */
+         * 8N1) so an interactive terminal renders the boot log at a
+         * readable, natural speed instead of all at once. */
         g_usleep(87);
         return;
     }
