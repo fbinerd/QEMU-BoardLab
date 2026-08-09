@@ -2,7 +2,8 @@
  * QCA IPQ5018 / Mercusys MR80X v5 research machine model
  *
  * Deliberately minimal and incomplete: enough to boot the REAL appsbl
- * (u-boot 2016.01) ELF from the sibling `appsbl` clean-room project far
+ * (u-boot 2016.01) ELF from the full-flash NAND image (or, as a development
+ * override, from the sibling `appsbl` clean-room project's -kernel file) far
  * enough to get an interactive UART console and, eventually, working
  * Ethernet and NAND - not a faithful IPQ5018 SoC model. No PCI/USB/BT/
  * switch chip. The CPU starts execution directly at appsbl's entry point
@@ -49,6 +50,8 @@
 #define MR80X_RAM_BASE      0x40000000
 #define MR80X_RAM_SIZE      (512 * MiB)
 #define MR80X_APPSBL_ENTRY  0x4A920000
+#define MR80X_APPSBL_FLASH_OFFSET 0x00380000
+#define MR80X_APPSBL_FLASH_SIZE   0x00140000
 
 #define MR80X_UART_BASE     0x078AF000
 #define MR80X_UART_SIZE     0x1000
@@ -559,6 +562,17 @@ typedef struct MR80XNandState {
     uint32_t page_read_offset;
 } MR80XNandState;
 
+static void mr80x_nand_reset(void *opaque)
+{
+    MR80XNandState *s = opaque;
+
+    memset(s->regs, 0, sizeof(s->regs));
+    s->regs[NAND_VERSION_OFF / 4] = 0x20000000u;
+    s->page_read_offset = 0;
+    /* image_data/image_size describe the persistent flash backing and must
+     * survive a SoC reset, just like the contents of physical NAND. */
+}
+
 static uint32_t mr80x_nand_reg_read(MR80XNandState *s, hwaddr offset)
 {
     return s->regs[offset / 4];
@@ -700,6 +714,15 @@ typedef struct MR80XBamState {
     MR80XBamPipe pipe[MR80X_BAM_NUM_PIPES];
     uint32_t generic_regs[MR80X_BAM_SIZE / 4];
 } MR80XBamState;
+
+static void mr80x_bam_reset(void *opaque)
+{
+    MR80XBamState *s = opaque;
+
+    memset(s->pipe, 0, sizeof(s->pipe));
+    memset(s->generic_regs, 0, sizeof(s->generic_regs));
+    /* s->nand is the device link, not volatile controller state. */
+}
 
 static void mr80x_bam_process_cmd_desc(MR80XBamState *s, hwaddr desc_addr)
 {
@@ -1747,6 +1770,111 @@ static void mr80x_reset(void *opaque)
     tb_flush(cs);
 }
 
+/* Load the ELF stored in the real NAND's APPSBL partition. Qualcomm's
+ * preceding PBL/SBL/QSEE stages normally parse this ELF and place its PT_LOAD
+ * segments in RAM before entering it; those proprietary stages are outside
+ * this machine's scope, so the board model performs their final handoff.
+ *
+ * QEMU's ELF loader only accepts a filename, not a slice of a larger file.
+ * Copy the exact APPSBL partition to a private temporary file, let the normal
+ * loader parse/register it as reset-restored ROM content, then unlink it. The
+ * same FULL_FIRMWARE.bin remains attached to QPIC as NAND backing below. */
+static void mr80x_load_appsbl_from_nand(const char *path)
+{
+    g_autofree uint8_t *image = g_malloc(MR80X_APPSBL_FLASH_SIZE);
+    g_autofree char *tmp_path = NULL;
+    g_autoptr(GError) tmp_error = NULL;
+    struct stat st;
+    size_t done = 0;
+    int nand_fd;
+    int tmp_fd;
+    ssize_t sz;
+
+    nand_fd = open(path, O_RDONLY);
+    if (nand_fd < 0) {
+        error_report("mr80x: could not open NAND image '%s': %s", path,
+                     strerror(errno));
+        exit(1);
+    }
+    if (fstat(nand_fd, &st) < 0) {
+        error_report("mr80x: could not stat NAND image '%s': %s", path,
+                     strerror(errno));
+        close(nand_fd);
+        exit(1);
+    }
+    if ((uint64_t)st.st_size < MR80X_APPSBL_FLASH_OFFSET +
+                               MR80X_APPSBL_FLASH_SIZE) {
+        error_report("mr80x: NAND image '%s' is too small for APPSBL "
+                     "partition (need at least 0x%x bytes, got 0x%" PRIx64 ")",
+                     path,
+                     MR80X_APPSBL_FLASH_OFFSET + MR80X_APPSBL_FLASH_SIZE,
+                     (uint64_t)st.st_size);
+        close(nand_fd);
+        exit(1);
+    }
+
+    while (done < MR80X_APPSBL_FLASH_SIZE) {
+        ssize_t n = pread(nand_fd, image + done,
+                          MR80X_APPSBL_FLASH_SIZE - done,
+                          MR80X_APPSBL_FLASH_OFFSET + done);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            error_report("mr80x: failed reading APPSBL partition from '%s': %s",
+                         path, n < 0 ? strerror(errno) : "unexpected EOF");
+            close(nand_fd);
+            exit(1);
+        }
+        done += n;
+    }
+    close(nand_fd);
+
+    if (memcmp(image, ELFMAG, SELFMAG) != 0) {
+        error_report("mr80x: APPSBL partition at NAND offset 0x%x is not an ELF",
+                     MR80X_APPSBL_FLASH_OFFSET);
+        exit(1);
+    }
+
+    tmp_fd = g_file_open_tmp("mr80x-appsbl-XXXXXX", &tmp_path, &tmp_error);
+    if (tmp_fd < 0) {
+        error_report("mr80x: could not create temporary APPSBL file: %s",
+                     tmp_error->message);
+        exit(1);
+    }
+    done = 0;
+    while (done < MR80X_APPSBL_FLASH_SIZE) {
+        ssize_t n = write(tmp_fd, image + done,
+                          MR80X_APPSBL_FLASH_SIZE - done);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            error_report("mr80x: failed writing temporary APPSBL file: %s",
+                         n < 0 ? strerror(errno) : "short write");
+            close(tmp_fd);
+            unlink(tmp_path);
+            exit(1);
+        }
+        done += n;
+    }
+    close(tmp_fd);
+
+    sz = load_elf_as(tmp_path, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                     0, EM_ARM, 0, 0, &address_space_memory);
+    unlink(tmp_path);
+    if (sz < 0) {
+        error_report("mr80x: could not load APPSBL ELF from NAND image '%s': %s",
+                     path, load_elf_strerror(sz));
+        exit(1);
+    }
+
+    info_report("mr80x: booting APPSBL from NAND '%s' partition "
+                "0x%x..0x%x (%zd ELF bytes loaded)",
+                path, MR80X_APPSBL_FLASH_OFFSET,
+                MR80X_APPSBL_FLASH_OFFSET + MR80X_APPSBL_FLASH_SIZE - 1, sz);
+}
+
 static void mr80x_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -1758,10 +1886,9 @@ static void mr80x_init(MachineState *machine)
 
     memory_region_add_subregion(sysmem, MR80X_RAM_BASE, machine->ram);
 
-    if (!machine->kernel_filename) {
-        error_report("mr80x: use -kernel to load appsbl.unpadded.elf "
-                      "(or an -kernel-compatible raw appsbl.bin via "
-                      "-device loader,file=...,addr=0x4A920000 instead)");
+    if (!machine->kernel_filename && !getenv("MR80X_NAND_IMAGE")) {
+        error_report("mr80x: provide -kernel for a development APPSBL override "
+                     "or MR80X_NAND_IMAGE to boot APPSBL from the full flash");
         exit(1);
     }
 
@@ -1789,7 +1916,7 @@ static void mr80x_init(MachineState *machine)
         qemu_register_reset(mr80x_reset, rs);
     }
 
-    {
+    if (machine->kernel_filename) {
         ssize_t sz = load_elf_as(machine->kernel_filename, NULL, NULL, NULL,
                                   NULL, NULL, NULL, NULL, 0, EM_ARM, 0, 0,
                                   &address_space_memory);
@@ -1806,6 +1933,10 @@ static void mr80x_init(MachineState *machine)
                 exit(1);
             }
         }
+        info_report("mr80x: booting development APPSBL override '%s'",
+                    machine->kernel_filename);
+    } else {
+        mr80x_load_appsbl_from_nand(getenv("MR80X_NAND_IMAGE"));
     }
 
     /* GCC clock controller stub */
@@ -1883,7 +2014,8 @@ static void mr80x_init(MachineState *machine)
 
     /* QPIC NAND - see the MR80X_NAND_BASE comment block above */
     MR80XNandState *nand_state = g_new0(MR80XNandState, 1);
-    nand_state->regs[NAND_VERSION_OFF / 4] = 0x20000000u;
+    mr80x_nand_reset(nand_state);
+    qemu_register_reset(mr80x_nand_reset, nand_state);
     /* Real page *data* backing for MR80X_BAM_DATA_PRODUCER_PIPE - a
      * raw full-flash dump (e.g. FULL_FIRMWARE.bin, BRINGUP-NOTES.md
      * section 4b), mmap'd read-only. Optional: without it, page reads
@@ -1930,6 +2062,7 @@ static void mr80x_init(MachineState *machine)
     {
         MR80XBamState *bam = g_new0(MR80XBamState, 1);
         bam->nand = nand_state;
+        qemu_register_reset(mr80x_bam_reset, bam);
         memory_region_init_io(&bam->iomem, NULL, &mr80x_bam_ops, bam,
                                "mr80x.bam", MR80X_BAM_SIZE);
         memory_region_add_subregion(sysmem, MR80X_BAM_BASE, &bam->iomem);

@@ -6,9 +6,11 @@
 # server reachable from the host.
 #
 # Usage:
-#   ./run.sh [--recovery] [--no-net] [--http-port PORT] [--guest-ip IP] [--nand-image PATH] [--stop-autoboot] <path-to-appsbl.unpadded.elf-or-.bin>
+#   ./run.sh [options] [path-to-development-appsbl.elf-or-.bin]
 #
 # Examples:
+#   ./run.sh                         # boot APPSBL from auto-detected full NAND
+#   ./run.sh --nand-image /path/to/FULL_FIRMWARE.bin
 #   ./run.sh /media/dados_2tb/appsbl/out/appsbl.unpadded.elf
 #   ./run.sh --recovery /media/dados_2tb/appsbl/out/appsbl.unpadded.elf
 #   ./run.sh --http-port 9090 /media/dados_2tb/appsbl/out/appsbl.unpadded.elf
@@ -25,6 +27,11 @@
 # receive buffer before the guest ever runs, so u-boot's own very
 # first "is a key waiting?" check (which happens instantly, no delay)
 # already sees one - zero timing dependency, unlike an actual keypress.
+# With no positional APPSBL argument, the board boots the real APPSBL partition
+# directly from --nand-image (or the auto-detected FULL_FIRMWARE.bin), modeling
+# the final SBL/QSEE handoff. A positional ELF/bin remains an explicit
+# development override while the same full image continues backing the NAND.
+#
 # --nand-image: back real QPIC NAND page reads with a raw full-flash
 # dump (BRINGUP-NOTES.md section 4b/17b) instead of returning 0xFF for
 # every page. Auto-detected if not given (see DEFAULT_NAND_IMAGE
@@ -52,13 +59,11 @@
 # emulator. Defaults to 192.168.1.1 because appsbl's *compiled-in*
 # default environment (env.txt-equivalent) uses that - real hardware
 # would normally load 192.168.0.1 (or whatever the real device is
-# configured with) from its NAND environment partition, but this
-# emulator doesn't yet implement real NAND *data* reads (only device
-# ID detection), so "*** Warning - readenv() failed, using default
-# environment" always fires and the compiled-in default applies. If a
-# future version of this emulator backs NAND with real firmware data
-# (see BRINGUP-NOTES.md "next steps"), the effective IP may go back to
-# matching the real device and this default should be revisited.
+# configured with) from its NAND environment partition. Real NAND reads
+# are implemented, but the APPSBLENV partition in the available captured
+# FULL_FIRMWARE.bin is genuinely erased (all 0xFF), so the compiled-in
+# default still applies to that image. A different dump with a valid
+# environment may use another guest IP; pass --guest-ip accordingly.
 #
 # Uses --network host instead of docker's own -p port mapping: with
 # -p, connections from the host arrive at QEMU's slirp networking
@@ -112,11 +117,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "${KERNEL:-}" ]]; then
-    echo "usage: $0 [--recovery] [--no-net] [--http-port PORT] [--guest-ip IP] [--nand-image PATH] [--stop-autoboot] <path-to-appsbl-elf-or-bin>" >&2
-    exit 1
-fi
-
 # Auto-detect the real flash dump if --nand-image wasn't given, so
 # every real partition (smeminfo, section 4b/17b/20) just shows up
 # without needing to remember and type the path every time. Only
@@ -130,8 +130,11 @@ if [[ -z "$NAND_IMAGE" ]]; then
     fi
 fi
 
-KERNEL_DIR="$(cd "$(dirname "$KERNEL")" && pwd)"
-KERNEL_FILE="$(basename "$KERNEL")"
+if [[ -z "${KERNEL:-}" && -z "$NAND_IMAGE" ]]; then
+    echo "usage: $0 [--recovery] [--no-net] [--http-port PORT] [--guest-ip IP] [--nand-image PATH] [--stop-autoboot] [path-to-development-appsbl-elf-or-bin]" >&2
+    echo "error: no APPSBL override and no full NAND image was found" >&2
+    exit 1
+fi
 
 GUEST_SUBNET="$(echo "$GUEST_IP" | sed 's/\.[0-9]*$/.0/')/24"
 GUEST_HOST_IP="$(echo "$GUEST_IP" | sed 's/\.[0-9]*$/.2/')"
@@ -155,6 +158,17 @@ if [[ "$STOP_AUTOBOOT" -eq 1 ]]; then
 fi
 
 DOCKER_VOLUMES=()
+QEMU_BOOT_ARGS=()
+if [[ -n "${KERNEL:-}" ]]; then
+    KERNEL_DIR="$(cd "$(dirname "$KERNEL")" && pwd)"
+    KERNEL_FILE="$(basename "$KERNEL")"
+    DOCKER_VOLUMES+=(-v "${KERNEL_DIR}:/fw:ro")
+    QEMU_BOOT_ARGS+=(-kernel "/fw/${KERNEL_FILE}")
+    echo "Development override: booting APPSBL from ${KERNEL}"
+else
+    echo "Boot source: APPSBL partition inside ${NAND_IMAGE}"
+fi
+
 if [[ -n "$NAND_IMAGE" ]]; then
     NAND_DIR="$(cd "$(dirname "$NAND_IMAGE")" && pwd)"
     NAND_FILE="$(basename "$NAND_IMAGE")"
@@ -168,11 +182,10 @@ echo
 
 exec docker run --rm -it \
     --network host \
-    -v "${KERNEL_DIR}:/fw:ro" \
     "${DOCKER_VOLUMES[@]}" \
     "${DOCKER_ENV[@]}" \
     "$IMAGE" \
     /build/qemu-9.1.0/build/qemu-system-arm -M mr80x -nographic -monitor none \
     -serial stdio \
     "${NET_ARGS[@]}" \
-    -kernel "/fw/${KERNEL_FILE}"
+    "${QEMU_BOOT_ARGS[@]}"

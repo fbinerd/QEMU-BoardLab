@@ -1164,6 +1164,67 @@ would print the byte-identical line, for the byte-identical reason.
 Nothing to emulate here; an SPI-NOR chip that answered the probe would
 be the *wrong*, unfaithful behavior.
 
+## 23. MILESTONE: boot the APPSBL directly from `FULL_FIRMWARE.bin`
+
+The machine no longer requires a separately-mounted
+`appsbl.unpadded.elf`. With `MR80X_NAND_IMAGE` set and no `-kernel`,
+`mr80x_init()` now performs the final handoff that the real proprietary
+PBL/SBL/QSEE chain performs before entering u-boot:
+
+1. validates that the full NAND image reaches the complete real `0:APPSBL`
+   partition (`0x380000..0x4BFFFF`, size `0x140000`);
+2. reads that exact partition and verifies its ELF magic;
+3. passes the extracted slice through QEMU's normal ARM ELF loader, which
+   loads the PT_LOAD segments at their linked addresses and registers them
+   as ROM content restored after every reset; and
+4. exposes the same `FULL_FIRMWARE.bin` simultaneously through the QPIC/BAM
+   NAND model, so the executable APPSBL and every partition it subsequently
+   reads come from one coherent flash image.
+
+The real partition is an ELF padded with `0xFF` to its fixed partition size,
+not a flat binary to copy wholesale to `0x4A920000`; using the ELF loader is
+therefore important. The available dump's APPSBL slice is byte-identical to
+`appsbl/out/appsbl.bin` (SHA-256 `1c8fbfd94bbb45fe8e1224dcca7686a6d27eb0a4bcc7edc3aee9faccc685951e`).
+The loader reported 644170 bytes of actual ELF segments loaded.
+
+`-kernel <elf-or-bin>` remains supported and deliberately takes precedence
+as a development override, while `MR80X_NAND_IMAGE` still backs NAND reads.
+Normal full-flash boot is now simply:
+
+```sh
+./run.sh
+# or explicitly:
+./run.sh --nand-image /path/to/FULL_FIRMWARE.bin
+```
+
+This models the result of the pre-u-boot boot chain, not execution of PBL,
+SBL1 or QSEE themselves. Executing those proprietary stages would require a
+separate model for secure boot, TrustZone, DDR training, PMIC and other early
+SoC facilities; it is not necessary for full fidelity of hardware as seen by
+this u-boot.
+
+### Reset regression found and fixed while validating this path
+
+The first full-flash boot reached `IPQ5018#`, but issuing `reset` made the
+second probe read NAND ID `0x0000`. RAM and APPSBL were already being restored
+correctly; the problem was the emulator's QPIC register file and BAM pipe
+descriptor/FIFO offsets surviving QEMU's system reset. Real controller state
+is volatile across the router's power-cycle.
+
+Added explicit QPIC NAND and BAM reset handlers. They clear controller
+registers, per-pipe offsets and generic BAM registers, restore the QPIC
+version register, and preserve only the NAND image pointer/size (the physical
+flash contents). Verified end-to-end after rebuilding:
+
+- first boot from the NAND partition identifies ID `c1c8`, reaches the real
+  interactive `IPQ5018#` prompt, and reads the real flash backing;
+- a console `reset` prints a second u-boot banner, identifies `c1c8` again,
+  reads the environment again, runs the UBI scan and reaches recovery;
+- the legacy `-kernel appsbl.unpadded.elf` override still reaches the same
+  prompt with the full NAND attached; and
+- `run.sh --no-net --stop-autoboot` works with no positional APPSBL argument,
+  auto-detecting and booting `FULL_FIRMWARE.bin`.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
@@ -1232,20 +1293,26 @@ be the *wrong*, unfaithful behavior.
     completes a full second boot cycle with no hang (this also fixed
     section 18's `malloc()` hang - same root cause, not a separate
     bug). `smeminfo`/`ubi0`'s "empty MTD device detected" is still
-    open, see #18 below.
-18. **Next, still open**: `smeminfo`/`ubi0` output shows "empty MTD
+    open, see #19 below.
+18. [done] MILESTONE (section 23): boot source unified with the physical
+    flash model. Without `-kernel`, the APPSBL ELF is loaded directly from
+    the real `0:APPSBL` slice of `FULL_FIRMWARE.bin`, while that same image
+    backs QPIC NAND reads. `-kernel` remains a development override. QPIC
+    and BAM volatile state now also resets correctly; a second boot after
+    the console `reset` command re-identifies NAND and completes normally.
+19. **Next, still open**: `smeminfo`/`ubi0` output shows "empty MTD
     device detected"/"UBI init error 28" even though `rootfs`'s real
     UBI header reads back correctly at its base offset - likely a gap
     in the NAND page-read model (UBI scanning reads many blocks across
     the partition, not just the first) rather than a missing-data
     issue. Blocks real kernel/rootfs loading even with
     `MR80X_NAND_IMAGE` present.
-19. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
+20. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
     driven - real flashing after signature verification (section 16)
     still fails with "Attempt to write outside the flash area". Lower
     priority since it doesn't block the recovery/signing test flow
     (the HTTP response is "Upgrade Success" regardless).
-20. Once #18 and NAND write both work: test `out/appsbl-dual-key.bin`
+21. Once #19 and NAND write both work: test `out/appsbl-dual-key.bin`
     (accepts either the original vendor key or the swapped-in custom
     one) and a full-size real firmware image, not just a small test
     payload.
