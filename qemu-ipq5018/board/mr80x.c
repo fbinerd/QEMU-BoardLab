@@ -1184,6 +1184,258 @@ static uint64_t mr80x_uart_read(void *opaque, hwaddr offset, unsigned size)
     }
 }
 
+/* ============================================================
+ * CoreSight (ARM's on-chip hardware debug/trace fabric - CSR, CTI,
+ * TMC, funnels, replicator, ETM, TPDA, STM) is real silicon on the
+ * real SoC, but is *debug-only*: JTAG/trace-capture infrastructure
+ * for chip bring-up, never touched by normal boot/operation on real
+ * hardware either unless a debug probe is actually attached. This
+ * emulator obviously can't model it, and the kernel's CoreSight
+ * drivers (BRINGUP-NOTES.md section 26) don't uniformly tolerate that
+ * absence: several probe with a harmless `-EINVAL`/`-22` failure, but
+ * whichever one runs right after "REPLICATOR 1.0 initialized" (no
+ * further per-driver log line before the fault, so not pinned down to
+ * an exact one without kernel debug symbols this exact 4.4.60 build
+ * doesn't have anywhere in this workspace) dereferences a NULL
+ * pointer and panics the kernel outright.
+ *
+ * Real production device trees for boards without a debug probe
+ * attached routinely disable these same nodes for exactly this class
+ * of reason - this isn't a workaround unique to emulation. Since
+ * appsbl/u-boot hands the kernel a device tree extracted from
+ * *inside* the signed FIT image (not something this project's own
+ * source controls, unlike appsbl itself), the fix has to happen by
+ * patching the live, already-loaded blob in guest RAM at the last
+ * safe moment - right as u-boot's own console print of "Starting
+ * kernel" (the literal last line it ever prints, checked byte-by-byte
+ * as it flows through the *existing* UART TX path below, needing no
+ * new hook or timing assumption) confirms the DTB is fully placed and
+ * about to be handed off, but before the kernel has parsed any of it.
+ *
+ * No libfdt available to this build (not vendored by QEMU itself -
+ * it links the *host's* libfdt package, which this Dockerfile never
+ * installs, and none of this project's existing machine code needed
+ * it before now) - hand-rolls the trivial parts of the flattened
+ * devicetree format instead: walk the structure block's token stream
+ * (FDT_BEGIN_NODE/END_NODE/PROP/NOP/END, all that's needed here -
+ * see the Devicetree Specification's "flattened format" chapter),
+ * and for every "compatible" property whose value contains the
+ * substring "coresight" (true of every one of these nodes' bindings:
+ * "arm,coresight-*", "qcom,coresight-*"), zero out that property's
+ * value in place - same length, no resizing/relocation needed, and a
+ * blanked compatible string can't `of_match_device()` against any
+ * driver's ID table, so the kernel just leaves that platform_device
+ * unbound instead of ever calling into a probe() function for it. */
+#define MR80X_FDT_MAGIC 0xd00dfeedu
+#define MR80X_FDT_BEGIN_NODE 0x1u
+#define MR80X_FDT_END_NODE   0x2u
+#define MR80X_FDT_PROP       0x3u
+#define MR80X_FDT_NOP        0x4u
+#define MR80X_FDT_END        0x9u
+
+/* Tries to walk and patch ONE candidate FDT at physical address
+ * `fdt_base`. Returns true only if this candidate is confirmed to be
+ * the *real* board device tree (a "compatible" or "model" property
+ * containing "ipq5018", matching this exact board's real DT,
+ * independently confirmed earlier by dumping and decompiling it -
+ * BRINGUP-NOTES.md section 25) - false for anything else, including
+ * a header that parses cleanly but isn't the board DT. That
+ * distinction matters: u-boot's FIT image container (loaded whole at
+ * CONFIG_SYS_LOAD_ADDR, 0x44000000, well before the real board DT
+ * u-boot later relocates to run the kernel from) is *itself* stored
+ * in valid flattened-devicetree format - its "images"/"configurations"
+ * nodes hold the kernel/fdt/etc as opaque data properties - so it
+ * passes every structural check a raw scan can make, but patching
+ * *it* does nothing (its own tree has no "compatible" properties at
+ * all resembling real hardware), leaving the caller looking like it
+ * silently found nothing to patch. Modifies `buf`/writes it back to
+ * guest RAM only on success; a false return leaves guest RAM
+ * untouched. */
+/* Per-node tracking, indexed by nesting depth (properties always
+ * appear as direct children of FDT_BEGIN_NODE, before any nested
+ * child nodes or the matching FDT_END_NODE - reset whenever a new
+ * node starts, consulted and acted on at that same node's
+ * FDT_END_NODE). A small fixed depth is plenty - this DT nests at
+ * most a handful of levels deep (soc -> peripheral -> sub-block). */
+#define MR80X_FDT_MAX_DEPTH 32
+typedef struct {
+    uint32_t compat_val_off;
+    uint32_t compat_len;
+    bool has_compat;
+    bool has_coresight_marker;
+} MR80XFdtNodeState;
+
+static bool mr80x_try_patch_fdt_at(hwaddr fdt_base, uint32_t totalsize,
+                                    uint32_t off_dt_struct,
+                                    uint32_t off_dt_strings)
+{
+    g_autofree uint8_t *buf = g_malloc(totalsize);
+    MR80XFdtNodeState stack[MR80X_FDT_MAX_DEPTH];
+    int depth = 0;
+    unsigned patched = 0;
+    bool is_board_dt = false;
+    uint32_t off;
+
+    cpu_physical_memory_read(fdt_base, buf, totalsize);
+    memset(&stack[0], 0, sizeof(stack[0]));
+
+    off = off_dt_struct;
+    while (off + 4 <= totalsize) {
+        uint32_t tok = ldl_be_p(buf + off);
+
+        off += 4;
+        if (tok == MR80X_FDT_BEGIN_NODE) {
+            while (off < totalsize && buf[off] != 0) {
+                off++;
+            }
+            off = (off + 1 + 3) & ~3u; /* skip the NUL too, then align */
+            if (depth + 1 >= MR80X_FDT_MAX_DEPTH) {
+                break; /* deeper than any real node in this DT - bail safe */
+            }
+            depth++;
+            memset(&stack[depth], 0, sizeof(stack[depth]));
+        } else if (tok == MR80X_FDT_PROP) {
+            uint32_t len, nameoff, val_off, i;
+            const char *pname;
+
+            if (off + 8 > totalsize) {
+                break;
+            }
+            len = ldl_be_p(buf + off);
+            nameoff = ldl_be_p(buf + off + 4);
+            val_off = off + 8;
+            if ((uint64_t)val_off + len > totalsize) {
+                break;
+            }
+            off = (val_off + len + 3) & ~3u;
+
+            if (off_dt_strings + nameoff >= totalsize) {
+                continue;
+            }
+            pname = (const char *)(buf + off_dt_strings + nameoff);
+
+            if (!strcmp(pname, "compatible") || !strcmp(pname, "model")) {
+                for (i = 0; len >= 7 && i + 7 <= len; i++) {
+                    if (!memcmp(buf + val_off + i, "ipq5018", 7)) {
+                        is_board_dt = true;
+                        break;
+                    }
+                }
+            }
+            if (!strcmp(pname, "compatible")) {
+                stack[depth].compat_val_off = val_off;
+                stack[depth].compat_len = len;
+                stack[depth].has_compat = true;
+            }
+            /* Every real CoreSight component node carries at least one
+             * "coresight-*" property (coresight-name at minimum, often
+             * coresight-ctis/coresight-cpu too) - a far more reliable
+             * marker than "compatible" for this subsystem specifically,
+             * since several of its nodes (TMC/funnel/ETM/replicator)
+             * bind through the generic ARM PrimeCell/AMBA bus via
+             * `compatible = "arm,primecell"` plus a numeric
+             * `arm,primecell-periphid`, not a "coresight"-named
+             * compatible string at all - confirmed by comparing this
+             * against the actual decompiled DT after an earlier,
+             * narrower "compatible contains coresight" version of this
+             * patch left those specific nodes untouched (still visibly
+             * probing successfully in dmesg) while only catching CTI/
+             * CSR/TPDA/etc, whose compatible strings *do* say
+             * "coresight" directly. */
+            if (!strncmp(pname, "coresight-", 10)) {
+                stack[depth].has_coresight_marker = true;
+            }
+        } else if (tok == MR80X_FDT_END_NODE) {
+            if (stack[depth].has_coresight_marker && stack[depth].has_compat) {
+                memset(buf + stack[depth].compat_val_off, 0,
+                       stack[depth].compat_len);
+                patched++;
+            }
+            if (depth > 0) {
+                depth--;
+            }
+        } else if (tok == MR80X_FDT_NOP) {
+            /* nothing to skip */
+        } else {
+            break; /* FDT_END, or an unexpected/malformed token - stop */
+        }
+    }
+
+    if (!is_board_dt) {
+        return false;
+    }
+    if (patched) {
+        cpu_physical_memory_write(fdt_base, buf, totalsize);
+        info_report("mr80x: disabled %u CoreSight device-tree node(s) at "
+                    "0x%" HWADDR_PRIx " before kernel handoff - debug-only "
+                    "silicon this emulator can't model, was crashing the "
+                    "kernel during probe (see BRINGUP-NOTES.md section 27)",
+                    patched, fdt_base);
+    }
+    return true;
+}
+
+/* Scans RAM for the flattened-devicetree magic and tries every
+ * plausible-looking header found (see mr80x_try_patch_fdt_at()'s
+ * comment for why "plausible-looking" isn't enough on its own to
+ * stop at the first hit) until one is confirmed to be the real board
+ * DT and patched, or RAM is exhausted. Two known false-positive
+ * sources in practice, both confirmed via a live boot log: the
+ * *kernel image* itself, decompressed into RAM at a lower address
+ * than the real DTB ("Load Address: 0x41208000" vs u-boot's "Loading
+ * Device Tree to 0x4a3ef000"), coincidentally contains those same 4
+ * magic bytes somewhere in several MB of compiled code/data; and
+ * u-boot's own FIT image container, loaded whole at
+ * CONFIG_SYS_LOAD_ADDR (0x44000000) *before* the real DTB, which is
+ * itself valid FDT-format data (see above) that parses cleanly but
+ * isn't the board DT. */
+static void mr80x_patch_fdt_disable_coresight(MachineState *machine)
+{
+    uint8_t *ram = memory_region_get_ram_ptr(machine->ram);
+    static const uint8_t magic[4] = { 0xd0, 0x0d, 0xfe, 0xed };
+    size_t i;
+
+    for (i = 0; i + 40 <= MR80X_RAM_SIZE; i += 4) {
+        uint32_t totalsize, off_dt_struct, off_dt_strings;
+        hwaddr fdt_base;
+
+        if (memcmp(ram + i, magic, 4) != 0) {
+            continue;
+        }
+        totalsize = ldl_be_p(ram + i + 4);
+        off_dt_struct = ldl_be_p(ram + i + 8);
+        off_dt_strings = ldl_be_p(ram + i + 12); /* struct fdt_header:
+                                                   * magic(0) totalsize(4)
+                                                   * off_dt_struct(8)
+                                                   * off_dt_strings(12) -
+                                                   * offset 16 is
+                                                   * off_mem_rsvmap, a
+                                                   * bug caught only by
+                                                   * comparing against a
+                                                   * live debug dump. */
+        if (totalsize == 0 || totalsize > 4 * MiB ||
+            (uint64_t)i + totalsize > MR80X_RAM_SIZE ||
+            off_dt_struct + 4 > totalsize) {
+            continue;
+        }
+        if (ldl_be_p(ram + i + off_dt_struct) != MR80X_FDT_BEGIN_NODE) {
+            continue;
+        }
+
+        fdt_base = MR80X_RAM_BASE + i;
+        if (mr80x_try_patch_fdt_at(fdt_base, totalsize, off_dt_struct,
+                                    off_dt_strings)) {
+            return;
+        }
+        i += totalsize - 4; /* skip the rest of this candidate's blob */
+    }
+
+    warn_report("mr80x: could not locate the kernel's device tree in RAM "
+                "to disable CoreSight nodes (no candidate FDT header "
+                "confirmed as the real board DT) - the kernel will likely "
+                "crash probing CoreSight, see BRINGUP-NOTES.md section 27");
+}
+
 /* qca_uart.c's msm_boot_uart_dm_write() path
  * (msm_boot_uart_replace_lr_with_cr()) blindly expands every '\n' to
  * "\r\n" - but several call sites already printf literal "\r\n"
@@ -1204,8 +1456,42 @@ static uint64_t mr80x_uart_read(void *opaque, hwaddr offset, unsigned size)
  * leaves other control characters (e.g. '\b' backspace, used by the
  * "Hit any key to stop autoboot" countdown to rewrite a single digit
  * in place) alone, since those aren't line endings. */
+/* Set once, in mr80x_init() - the one MachineState this whole custom
+ * board ever has, needed here only to reach machine->ram for the
+ * CoreSight device-tree patch above. mr80x_kernel_handoff_match/
+ * _triggered are reset in mr80x_reset() (not local statics) so the
+ * console `reset` command's second boot cycle re-arms this and
+ * re-patches the freshly-reloaded DTB, instead of only ever firing
+ * once for the machine's entire lifetime. */
+static MachineState *mr80x_machine;
+static unsigned mr80x_kernel_handoff_match;
+static bool mr80x_kernel_handoff_triggered;
+
+static void mr80x_watch_for_kernel_handoff(uint8_t c)
+{
+    static const char needle[] = "Starting kernel";
+
+    if (mr80x_kernel_handoff_triggered || !mr80x_machine) {
+        return;
+    }
+    if (c == needle[mr80x_kernel_handoff_match]) {
+        mr80x_kernel_handoff_match++;
+        if (mr80x_kernel_handoff_match == strlen(needle)) {
+            mr80x_kernel_handoff_triggered = true;
+            mr80x_patch_fdt_disable_coresight(mr80x_machine);
+        }
+    } else {
+        /* "Starting kernel" has no internal repeats that would need a
+         * real partial-match restart (e.g. no re-entrant prefix), so
+         * a flat reset-to-zero on any mismatch is exact here. */
+        mr80x_kernel_handoff_match = (c == needle[0]) ? 1 : 0;
+    }
+}
+
 static void mr80x_uart_putc(MR80XUartState *s, uint8_t c)
 {
+    mr80x_watch_for_kernel_handoff(c);
+
     if (c == '\r' || c == '\n') {
         if (s->tx_eol_pending) {
             return;
@@ -1940,6 +2226,8 @@ static void mr80x_reset(void *opaque)
     cpu_set_pc(cs, MR80X_APPSBL_ENTRY);
     rs->cpu->env.cp15.mvbar = MR80X_MVBAR_BASE;
     rs->cpu->psci_conduit = QEMU_PSCI_CONDUIT_DISABLED;
+    mr80x_kernel_handoff_match = 0;
+    mr80x_kernel_handoff_triggered = false;
 
     if (!mr80x_psci_watch_timer) {
         mr80x_psci_watch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
@@ -2071,6 +2359,8 @@ static void mr80x_init(MachineState *machine)
     MemoryRegion *sysmem = get_system_memory();
     Object *cpuobj = object_new(machine->cpu_type);
     ARMCPU *cpu = ARM_CPU(cpuobj);
+
+    mr80x_machine = machine;
 
     object_property_set_bool(cpuobj, "reset-hivecs", false, &error_fatal);
     qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
