@@ -874,6 +874,18 @@ static void mr80x_uart_write(void *opaque, hwaddr offset, uint64_t value,
          * directly, extend if a wider write shows up in practice. */
         uint8_t c = (uint8_t)value;
         qemu_chr_fe_write_all(&s->chr, &c, 1);
+        /* Pace output to roughly a real 115200-baud UART (~87us/byte,
+         * 8N1). Without this, TCG runs the whole boot log through in a
+         * few milliseconds - individual writes still land on the
+         * chardev in the right order, but a real terminal receiving
+         * thousands of \r\n-laden bytes in one burst can visibly
+         * mis-render (lines overwriting each other) even though the
+         * underlying byte stream is correct (confirmed by capturing
+         * boot logs to a file - always clean, never corrupted). This
+         * doesn't change what boots or how - only how readable it is
+         * live in an interactive terminal, matching what a real serial
+         * console's own throughput would look like anyway. */
+        g_usleep(87);
         return;
     }
     case UART_SR:
