@@ -1074,15 +1074,54 @@ the fixed RX path, confirmed working end-to-end, not just TX.
     correctly at the right offset).
 13. [done] Interactive TTL console readable - UART line-ending
     normalization (section 17a).
-14. **In progress / next**: fix the second-normal-boot-cycle `malloc()`
-    hang (section 18) - move SMEM re-population + MVBAR trampoline
-    rewrite + ELF/image reload into `mr80x_reset()` so every reset
-    (not just the first boot) mimics a real SBL-driven power-cycle.
-15. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
+14. [done, but didn't fix the actual malloc() hang] Moved SMEM
+    re-population + MVBAR trampoline rewrite into `mr80x_reset()`
+    (section 18 update) - a real correctness improvement (every reset
+    now mimics a power-cycle, not just the first boot), verified no
+    regression, but the second-boot-cycle `malloc()` hang turned out
+    to have a different, still-unknown root cause (stale RAM
+    conclusively ruled out).
+15. [done] MILESTONE (section 20): genuine interactive u-boot console
+    access - fixed the *real* RX-detection bug (`UART_MISR`/`RXSTALE`
+    and `UART_RX_TOTAL_SNAP`, not `UART_SR`/`RXRDY` as originally
+    modeled) and added `MR80X_STOP_AUTOBOOT`/`run.sh --stop-autoboot`
+    for guaranteed, timing-independent console access. Verified with a
+    real `printenv` command round-trip.
+16. [done] MILESTONE (section 20 addendum): all 16 real partitions
+    exposed via the SMEM fake (not just the 3 originally added
+    piecemeal), and `run.sh` auto-detects `FULL_FIRMWARE.bin` so real
+    NAND data is on by default. Verified via `smeminfo` at the console.
+17. **Next, still open**: normal (non-recovery) boot still doesn't
+    successfully load a real kernel/rootfs, *even with real NAND data
+    present* - typing `bootipq` manually at the console (reachable via
+    `--stop-autoboot`) reproduces a crash/reset right after the
+    `check_fw_gpio()` check, before any kernel-loading messages print.
+    Traced partway via `gdb-multiarch`: `qca_scm_call()` is reached
+    correctly (`r0=8, r1=7` - a `SCM_SVC_FUSE`-shaped call) and the
+    MVBAR trampoline (section 14) *is* entered correctly with a sane
+    LR (confirmed: `pc=0x4a91f008 lr=0x4a921936`, a valid in-range
+    return address) - so the original SMC-crash fix is still working.
+    But single-stepping ~60 instructions past that point lands at
+    `pc=0x4a92051e lr=0x00000002` - `lr=2` is not a valid code address,
+    meaning something *after* a successful trampoline return corrupts
+    LR before this specific call chain (reached via manually invoking
+    `bootipq`, a different calling context than the original
+    automatic-autoboot path this was first fixed against) returns.
+    Not root-caused further this session - worth a dedicated
+    `gdb-multiarch` session tracing instruction-by-instruction from
+    the trampoline's return point forward, watching for exactly where
+    LR gets clobbered, rather than the wide 60-step jump used here.
+    Also worth checking whether `smeminfo`/`ubi0` output ("empty MTD
+    device detected", "UBI init error 28" - printed even though
+    `rootfs`'s real UBI header reads back correctly at its base
+    offset) points at a related or separate gap in the NAND
+    page-read model once this crash itself is resolved.
+18. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
     driven - real flashing after signature verification (section 16)
     still fails with "Attempt to write outside the flash area". Lower
-    priority than #14 since it doesn't block the recovery/signing test
-    flow (the HTTP response is "Upgrade Success" regardless).
-16. Once NAND write works too: test `out/appsbl-dual-key.bin` (accepts
-    either the original vendor key or the swapped-in custom one) and a
-    full-size real firmware image, not just a small test payload.
+    priority since it doesn't block the recovery/signing test flow
+    (the HTTP response is "Upgrade Success" regardless).
+19. Once #17 and NAND write both work: test `out/appsbl-dual-key.bin`
+    (accepts either the original vendor key or the swapped-in custom
+    one) and a full-size real firmware image, not just a small test
+    payload.
