@@ -980,6 +980,56 @@ that this emulator is reading the wrong location - fixing the
 content, which hasn't been done since it would misrepresent what's
 actually known about the real device's real state.
 
+## 20. MILESTONE: genuine interactive u-boot console access
+
+The user reported that even after sections 17-19's fixes (real-time
+timer, BQL-blocking `g_usleep()` removed from UART TX), pressing keys
+during the "Hit any key to stop autoboot" window still never dropped
+into the console - confirmed this class of fix (timing-dependent
+input) is fundamentally unreliable through terminal -> docker engine
+API -> container -> QEMU, regardless of how correct the underlying
+timer/blocking fixes are, and pivoted to a timing-*independent*
+solution instead of continuing to chase sub-second latency.
+
+**Root cause, found via source reading, not guessing**: `tstc()`/
+`getc()` for this UART driver do NOT poll `UART_SR`/`RXRDY` (what this
+emulator modeled) at all - `ipq_serial_pending()`
+(`drivers/serial/qca_uart.c`) calls `msm_boot_uart_dm_read()`, which
+polls a completely different register, `UART_MISR`, for the
+`RXSTALE` bit, and separately reads `UART_RX_TOTAL_SNAP` for a byte
+count before ever touching the RX FIFO word. Since this emulator
+never modeled MISR/RXSTALE at all (reads always returned 0, the
+generic-stub default), `tstc()` reported "no key waiting" *forever*,
+regardless of anything actually sitting in the RX buffer - explaining
+why even a "guaranteed" pre-seeded keypress (an earlier attempt at
+`MR80X_STOP_AUTOBOOT`, added but not yet working when first tried)
+silently did nothing.
+
+Fixed by modeling `UART_MISR` (aliases `UART_CR`'s offset, same
+alias-pattern already used for `UART_SR`/`CSR`) to report
+`RXSTALE` set whenever the RX buffer is non-empty, and
+`UART_RX_TOTAL_SNAP` (aliases `UART_IRDA`'s offset) to report the
+actual pending byte count. The existing RF/TF0 FIFO-word read already
+happened to return the right *format* (byte in the low 8 bits, zero
+elsewhere) for msm_boot_uart_dm_read()'s "all-zero word means not
+ready" hardware-quirk workaround to not misfire.
+
+**`MR80X_STOP_AUTOBOOT`** (env var, wired into `run.sh` as
+`--stop-autoboot`): pre-seeds the UART's RX buffer with one byte
+before the guest ever starts running, so `abortboot_normal()`'s very
+first `tstc()` poll - which happens immediately, no delay needed -
+already sees it and aborts autoboot instantly. Zero timing dependency,
+unlike racing an actual keypress against a ~1-real-second window
+through several layers of latency. This is now the *recommended* way
+to reach the console, not just a fallback.
+
+**Verified genuinely interactive, not just "reaches a prompt"**:
+injected a real `printenv` command via the container's stdin after
+the `IPQ5018#` prompt appeared, and got back the full, real default
+environment (`bootcmd=bootipq`, `bootdelay=1`, `ipaddr=192.168.1.1`,
+`ethaddr=00:11:22:33:44:55`, etc.) - full command round-trip through
+the fixed RX path, confirmed working end-to-end, not just TX.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.

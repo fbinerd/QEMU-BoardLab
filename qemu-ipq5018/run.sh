@@ -6,14 +6,25 @@
 # server reachable from the host.
 #
 # Usage:
-#   ./run.sh [--recovery] [--no-net] [--http-port PORT] [--guest-ip IP] [--nand-image PATH] <path-to-appsbl.unpadded.elf-or-.bin>
+#   ./run.sh [--recovery] [--no-net] [--http-port PORT] [--guest-ip IP] [--nand-image PATH] [--stop-autoboot] <path-to-appsbl.unpadded.elf-or-.bin>
 #
 # Examples:
 #   ./run.sh /media/dados_2tb/appsbl/out/appsbl.unpadded.elf
 #   ./run.sh --recovery /media/dados_2tb/appsbl/out/appsbl.unpadded.elf
 #   ./run.sh --http-port 9090 /media/dados_2tb/appsbl/out/appsbl.unpadded.elf
 #   ./run.sh --nand-image /path/to/FULL_FIRMWARE.bin /media/dados_2tb/appsbl/out/appsbl.unpadded.elf
+#   ./run.sh --stop-autoboot /media/dados_2tb/appsbl/out/appsbl.unpadded.elf
 #
+# --stop-autoboot: land straight in the interactive u-boot console
+# instead of racing the "Hit any key to stop autoboot" countdown.
+# Recommended if you actually want the console - that countdown is
+# only ~1 real second on this build (CONFIG_BOOTDELAY=1) and terminal
+# -> docker -> container -> QEMU input latency reliably eats the
+# whole window before a real keypress can land, even though the timer
+# itself is real-time-accurate. This works by pre-seeding the UART's
+# receive buffer before the guest ever runs, so u-boot's own very
+# first "is a key waiting?" check (which happens instantly, no delay)
+# already sees one - zero timing dependency, unlike an actual keypress.
 # --nand-image: back real QPIC NAND page reads with a raw full-flash
 # dump (BRINGUP-NOTES.md section 4b/17b) instead of returning 0xFF for
 # every page. Without this flag, NAND device *identification* still
@@ -63,6 +74,7 @@ GUEST_IP=192.168.1.1
 RECOVERY=0
 NO_NET=0
 NAND_IMAGE=""
+STOP_AUTOBOOT=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -86,6 +98,10 @@ while [[ $# -gt 0 ]]; do
             NAND_IMAGE="$2"
             shift 2
             ;;
+        --stop-autoboot)
+            STOP_AUTOBOOT=1
+            shift
+            ;;
         *)
             KERNEL="$1"
             shift
@@ -94,7 +110,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${KERNEL:-}" ]]; then
-    echo "usage: $0 [--recovery] [--no-net] [--http-port PORT] [--guest-ip IP] <path-to-appsbl-elf-or-bin>" >&2
+    echo "usage: $0 [--recovery] [--no-net] [--http-port PORT] [--guest-ip IP] [--nand-image PATH] [--stop-autoboot] <path-to-appsbl-elf-or-bin>" >&2
     exit 1
 fi
 
@@ -115,6 +131,11 @@ DOCKER_ENV=()
 if [[ "$RECOVERY" -eq 1 ]]; then
     DOCKER_ENV+=(-e MR80X_RECOVERY=1)
     echo "Recovery mode: modeling the reset button held down, same as real hardware."
+fi
+
+if [[ "$STOP_AUTOBOOT" -eq 1 ]]; then
+    DOCKER_ENV+=(-e MR80X_STOP_AUTOBOOT=1)
+    echo "Autoboot will stop automatically - dropping straight into the u-boot console."
 fi
 
 DOCKER_VOLUMES=()

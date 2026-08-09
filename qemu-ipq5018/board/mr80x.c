@@ -171,7 +171,9 @@
 #define UART_MR2    0x04
 #define UART_SR     0x08   /* read: status bits; write (as "CSR"): no-op */
 #define UART_CR     0x10
-#define UART_MISR   0x10   /* alias, unused by this driver's read path */
+#define UART_MISR   0x10   /* alias - see the RX-detection comment below;
+                             * *not* actually unused, despite what this
+                             * comment used to claim. */
 #define UART_IMR    0x14
 #define UART_ISR    0x14   /* alias, see UART_IMR */
 #define UART_IPR    0x18
@@ -180,6 +182,7 @@
 #define UART_HCR    0x24
 #define UART_DMRX   0x34
 #define UART_IRDA   0x38
+#define UART_RX_TOTAL_SNAP 0x38 /* alias, see the RX-detection comment below */
 #define UART_DMEN   0x3C
 #define UART_NCHAR  0x40
 #define UART_TF0    0x70
@@ -188,6 +191,22 @@
 #define UART_SR_RXRDY  (1 << 0)
 #define UART_SR_TXRDY  (1 << 2)
 #define UART_SR_TXEMT  (1 << 3)
+#define UART_MISR_RXSTALE (1 << 3)
+
+/* qca_uart.c's ipq_serial_pending() (what tstc()/getc() actually call,
+ * not a simple UART_SR/RXRDY check as originally assumed here) goes
+ * through msm_boot_uart_dm_read(): poll UART_MISR for RXSTALE, then
+ * read UART_RX_TOTAL_SNAP once per transfer for the real byte count,
+ * then read the RX FIFO word (UART_TF0/RF, same offset in this
+ * variant) - a 32-bit word can carry up to 4 packed bytes, with a
+ * hardware-quirk workaround treating an all-zero word as "not ready"
+ * regardless of what UART_RX_TOTAL_SNAP said. Getting *this* path
+ * right matters a lot more than UART_SR/RXRDY (which nothing in this
+ * driver's RX path actually reads) - confirmed by direct testing:
+ * pre-seeding this emulator's RX buffer to guarantee an autoboot
+ * abort (MR80X_STOP_AUTOBOOT) silently did nothing until this was
+ * fixed, because tstc() was polling MISR/RXSTALE the whole time, a
+ * register this file never modeled a real answer for. */
 
 /* ============================================================
  * Catch-all logging stub for anything not modeled yet. Reads always
@@ -366,20 +385,42 @@ static const MemoryRegionOps mr80x_gcc_ops = {
 #define MR80X_TIMER_BASE 0x4A2000
 #define MR80X_TIMER_SIZE 0x8
 #define MR80X_TIMER_FREQ_HZ 240000
+/* Real hardware's CONFIG_BOOTDELAY=1 (this is a CONFIG_TP_IMAGE
+ * build) means a genuinely tight 1-second window to press a key
+ * before autoboot proceeds - on real hardware, connected via a real
+ * TTL adapter, that's already not much time; over docker's stdin
+ * (host terminal -> docker engine API -> container -> QEMU) there's
+ * extra unavoidable latency in that path on top of ordinary human
+ * reaction time, and 1 second in like this reliably isn't enough -
+ * confirmed by direct user testing (couldn't interrupt autoboot even
+ * after the BQL-blocking g_usleep() fix, which addressed a different,
+ * real problem but not this one). Slow the timer down by
+ * MR80X_TIME_SCALE (an env var, default below) so u-boot's own
+ * "1 second" still means genuinely one second to *it*
+ * (get_timer()/CONFIG_SYS_HZ math is untouched - only how fast real
+ * wall-clock time maps to ticks changes), while the human actually
+ * gets several real seconds of window. Everything else timer-gated
+ * (hardware busy-polls, other delays) is proportionally slower too,
+ * but those are micro/millisecond-scale to begin with, so the
+ * absolute real-time cost stays negligible. */
+#define MR80X_TIME_SCALE_DEFAULT 6
 
 typedef struct MR80XTimerState {
     MemoryRegion iomem;
+    uint32_t scale;
 } MR80XTimerState;
 
-static uint64_t mr80x_timer_counter(void)
+static uint64_t mr80x_timer_counter(MR80XTimerState *s)
 {
     int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    return muldiv64(now_ns, MR80X_TIMER_FREQ_HZ, NANOSECONDS_PER_SECOND);
+    return muldiv64(now_ns, MR80X_TIMER_FREQ_HZ,
+                     (int64_t)NANOSECONDS_PER_SECOND * s->scale);
 }
 
 static uint64_t mr80x_timer_read(void *opaque, hwaddr offset, unsigned size)
 {
-    uint64_t counter = mr80x_timer_counter();
+    MR80XTimerState *s = opaque;
+    uint64_t counter = mr80x_timer_counter(s);
 
     if (offset == 0x0) {
         return (uint32_t)counter;
@@ -987,6 +1028,11 @@ static bool mr80x_uart_rx_empty(MR80XUartState *s)
     return s->rx_head == s->rx_tail;
 }
 
+static unsigned mr80x_uart_rx_count(MR80XUartState *s)
+{
+    return (s->rx_head + UART_RX_BUF_SIZE - s->rx_tail) % UART_RX_BUF_SIZE;
+}
+
 static uint64_t mr80x_uart_read(void *opaque, hwaddr offset, unsigned size)
 {
     MR80XUartState *s = opaque;
@@ -1005,6 +1051,13 @@ static uint64_t mr80x_uart_read(void *opaque, hwaddr offset, unsigned size)
          * TX path via a different helper not wired yet, stale-RX events
          * for RX) - revisit if boot gets stuck polling this. */
         return 0;
+    case UART_MISR:
+        /* See the RX-detection comment above UART_MISR_RXSTALE's
+         * #define - this, not UART_SR/RXRDY, is what tstc()/getc()
+         * actually poll to decide "is there a byte waiting". */
+        return mr80x_uart_rx_empty(s) ? 0 : UART_MISR_RXSTALE;
+    case UART_RX_TOTAL_SNAP:
+        return mr80x_uart_rx_count(s);
     case UART_NCHAR + 0x00:
     case UART_TF0:
     case UART_TF0 + 4:
@@ -1693,8 +1746,17 @@ static void mr80x_init(MachineState *machine)
                            "mr80x.gcc", MR80X_GCC_SIZE);
     memory_region_add_subregion(sysmem, MR80X_GCC_BASE, &gcc->iomem);
 
-    /* Generic timer counter-view registers */
+    /* Generic timer counter-view registers - see the
+     * MR80X_TIME_SCALE_DEFAULT comment above for why this runs slower
+     * than real time by default. */
     MR80XTimerState *timer = g_new0(MR80XTimerState, 1);
+    timer->scale = MR80X_TIME_SCALE_DEFAULT;
+    {
+        const char *scale_env = getenv("MR80X_TIME_SCALE");
+        if (scale_env && atoi(scale_env) > 0) {
+            timer->scale = atoi(scale_env);
+        }
+    }
     memory_region_init_io(&timer->iomem, NULL, &mr80x_timer_ops, timer,
                            "mr80x.timer", MR80X_TIMER_SIZE);
     memory_region_add_subregion(sysmem, MR80X_TIMER_BASE, &timer->iomem);
@@ -1721,6 +1783,27 @@ static void mr80x_init(MachineState *machine)
     qemu_chr_fe_init(&uart->chr, serial_hd(0), &error_abort);
     qemu_chr_fe_set_handlers(&uart->chr, mr80x_uart_can_rx, mr80x_uart_rx,
                               mr80x_uart_event, NULL, uart, NULL, true);
+
+    /* MR80X_STOP_AUTOBOOT - a guaranteed, timing-independent way to
+     * drop into the interactive u-boot console, for when the real
+     * "Hit any key to stop autoboot" countdown isn't reliably
+     * catchable: even with the timer made real-time-accurate (see the
+     * MR80X_TIME_SCALE_DEFAULT comment above) and the BQL-blocking
+     * g_usleep() removed from UART TX, actually landing a keypress
+     * inside a short (CONFIG_BOOTDELAY=1s on this TP-Link build)
+     * window is still at the mercy of terminal -> docker engine API
+     * -> container -> QEMU latency stacking with ordinary human
+     * reaction time - confirmed unreliable by direct user testing
+     * even after those fixes. Pre-seeding the UART's own RX buffer
+     * with a byte before the guest ever runs means
+     * abortboot_normal()'s very first tstc() poll (which happens
+     * immediately on entering its wait loop, no real delay needed)
+     * sees it and aborts autoboot instantly - zero timing dependency,
+     * unlike waiting for a real keypress to race the countdown. */
+    if (getenv("MR80X_STOP_AUTOBOOT")) {
+        static const uint8_t stop_key[] = { ' ' };
+        mr80x_uart_rx(uart, stop_key, sizeof(stop_key));
+    }
 
     /* Everything else touched during early boot that we haven't modeled
      * yet: catch, log, return 0. Widen/replace piecemeal as the boot
