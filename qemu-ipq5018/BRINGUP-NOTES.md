@@ -1135,6 +1135,35 @@ inicia o kernel" (kernel still doesn't boot) and "o reset ainda nao da
 reboot no uboot" (reset still doesn't reboot) - are the same bug and
 are now fixed.
 
+## 22. "ipq_spi: SPI Flash not found (bus/cs/speed/mode) = (0/0/48000000/0)" is expected, not a gap
+
+Asked about during a normal-boot log review. Confirmed via source, not
+guessed: `board/qca/arm/ipq5018/ipq5018.c`'s board-storage-init
+function unconditionally probes *both* flash types the IPQ5018 family
+supports - QPIC NAND (`qpic_nand_init()`, what this router actually
+has) and SPI-NOR (`ipq_spi_init()`,
+`drivers/mtd/ipq_spi_flash.c:130`, gated on the DTS's `/spi/spi_gpio`
+node existing, which it does: `arch/arm/dts/ipq5018-soc.dtsi:36-40`
+has `spi { ... status = "ok"; ...}` unconditionally, at the *SoC*
+level, included by every board `.dts` including
+`ipq5018-emulation.dts` (the one this build's machid,
+`MR80X_TARGET_MACHID = 0x0F040000`, actually selects - see section 7b
+for why the generic "emulation" DTS stands in for the real,
+unavailable Mercusys/TP-Link OEM one).
+
+The SPI *controller* being enabled in the DTS only means the SoC pin
+mux/QUP peripheral is wired up - it says nothing about whether a
+physical SPI-NOR chip is soldered to this specific board.
+`spi_flash_probe(bus=0, cs=0, speed=48MHz, mode=0)` sends a JEDEC ID
+read and gets no valid response, because there genuinely is no SPI-NOR
+chip on this router (confirmed independently: all 16 real partitions,
+section 4b, live in NAND; the real flash dump used as
+`MR80X_NAND_IMAGE` is NAND-only). So `flash` comes back NULL and the
+driver prints this exact message - real hardware over a TTL adapter
+would print the byte-identical line, for the byte-identical reason.
+Nothing to emulate here; an SPI-NOR chip that answered the probe would
+be the *wrong*, unfaithful behavior.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
