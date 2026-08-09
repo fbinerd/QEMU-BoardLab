@@ -555,10 +555,10 @@ typedef struct MR80XNandState {
      * of real data, same as before this existed. */
     const uint8_t *image_data;
     size_t image_size;
-    /* Running byte offset into the page currently being read, reset
-     * to 0 whenever NAND_ADDR0 is written (start of a new page-scope
-     * read op) and advanced by each data-pipe descriptor's size as
-     * codewords stream through - see MR80X_BAM_DATA_PRODUCER_PIPE. */
+    /* Running byte offset in the current read stream.  The low 16 bits of
+     * NAND_ADDR0 select the initial column.  Page reads then stream each
+     * 2048-byte main area plus the 16 OOB bytes this APPSBL asks for before
+     * advancing to the next page in multi-page reads. */
     uint32_t page_read_offset;
 } MR80XNandState;
 
@@ -590,7 +590,7 @@ static void mr80x_nand_reg_write(MR80XNandState *s, hwaddr offset,
     s->regs[offset / 4] = (s->regs[offset / 4] & ~mask) | (value & mask);
 
     if (offset == NAND_ADDR0_OFF) {
-        s->page_read_offset = 0;
+        s->page_read_offset = value & 0xffff;
     }
 
     if (offset == NAND_EXEC_CMD_OFF && (value & mask & 0x1)) {
@@ -681,6 +681,10 @@ static const MemoryRegionOps mr80x_nand_ops = {
 #define MR80X_BAM_STATUS_PIPE 3         /* per-codeword auto-status, page-scope reads */
 #define MR80X_BAM_EE 0
 
+#define MR80X_NAND_OOB_STREAM_SIZE 16
+#define MR80X_NAND_READ_STREAM_STRIDE \
+    (MR80X_NAND_PAGE_SIZE + MR80X_NAND_OOB_STREAM_SIZE)
+
 #define BAM_P_CTRLn_BASE          0x00013000
 #define BAM_P_RSTn_BASE           0x00013004
 #define BAM_P_IRQ_STTSn_BASE      0x00013010
@@ -697,6 +701,9 @@ static const MemoryRegionOps mr80x_nand_ops = {
 typedef struct MR80XBamPipe {
     hwaddr fifo_base;
     uint32_t irq_stts;
+    /* Latest offset advertised via P_EVNT_REG.  Raw producer/status
+     * descriptors may wait here for the matching command-pipe kick. */
+    uint32_t notified_evnt_off;
     uint32_t last_evnt_off;
     uint32_t fifo_size; /* bytes, from BAM_P_FIFO_SIZESn - real hardware
                           * masks the event/offset register modulo this,
@@ -780,10 +787,10 @@ static void mr80x_bam_process_cmd_desc(MR80XBamState *s, hwaddr desc_addr)
  * auto-status) descriptors are plain {dest, len} buffers, not
  * cmd_element batches - see the comment block above. The *source*
  * side (which bytes of real flash a given descriptor should deliver)
- * is tracked separately in MR80XNandState.page_read_offset, reset to
- * 0 whenever NAND_ADDR0 is written (qpic_nand_page_scope_read()'s
- * i==0 codeword) and advanced by each descriptor's length as
- * codewords stream through in order - the *destination* address is
+ * is tracked separately in MR80XNandState.page_read_offset.  It starts at
+ * NAND_ADDR0's low-16-bit column and advances through the 2048-byte main
+ * area plus the 16-byte OOB slot requested by this APPSBL before rolling
+ * to the next page in multi-page reads.  The *destination* address is
  * always taken directly from the descriptor itself, since the real
  * driver already computes a distinct, correctly-offset buffer
  * pointer per codeword (qpic_nand.c's `buffer += data_bytes`
@@ -819,19 +826,63 @@ static void mr80x_bam_process_raw_desc(MR80XBamState *s, int pipe,
 
     /* MR80X_BAM_DATA_PRODUCER_PIPE */
     {
-        uint32_t page = (nand->regs[NAND_ADDR0_OFF / 4] >> 16) |
-                         (nand->regs[NAND_ADDR1_OFF / 4] << 16);
-        uint64_t file_off = (uint64_t)page * MR80X_NAND_PAGE_SIZE +
-                             nand->page_read_offset;
+        uint32_t base_page = (nand->regs[NAND_ADDR0_OFF / 4] >> 16) |
+                             (nand->regs[NAND_ADDR1_OFF / 4] << 16);
+        uint32_t stream_off = nand->page_read_offset;
+        uint32_t done = 0;
 
-        if (nand->image_data && nand->page_read_offset < MR80X_NAND_PAGE_SIZE &&
-            file_off + len <= nand->image_size) {
-            memcpy(buf, nand->image_data + file_off, len);
-        } else {
-            memset(buf, 0xFF, len);
+        while (done < len) {
+            uint32_t page_delta = stream_off / MR80X_NAND_READ_STREAM_STRIDE;
+            uint32_t column = stream_off % MR80X_NAND_READ_STREAM_STRIDE;
+            uint32_t chunk;
+
+            if (column < MR80X_NAND_PAGE_SIZE) {
+                uint32_t main_left = MR80X_NAND_PAGE_SIZE - column;
+                uint64_t file_off = (uint64_t)(base_page + page_delta) *
+                                    MR80X_NAND_PAGE_SIZE + column;
+
+                chunk = MIN((uint32_t)len - done, main_left);
+                if (nand->image_data && file_off + chunk <= nand->image_size) {
+                    memcpy(buf + done, nand->image_data + file_off, chunk);
+                } else {
+                    memset(buf + done, 0xFF, chunk);
+                }
+            } else {
+                uint32_t oob_left = MR80X_NAND_READ_STREAM_STRIDE - column;
+
+                chunk = MIN((uint32_t)len - done, oob_left);
+                memset(buf + done, 0xFF, chunk);
+            }
+
+            done += chunk;
+            stream_off += chunk;
         }
+
         cpu_physical_memory_write(dest_addr, buf, len);
-        nand->page_read_offset += len;
+        nand->page_read_offset = stream_off;
+    }
+}
+
+static void mr80x_bam_drain_raw_pipe(MR80XBamState *s, uint32_t pipe)
+{
+    MR80XBamPipe *p = &s->pipe[pipe];
+    uint32_t mask, delta, i;
+
+    if (!p->fifo_base || !p->fifo_size) {
+        return;
+    }
+
+    mask = p->fifo_size - 1;
+    delta = (p->notified_evnt_off - p->last_evnt_off) & mask;
+    for (i = 0; i < delta; i += 8) {
+        hwaddr desc_addr = p->fifo_base +
+                           ((p->last_evnt_off + i) & mask);
+        mr80x_bam_process_raw_desc(s, pipe, desc_addr);
+    }
+
+    if (delta) {
+        p->last_evnt_off = p->notified_evnt_off;
+        p->irq_stts |= BAM_P_PRCSD_DESC_MASK;
     }
 }
 
@@ -901,32 +952,36 @@ static void mr80x_bam_write(void *opaque, hwaddr offset, uint64_t value,
         (offset - BAM_P_EVNT_REGn_BASE) % 0x1000 == 0) {
         uint32_t n = (offset - BAM_P_EVNT_REGn_BASE) / 0x1000;
 
-        /* The "kick": one or more descriptors were appended between
-         * the pipe's last-known offset and this new write-offset -
-         * almost always exactly one (matching bam_sys_gen_event()'s
-         * usual num_desc=1 call), except qpic_nand_page_scope_read()'s
-         * last codeword, which batches 2 data descriptors (user data
-         * + OOB/spare) into a single kick. Process each in FIFO order. */
+        /* qpic_nand_page_scope_read() advertises data/status descriptors
+         * before the matching command descriptor.  Real BAM lock groups
+         * hold those raw pipes until CMD has programmed NAND_ADDR0/1 and
+         * the read location.  Processing raw kicks immediately used the
+         * previous page address, shifting NAND reads and making a populated
+         * UBI image appear empty.  Record raw kicks here; a command kick
+         * executes its command elements first and then releases them. */
         if (s->pipe[n].fifo_base && s->pipe[n].fifo_size) {
             uint32_t mask = s->pipe[n].fifo_size - 1; /* fifo_size is pow2 */
             uint32_t new_off = (uint32_t)value;
-            uint32_t old_off = s->pipe[n].last_evnt_off;
-            uint32_t delta = (new_off - old_off) & mask;
-            uint32_t i;
+            s->pipe[n].notified_evnt_off = new_off;
 
-            for (i = 0; i < delta; i += 8) {
-                hwaddr desc_addr = s->pipe[n].fifo_base +
-                                    ((old_off + i) & mask);
-                if (n == MR80X_BAM_CMD_PIPE) {
+            if (n == MR80X_BAM_CMD_PIPE) {
+                uint32_t old_off = s->pipe[n].last_evnt_off;
+                uint32_t delta = (new_off - old_off) & mask;
+                uint32_t i;
+
+                for (i = 0; i < delta; i += 8) {
+                    hwaddr desc_addr = s->pipe[n].fifo_base +
+                                        ((old_off + i) & mask);
                     mr80x_bam_process_cmd_desc(s, desc_addr);
-                } else if (n == MR80X_BAM_DATA_PRODUCER_PIPE ||
-                           n == MR80X_BAM_STATUS_PIPE) {
-                    mr80x_bam_process_raw_desc(s, n, desc_addr);
                 }
+                s->pipe[n].last_evnt_off = new_off;
+                s->pipe[n].irq_stts |= BAM_P_PRCSD_DESC_MASK;
+
+                mr80x_bam_drain_raw_pipe(s,
+                                         MR80X_BAM_DATA_PRODUCER_PIPE);
+                mr80x_bam_drain_raw_pipe(s, MR80X_BAM_STATUS_PIPE);
             }
-            s->pipe[n].last_evnt_off = new_off;
         }
-        s->pipe[n].irq_stts |= BAM_P_PRCSD_DESC_MASK;
         return;
     }
 }

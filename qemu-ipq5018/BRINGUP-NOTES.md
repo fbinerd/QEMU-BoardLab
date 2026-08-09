@@ -1233,6 +1233,59 @@ flash contents). Verified end-to-end after rebuilding:
 - `run.sh --no-net --stop-autoboot` works with no positional APPSBL argument,
   auto-detecting and booting `FULL_FIRMWARE.bin`.
 
+## 24. UBI no longer appears empty; u-boot loads the kernel from rootfs
+
+Normal autoboot from the full NAND image originally reached `ubi part fs`, but
+UBI attached the partition as empty:
+
+```
+ubi0: empty MTD device detected
+Read 0 bytes from volume kernel to 44000000
+Volume kernel not found!
+```
+
+The image itself was not missing the kernel. `rootfs` starts at `0x640000` and
+contains valid UBI metadata: EC header at `+0x0`, VID header at `+0x800`, and
+the layout volume data at `+0x1000` naming `kernel` and `ubi_rootfs`.
+
+The emulator had three NAND-read fidelity bugs that only became visible once
+UBI scanned past the first header:
+
+- BAM raw DATA/STATUS pipes were processed immediately when kicked, but this
+  APPSBL queues DATA/STATUS before the matching CMD descriptor. Real BAM lock
+  groups hold those pipes until CMD programs the QPIC address/read location.
+- `NAND_ADDR0`'s low 16 bits were ignored. That broke OOB-style reads such as
+  the bad-block marker at column `2048`.
+- Multi-page reads were treated as a single infinitely long page. The driver
+  actually streams `2048` main bytes plus the requested `16` OOB bytes, then
+  advances to the next NAND page.
+
+Fixed by recording DATA/STATUS pipe kicks as pending work, draining them only
+after CMD has run, seeding the read stream from the `NAND_ADDR0` column, and
+mapping the stream as `2048 + 16` bytes per page. OOB bytes are synthesized as
+`0xff` because `FULL_FIRMWARE.bin` is a main-area dump without spare data.
+
+Verified after rebuilding `mr80x-qemu:9.1.0`:
+
+```
+./run.sh --no-net --nand-image images/FULL_FIRMWARE.bin
+```
+
+The boot now reaches the real kernel handoff path:
+
+```
+ubi0: user volume: 2, internal volumes: 1
+No size specified -> Using max size (3703796)
+## Loading kernel from FIT Image at 44000000 ...
+   Verifying Hash Integrity ... crc32+ sha1+ OK
+   Uncompressing Kernel Image ... OK
+Starting kernel ...
+```
+
+No kernel console output was observed in the short validation window after
+`Starting kernel ...`; that is now the next boot-stage problem, separate from
+u-boot locating and loading `kernel` from UBI.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
@@ -1308,19 +1361,19 @@ flash contents). Verified end-to-end after rebuilding:
     backs QPIC NAND reads. `-kernel` remains a development override. QPIC
     and BAM volatile state now also resets correctly; a second boot after
     the console `reset` command re-identifies NAND and completes normally.
-19. **Next, still open**: `smeminfo`/`ubi0` output shows "empty MTD
-    device detected"/"UBI init error 28" even though `rootfs`'s real
-    UBI header reads back correctly at its base offset - likely a gap
-    in the NAND page-read model (UBI scanning reads many blocks across
-    the partition, not just the first) rather than a missing-data
-    issue. Blocks real kernel/rootfs loading even with
-    `MR80X_NAND_IMAGE` present.
-20. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
+19. [done] MILESTONE (section 24): normal autoboot from
+    `FULL_FIRMWARE.bin` now attaches the populated UBI, finds two user
+    volumes, reads the `kernel` volume, validates/decompresses the FIT
+    image and reaches `Starting kernel ...`.
+20. **Next, still open**: no kernel console output has been observed yet
+    after `Starting kernel ...`; investigate Linux entry/earlycon/DT/SoC
+    devices now that u-boot's UBI/kernel-load path is working.
+21. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
     driven - real flashing after signature verification (section 16)
     still fails with "Attempt to write outside the flash area". Lower
     priority since it doesn't block the recovery/signing test flow
     (the HTTP response is "Upgrade Success" regardless).
-21. Once #19 and NAND write both work: test `out/appsbl-dual-key.bin`
+22. Once kernel handoff and NAND write both work: test `out/appsbl-dual-key.bin`
     (accepts either the original vendor key or the swapped-in custom
     one) and a full-size real firmware image, not just a small test
     payload.
