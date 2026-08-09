@@ -1392,26 +1392,37 @@ static void mr80x_smem_fake_u32_entry(unsigned type, hwaddr data_off,
 #define MR80X_MVBAR_SIZE 0x20
 #define MR80X_MVBAR_SMC_OFF 0x08
 
-static void mr80x_reset(void *opaque)
+/* ============================================================
+ * Everything below re-populates RAM content on every reset, not just
+ * the first boot - see BRINGUP-NOTES.md section 18. Real hardware's
+ * GCNT_PSHOLD write (mr80x_pshold_write() above) triggers an actual
+ * power-cycle: the DRAM controller re-inits from scratch (RAM content
+ * is genuinely gone, not preserved), and SBL re-runs on every
+ * power-up, re-loading appsbl into RAM and re-populating SMEM fresh
+ * before ever jumping into it. A QEMU "warm" qemu_system_reset()
+ * resets CPU/device state but *preserves* RAM by default - fine for
+ * most guest OSes, but wrong for this specific reset source, and the
+ * mismatch was root-caused (via gdb) to a deterministic malloc()
+ * corruption on the *second* normal-boot cycle: u-boot's own
+ * heap/BSS state from the first cycle's malloc() usage was still
+ * sitting in RAM, an assumption real hardware's actual power-cycle
+ * would never let it make. Fixed by clearing all of RAM and re-doing
+ * every one-time mr80x_init()-era setup (SMEM fakes, ELF/image load,
+ * MVBAR trampoline) here instead, called from mr80x_reset() on every
+ * reset including the implicit first one QEMU performs automatically
+ * after machine init - so "first boot" and "every reset after" are
+ * now the exact same code path, matching real hardware.
+ * ============================================================ */
+
+typedef struct MR80XResetState {
+    ARMCPU *cpu;
+    MachineState *machine;
+} MR80XResetState;
+
+static void mr80x_populate_ram(MachineState *machine)
 {
-    ARMCPU *cpu = opaque;
-    CPUState *cs = CPU(cpu);
-
-    cpu_reset(cs);
-    cpu_set_pc(cs, MR80X_APPSBL_ENTRY);
-    cpu->env.cp15.mvbar = MR80X_MVBAR_BASE;
-}
-
-static void mr80x_init(MachineState *machine)
-{
-    MemoryRegion *sysmem = get_system_memory();
-    Object *cpuobj = object_new(machine->cpu_type);
-    ARMCPU *cpu = ARM_CPU(cpuobj);
-
-    object_property_set_bool(cpuobj, "reset-hivecs", false, &error_fatal);
-    qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
-
-    memory_region_add_subregion(sysmem, MR80X_RAM_BASE, machine->ram);
+    void *ram_ptr = memory_region_get_ram_ptr(machine->ram);
+    memset(ram_ptr, 0, MR80X_RAM_SIZE);
 
     /* Fake just enough SMEM for fdtdec_setup()'s machid lookup to
      * succeed - see the comment by MR80X_SMEM_BASE above. */
@@ -1516,6 +1527,40 @@ static void mr80x_init(MachineState *machine)
         }
     }
 
+    /* NOTE: the ELF/image itself is NOT (re-)loaded here - QEMU's own
+     * loader functions (called once from mr80x_init(), below) already
+     * register the loaded data as a "ROM" blob that QEMU automatically
+     * re-applies on every reset via its own internal rom_reset()
+     * handler (registered at that same call, guaranteed to run AFTER
+     * mr80x_reset() - see the ordering comment in mr80x_init()). Calling
+     * load_elf_as()/load_image_targphys() a second time here would hit
+     * QEMU's "ROM images must be loaded at startup" hard error - this
+     * function's memset() above only needs to leave a clean slate for
+     * that automatic restore to land on. */
+}
+
+static void mr80x_reset(void *opaque)
+{
+    MR80XResetState *rs = opaque;
+    CPUState *cs = CPU(rs->cpu);
+
+    cpu_reset(cs);
+    mr80x_populate_ram(rs->machine);
+    cpu_set_pc(cs, MR80X_APPSBL_ENTRY);
+    rs->cpu->env.cp15.mvbar = MR80X_MVBAR_BASE;
+}
+
+static void mr80x_init(MachineState *machine)
+{
+    MemoryRegion *sysmem = get_system_memory();
+    Object *cpuobj = object_new(machine->cpu_type);
+    ARMCPU *cpu = ARM_CPU(cpuobj);
+
+    object_property_set_bool(cpuobj, "reset-hivecs", false, &error_fatal);
+    qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
+
+    memory_region_add_subregion(sysmem, MR80X_RAM_BASE, machine->ram);
+
     if (!machine->kernel_filename) {
         error_report("mr80x: use -kernel to load appsbl.unpadded.elf "
                       "(or an -kernel-compatible raw appsbl.bin via "
@@ -1523,36 +1568,48 @@ static void mr80x_init(MachineState *machine)
         exit(1);
     }
 
-    ssize_t sz = load_elf_as(machine->kernel_filename, NULL, NULL, NULL,
-                              NULL, NULL, NULL, NULL, 0, EM_ARM, 0, 0,
-                              &address_space_memory);
-    if (sz < 0) {
-        /* Not an ELF (e.g. a raw appsbl.bin) - load it as a flat image
-         * at its known link address instead. */
-        sz = load_image_targphys(machine->kernel_filename,
-                                  MR80X_APPSBL_ENTRY,
-                                  MR80X_RAM_SIZE -
-                                  (MR80X_APPSBL_ENTRY - MR80X_RAM_BASE));
+    /* SMEM fakes and the MVBAR trampoline live in mr80x_populate_ram()
+     * now, called from mr80x_reset() - which QEMU invokes once
+     * automatically right after this function returns (same timing as
+     * before) and again on every subsequent guest-triggered reset, so
+     * "first boot" and "every reset after" go through the exact same
+     * real-RAM-content setup. See the comment block above
+     * mr80x_populate_ram().
+     *
+     * Registered *before* the ELF/image load below on purpose: QEMU's
+     * own loader functions register their own internal rom_reset()
+     * reset handler as a side effect of loading, and reset handlers
+     * fire in registration order - putting ours first guarantees our
+     * RAM clear (inside mr80x_populate_ram()) always runs, then QEMU's
+     * rom_reset() runs right after and restores the loaded image on
+     * top of that clean slate, every single reset including the
+     * implicit first one. Reversing this order would let our clear
+     * wipe out the image *after* QEMU had just restored it. */
+    {
+        MR80XResetState *rs = g_new0(MR80XResetState, 1);
+        rs->cpu = cpu;
+        rs->machine = machine;
+        qemu_register_reset(mr80x_reset, rs);
+    }
+
+    {
+        ssize_t sz = load_elf_as(machine->kernel_filename, NULL, NULL, NULL,
+                                  NULL, NULL, NULL, NULL, 0, EM_ARM, 0, 0,
+                                  &address_space_memory);
         if (sz < 0) {
-            error_report("mr80x: could not load '%s' as ELF or raw image",
-                          machine->kernel_filename);
-            exit(1);
+            /* Not an ELF (e.g. a raw appsbl.bin) - load it as a flat
+             * image at its known link address instead. */
+            sz = load_image_targphys(machine->kernel_filename,
+                                      MR80X_APPSBL_ENTRY,
+                                      MR80X_RAM_SIZE -
+                                      (MR80X_APPSBL_ENTRY - MR80X_RAM_BASE));
+            if (sz < 0) {
+                error_report("mr80x: could not load '%s' as ELF or raw image",
+                              machine->kernel_filename);
+                exit(1);
+            }
         }
     }
-
-    /* Monitor-mode SMC trampoline - see the MR80X_MVBAR_BASE comment
-     * block above mr80x_reset(). Written after the ELF/image load
-     * above so nothing overwrites it. */
-    {
-        static const uint8_t trampoline[] = {
-            0x03, 0x00, 0xE0, 0xE3, /* mvn  r0, #3   (little-endian) */
-            0x0E, 0xF0, 0xB0, 0xE1, /* movs pc, lr                  */
-        };
-        cpu_physical_memory_write(MR80X_MVBAR_BASE + MR80X_MVBAR_SMC_OFF,
-                                   trampoline, sizeof(trampoline));
-    }
-
-    qemu_register_reset(mr80x_reset, cpu);
 
     /* GCC clock controller stub */
     MR80XGccState *gcc = g_new0(MR80XGccState, 1);

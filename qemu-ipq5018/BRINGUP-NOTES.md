@@ -845,19 +845,43 @@ the flow needed to test signed-image uploads. This only affects
 "normal boot repeatedly failing to find a kernel and retrying," a
 secondary scenario.
 
-**Correct fix** (not yet implemented - flagged as non-trivial, real
-regression risk, deferred rather than rushed): move RAM-clearing +
-ELF/image re-load + SMEM re-population + MVBAR trampoline re-write
-into `mr80x_reset()` itself (currently all one-time `mr80x_init()`
-work), so every reset - not just the first boot - accurately mimics a
-real SBL-driven cold power-cycle. Needs care: `mr80x_reset()` runs on
-the *very first* boot too (QEMU calls registered reset handlers once
-during initial startup, after `mr80x_init()`'s ELF load already
-happened), so naively clearing RAM there would destroy the
-just-loaded image on the first boot - the fix needs to either skip RAM
-clearing on the very first invocation, or (more correct) always
-clear-then-reload uniformly, treating the first boot the same as every
-subsequent one.
+**Update - implemented the RAM-persistence fix, and it did NOT resolve
+this bug**, which is itself an important, conclusive finding: moved
+RAM-clearing + SMEM re-population + MVBAR trampoline re-write into
+`mr80x_populate_ram()`, called from `mr80x_reset()` on every reset
+including the implicit first one. The ELF/image itself is *not*
+manually re-loaded there (QEMU hard-errors with "ROM images must be
+loaded at startup" if you try) - instead, `mr80x_reset()` is now
+registered *before* the one-time `load_elf_as()`/`load_image_targphys()`
+call in `mr80x_init()`, so reset handlers fire in the right order every
+cycle: ours (memset all of RAM to 0, then re-write SMEM/trampoline)
+runs first, then QEMU's own internal `rom_reset()` (registered as a
+side effect of the loader call, always after ours by registration
+order) restores the loaded image on top of that clean slate. Verified
+no regression: `MR80X_RECOVERY=1` + real NAND data + a
+`tplink-cloud-sign.py`-signed upload still passes RSA verification and
+returns "Upgrade Success" exactly as before (sections 15-17).
+
+**But the second-boot-cycle `malloc()` hang is still there, at the
+byte-identical PC and heap address** (`pc=0x4a93720e`,
+`r1=0x4a9a7dd0`) as before this fix, confirmed via `gdb-multiarch`
+immediately after implementing and rebuilding. Since RAM is now
+provably, genuinely fresh (zeroed, then only SMEM/trampoline/ELF
+re-written) on the second cycle, **stale first-cycle heap/BSS content
+is conclusively ruled out as the root cause** - whatever's actually
+wrong is something else, likely either a genuine pre-existing
+fragility in this exact u-boot fork's `malloc()`/allocation pattern
+under specific conditions only reachable on a *second* pass through
+some init path (independent of memory freshness), or a subtler timing/
+register-state difference in this emulator's own peripherals between
+the first and second pass through the same code. Not yet root-caused
+further - would need a dedicated `gdb-multiarch` session tracing
+backward from the hang to find what's actually different about the
+second pass, which is a new, separate investigation from the one this
+section originally described. Kept as a known, still-open limitation;
+the RAM-repopulation-on-reset change is kept regardless since it's
+still a real correctness improvement (accurately mimics a real
+power-cycle) with zero observed regressions.
 
 ## Status / next steps (in order)
 
