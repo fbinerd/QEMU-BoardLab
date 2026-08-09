@@ -502,6 +502,59 @@ same `gdb-multiarch` approach as section 9, or add temporary
 `qemu_log_mask` tracing to `mr80x_gmac_receive`/`do_tx` to see whether
 the GET request's packet is even reaching `mr80x_gmac_receive` at all.
 
+## 12. GPIO14/reset-button fix + normal (non-recovery) boot exposes the NAND gap directly
+
+The user asked for the emulator to boot *normally*, like real hardware,
+not always land in recovery mode. `check_fw_gpio()`
+(`board/qca/arm/common/cmd_bootqca.c`) reads GPIO14 (`CONFIG_RESET_KEY`)
+*active low* (`return !(val & 0x1)`) - the generic TLMM catch-all
+stub's default 0 read reads as "button held", auto-triggering recovery
+on every boot regardless of what was actually being tested. Fixed
+with a dedicated TLMM ops handler (`mr80x_tlmm_ops`) that returns
+all-ones for every read instead of the generic stub's zero - "button
+not pressed", the correct idle state for a device nobody is touching.
+Confirmed: `key 14 addr 0x0100e004 val 0xffffffff`, no more
+auto-recovery, boot takes the normal path.
+
+That normal path immediately hits a *different*, real crash: a
+prefetch abort at `pc=0x0000000c` - the classic "called through a
+null function pointer, offset 0xc into some struct/vtable" signature.
+`LR` at the fault doesn't resolve to any symbol in `System.map` at
+all (it's stack *data* being read back as a return address, meaning
+the stack itself is already corrupted by this point, not just a bad
+single jump). Root cause not fully confirmed yet but strongly
+indicated: the normal boot path tries to actually load a kernel/rootfs
+from NAND (unlike the recovery-mode path, which only serves HTTP and
+never touches block storage) - our QPIC NAND is still just an unimp
+stub ("Qpic controller not support serial NAND" already printed
+earlier in the same boot), so any UBI/JFFS2/MTD code that assumes NAND
+init succeeded is working with an uninitialized device table.
+**Implementing real QPIC NAND (already section 5/item 7 on this list,
+backed by `FULL_FIRMWARE.bin`) is very likely the actual fix**, not
+another targeted register fake.
+
+While chasing this, also found and fixed a **real, separate** bug:
+`reset_cpu()` (`board/qca/arm/ipq5018/ipq5018.c`) -> `qti_scm_pshold()`
+tries an SCM/TrustZone call first and only falls back to writing
+`GCNT_PSHOLD` (`0x004AB000`) directly if that fails - modeled the
+PSHOLD write to trigger a real `qemu_system_reset_request()`, matching
+the real hardware's power-cycle-on-write behavior. Confirmed via log
+that this fallback write **never actually happens** - `grep -c
+GCNT_PSHOLD` on a full crash-loop capture is 0, and only one
+`"U-Boot 2016.01"` banner ever appears despite dozens of "Resetting
+CPU .../resetting ..." message pairs. This means the `scm_call()`
+attempt itself is what's actually going wrong (an SMC instruction with
+no EL3/secure-monitor configured in this minimal machine, plausibly
+undefined-behavior-ish in TCG without one) - the panic-inside-panic
+recursion this produces is what accounts for the repeating,
+progressively-lower-address crash pattern seen in raw logs, not a
+single hang. The PSHOLD fix is real and correct for the *normal* path
+but doesn't get exercised until `scm_call()`'s behavior is also
+addressed - worth a `gdb-multiarch` session on `scm_call()` specifically
+if crash-recovery-triggered resets matter for some future test (mainline
+non-crash reboots, e.g. a `reset` console command, would hit the same
+`qti_scm_pshold()` path and are equally unverified yet).
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.

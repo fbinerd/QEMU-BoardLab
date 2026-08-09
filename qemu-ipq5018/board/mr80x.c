@@ -28,6 +28,7 @@
 #include "hw/loader.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/reset.h"
+#include "sysemu/runstate.h"
 #include "chardev/char-fe.h"
 #include "cpu.h"
 #include "qom/object.h"
@@ -207,6 +208,39 @@ static void mr80x_add_unimp_region(MemoryRegion *sysmem, const char *name,
 }
 
 /* ============================================================
+ * TLMM/GPIO: reads always return all-ones (every input pin idles
+ * "high"), writes are silently accepted. board/qca/arm/common/
+ * cmd_bootqca.c's check_fw_gpio() reads GPIO14 (the reset button) and
+ * treats it *active low* (`return !(val & 0x1)`) - reading back 0 (the
+ * generic catch-all stub's default) reads as "button held down",
+ * auto-triggering firmware recovery mode on every single boot
+ * regardless of what was actually requested. All-ones reads as
+ * "button not pressed", the correct idle state for a real device that
+ * nobody is touching, so appsbl takes its normal boot path instead -
+ * see BRINGUP-NOTES.md section 12. Pin-mux/config writes elsewhere in
+ * this same region don't need to be readable-back for anything
+ * observed so far, so one blanket policy for the whole block is
+ * enough; split this into per-register handling only if something
+ * else in this address range turns out to need a real value read
+ * back. */
+
+static uint64_t mr80x_tlmm_read(void *opaque, hwaddr offset, unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP,
+                  "mr80x: tlmm READ  off=0x%" HWADDR_PRIx " size=%u -> ~0\n",
+                  offset, size);
+    return 0xFFFFFFFFu;
+}
+
+static const MemoryRegionOps mr80x_tlmm_ops = {
+    .read = mr80x_tlmm_read,
+    .write = mr80x_unimp_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 8 },
+};
+
+/* ============================================================
  * GCC clock controller: only what uart1_clock_config() touches.
  * Every register just latches whatever is written; CMD_RCGR additionally
  * always reads back with UART1_CMD_RCGR_UPDATE_BIT already clear, so
@@ -298,6 +332,50 @@ static void mr80x_timer_write(void *opaque, hwaddr offset, uint64_t value,
 static const MemoryRegionOps mr80x_timer_ops = {
     .read = mr80x_timer_read,
     .write = mr80x_timer_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/* ============================================================
+ * GCNT_PSHOLD (arch-qca-common/iomap.h) - reset_cpu()'s fallback path
+ * (qti_scm_pshold(), board/qca/arm/ipq5018/ipq5018.c) writes 0 here
+ * when the SCM/TrustZone call it tries first fails - which it always
+ * will here, since we don't execute qsee (BRINGUP-NOTES.md section
+ * 7b). On real hardware this write releases the PMIC's power-hold
+ * line, causing an actual power-cycle. Without modeling it, whatever
+ * called reset_cpu() (e.g. a crash handler, "Resetting CPU ...") just
+ * falls through into `while(1);` with nothing having actually reset -
+ * confirmed empirically: a real crash-recovery reset attempt produced
+ * repeated "prefetch abort"/"Resetting CPU .../resetting ..." message
+ * pairs with a *slightly different* LR each time instead of one clean
+ * restart, i.e. execution kept limping forward through corrupted state
+ * rather than actually restarting. Triggering a real QEMU system reset
+ * here - which re-invokes mr80x_reset() the same way the very first
+ * boot did - makes a guest-requested reset behave the same as real
+ * hardware's power-cycle: RAM content (already-loaded appsbl code,
+ * and this file's earlier one-time SMEM fakes) is untouched, only CPU
+ * state resets to a fresh start at the entry point.
+ * ============================================================ */
+
+#define MR80X_PSHOLD_BASE 0x004AB000
+#define MR80X_PSHOLD_SIZE 0x4
+
+static uint64_t mr80x_pshold_read(void *opaque, hwaddr offset, unsigned size)
+{
+    return 0;
+}
+
+static void mr80x_pshold_write(void *opaque, hwaddr offset, uint64_t value,
+                                unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "mr80x: GCNT_PSHOLD write val=0x%" PRIx64
+                  " - requesting a real system reset\n", value);
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+static const MemoryRegionOps mr80x_pshold_ops = {
+    .read = mr80x_pshold_read,
+    .write = mr80x_pshold_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
@@ -896,6 +974,14 @@ static void mr80x_init(MachineState *machine)
                            "mr80x.timer", MR80X_TIMER_SIZE);
     memory_region_add_subregion(sysmem, MR80X_TIMER_BASE, &timer->iomem);
 
+    /* GCNT_PSHOLD - see the comment block above */
+    {
+        MemoryRegion *pshold = g_new0(MemoryRegion, 1);
+        memory_region_init_io(pshold, NULL, &mr80x_pshold_ops, NULL,
+                               "mr80x.pshold", MR80X_PSHOLD_SIZE);
+        memory_region_add_subregion(sysmem, MR80X_PSHOLD_BASE, pshold);
+    }
+
     /* MDIO controller - see the MR80X_MDIO_BASE comment block */
     MR80XMdioState *mdio = g_new0(MR80XMdioState, 1);
     memory_region_init_io(&mdio->iomem, NULL, &mr80x_mdio_ops, mdio,
@@ -922,8 +1008,12 @@ static void mr80x_init(MachineState *machine)
                             0x079B0000, 1 * MiB);
     mr80x_add_unimp_region(sysmem, "mr80x.unimp-gmac2-0x39D00000",
                             0x39D00000, 1 * MiB);
-    mr80x_add_unimp_region(sysmem, "mr80x.unimp-tlmm-0x01000000",
-                            0x01000000, 1 * MiB);
+    {
+        MemoryRegion *tlmm = g_new0(MemoryRegion, 1);
+        memory_region_init_io(tlmm, NULL, &mr80x_tlmm_ops, NULL,
+                               "mr80x.tlmm", 1 * MiB);
+        memory_region_add_subregion(sysmem, 0x01000000, tlmm);
+    }
 
     /* GMAC1 - real device (see mr80x_gmac_realize and friends above).
      * gmac1_cfg's "base" in every DTB checked, including our target
