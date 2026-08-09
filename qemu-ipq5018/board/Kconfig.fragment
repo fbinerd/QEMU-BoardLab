@@ -1,0 +1,5 @@
+
+config MR80X
+    bool
+    default y
+    depends on TCG && ARM

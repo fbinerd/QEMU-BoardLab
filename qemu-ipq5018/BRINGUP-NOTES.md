@@ -49,14 +49,18 @@ wrong, don't trust this file blindly once the vendor source changes.
 ## 3. UART - MSM UART DM (`drivers/serial/qca_uart.c` +
    `arch/arm/include/asm/arch-qca-common/uart.h`)
 
-- Base address used by the real board code: `0x78b0000` (from
-  `board/qca/arm/ipq5018/ipq5018.c:1916`,
-  `parse_fdt_fixup("/soc/serial@78b0000/...")`). NOTE: the *separate*
-  `ipq5018-emulation.dts` (Qualcomm's own internal bring-up profile, not a
-  QEMU model, not necessarily what real MR80X v5 hardware uses) has the
-  console at `0x78AF000` instead - close but different register block;
-  don't mix the two up. Use `0x78b0000`, it's the one the actual C driver
-  code references.
+- **Correction (2026-08-09, caught before the first build): base address
+  is `0x78AF000`, not `0x78b0000`.** `board/qca/arm/ipq5018/ipq5018.c:1916`
+  has `parse_fdt_fixup("/soc/serial@78b0000/...")`, which looked like the
+  authoritative source at first - but grepping "78b0000" across every
+  `.dts`/`.dtsi` in the vendor tree shows it only ever appears in
+  `ipq807x-*`/`ipq40xx-*`/`ipq6018-*` files, **never** in any `ipq5018-*`
+  one. `78AF000` is what actually appears throughout every IPQ5018 board
+  DTS (`mp02.1`, `sod`, `db-mp03.*`, `mp03.*`, `emulation`) AND the shared
+  `ipq5018-soc.dtsi` (`serial@78AF000`, line 19) - that fixup line in
+  `ipq5018.c` is almost certainly dead code left over from copying the
+  IPQ807x board file without fully updating it for IPQ5018. DTS is
+  authoritative over one leftover C reference; use `0x78AF000`.
 - Register layout (offsets from base; two `#ifdef`-gated variants exist in
   `uart.h`, need to confirm at prepare-time which one this board's config
   actually selects before finalizing - both captured here so either is a
