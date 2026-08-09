@@ -1803,6 +1803,80 @@ static void mr80x_populate_ram(MachineState *machine)
      * that automatic restore to land on. */
 }
 
+/* ============================================================
+ * Linux's own SMC calls (PSCI - CPU_ON to boot the second CPU core the
+ * DT declares, PSCI_VERSION/FEATURES probes) hit the exact same
+ * MVBAR/SMC trampoline (above) appsbl's SCM_SVC_FUSE calls do - real
+ * hardware would route both to the same Monitor-mode firmware too.
+ * But unlike appsbl (which runs with u-boot's own, unusually
+ * permissive single-1MiB-section-executable MMU setup, see the
+ * MR80X_MVBAR_BASE comment), the kernel builds its *own* page tables
+ * from scratch and, for reasons not fully root-caused (neither the
+ * DT's `memory` node nor its `reserved-memory` carve-outs exclude
+ * this physical address - confirmed by dumping and decompiling the
+ * live in-RAM DTB via the QEMU monitor's `pmemsave` mid-boot), simply
+ * doesn't map the trampoline's physical page at all - confirmed via
+ * `-d int`: a Prefetch Abort with IFSR 0x5 (translation fault) at
+ * exactly the trampoline's physical address, right as the kernel
+ * (genuinely alive and running real code, not crashed - visible
+ * setting up its own per-mode exception stacks around pc=0x8131252x
+ * first) issues its first post-"Starting kernel..." `smc`.
+ *
+ * Fix: use QEMU's own *native* PSCI implementation
+ * (target/arm/tcg/psci.c, the same C-code SMC interception the `virt`
+ * machine type uses for SMP boot) instead of guest-visible trampoline
+ * code for calls made after u-boot hands off - entirely sidesteps the
+ * "is this physical page mapped by whichever page tables happen to be
+ * active" question, since QEMU intercepts the `smc` *before* any
+ * guest instruction fetch happens for it at all.
+ *
+ * Can't just enable `cpu->psci_conduit` unconditionally from machine
+ * start, though: `arm_is_psci_call()` intercepts *every* `smc`
+ * regardless of which function ID it carries (checked before the
+ * instruction executes), so it would also swallow appsbl's own
+ * Qualcomm-specific SCM_SVC_FUSE calls - QEMU's PSCI handler's
+ * "unrecognized function ID" case returns r0=QEMU_PSCI_RET_NOT_SUPPORTED
+ * (-1, kvm-consts.h), which appsbl's own scm.c `scm_remap_error()`
+ * maps to `-EIO` (since -1 == SCM_ERROR, checked before
+ * SCM_EOPNOTSUPP=-4 in that switch) - NOT `-EOPNOTSUPP`, which is
+ * exactly the value do_bootipq() branches on (section 21) -
+ * reintroducing the original silent-reset bug this session already
+ * fixed once.
+ *
+ * So this is gated dynamically: a periodic QEMU-side timer (no guest
+ * involvement at all, just watches CPU state) polls the CPU's PC, and
+ * flips `psci_conduit` to SMC the first time PC lands outside
+ * appsbl's own ~1MiB code footprint - a simple, image-independent
+ * proxy for "u-boot is done, this has to be the kernel (or later)"
+ * that doesn't require knowing any specific FIT image's load address
+ * ahead of time. Reset back to DISABLED (own trampoline handles
+ * everything again) on every machine reset, so the console `reset`
+ * command's second boot cycle - which re-runs appsbl's own SCM_SVC_FUSE
+ * calls - keeps working exactly as before this existed. */
+#define MR80X_PSCI_WATCH_INTERVAL_NS (5 * SCALE_MS)
+
+static QEMUTimer *mr80x_psci_watch_timer;
+
+static void mr80x_psci_watch_tick(void *opaque)
+{
+    MR80XResetState *rs = opaque;
+    target_ulong pc = rs->cpu->env.regs[15];
+
+    if (pc < MR80X_APPSBL_ENTRY || pc >= MR80X_APPSBL_ENTRY + MiB) {
+        rs->cpu->psci_conduit = QEMU_PSCI_CONDUIT_SMC;
+        info_report("mr80x: pc=0x%lx is past appsbl's own code - "
+                    "switching SMC calls to QEMU's native PSCI "
+                    "handling (kernel CPU_ON/VERSION/etc, real appsbl "
+                    "SCM calls are already done by now)",
+                    (unsigned long)pc);
+        return;
+    }
+
+    timer_mod(mr80x_psci_watch_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  MR80X_PSCI_WATCH_INTERVAL_NS);
+}
+
 static void mr80x_reset(void *opaque)
 {
     MR80XResetState *rs = opaque;
@@ -1812,6 +1886,15 @@ static void mr80x_reset(void *opaque)
     mr80x_populate_ram(rs->machine);
     cpu_set_pc(cs, MR80X_APPSBL_ENTRY);
     rs->cpu->env.cp15.mvbar = MR80X_MVBAR_BASE;
+    rs->cpu->psci_conduit = QEMU_PSCI_CONDUIT_DISABLED;
+
+    if (!mr80x_psci_watch_timer) {
+        mr80x_psci_watch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                               mr80x_psci_watch_tick, rs);
+    }
+    timer_mod(mr80x_psci_watch_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  MR80X_PSCI_WATCH_INTERVAL_NS);
 
     /* mr80x_populate_ram() pokes RAM (including the MVBAR trampoline)
      * via cpu_physical_memory_write() from board code, not via a

@@ -1286,6 +1286,102 @@ No kernel console output was observed in the short validation window after
 `Starting kernel ...`; that is now the next boot-stage problem, separate from
 u-boot locating and loading `kernel` from UBI.
 
+## 25. The kernel genuinely runs (not stuck) - it was crashing on its own first SMC/PSCI call, fixed with QEMU's native PSCI instead of the guest trampoline
+
+Follow-up to section 24's "no console output" note. First confirmed the kernel
+isn't just silently hung: `-d int` exception tracing (non-invasive, doesn't
+perturb timing the way gdb single-stepping does - see section 21's
+methodology) shows real kernel code executing after "Starting kernel ..." -
+`AArch32 mode switch from svc to irq/abt/und/fiq/svc PC 0x81312520..0x81312548`
+is the kernel's own early per-mode exception-stack setup, standard ARM Linux
+boot code, definitely not appsbl.
+
+It then crashes: `Taking exception 3 [Prefetch Abort] ... IFSR 0x5 IFAR
+0x4a9f9008` - a translation fault at the exact physical address of the
+MVBAR/SMC trampoline (section 21). The kernel's device tree declares two CPUs
+with `enable-method = "psci"` (`cpu@0`/`cpu@1` under `/cpus`, confirmed by
+dumping the live in-RAM DTB via the QEMU monitor's `pmemsave` command mid-boot
+and decompiling with `dtc` - see the exact recipe below) and a `psci` node,
+so this is Linux's own PSCI probe/CPU_ON `smc` landing at the same Monitor
+vector appsbl's SCM_SVC_FUSE calls do. Unlike appsbl - which runs under
+u-boot's own unusually permissive "one whole 1MiB section is exec-friendly"
+MMU setup (section 21) - the kernel builds its own page tables from scratch
+and, for reasons not fully root-caused (neither the DT's `memory` node,
+`reg = <0x0 0x40000000 0x0 0x10000000>`, nor its `reserved-memory` carve-outs
+- `nss@40000000`, `smem@4ab00000`, `tz@4ac00000`, `tzapp@4a400000`, `bt@7000000`
+- exclude this address), simply never maps the trampoline's page at all.
+
+Recipe used to get the live DTB out of guest RAM for inspection (u-boot's own
+"Loading Device Tree to 4a3ef000, end 4a3ff4f1" log line gives the address/
+size):
+
+```
+qemu-system-arm -M mr80x ... -monitor unix:/tmp/mon.sock,server,nowait &
+sleep 8   # long enough to be well past DT load, before/around the crash
+printf 'pmemsave 0x4a3ef000 0x104f2 kernel_dtb.bin\n' | <send to the socket>
+dtc -I dtb -O dts kernel_dtb.bin -o kernel_dtb.dts
+```
+
+**Fix**: rather than chase where the kernel's own paging_init() does or
+doesn't map things (its page-table logic is arch/generic Linux code, not this
+project's own, so there's no source here to grep the way appsbl's SCM path
+could be traced in section 21), sidestep the whole "is this guest-RAM address
+mapped by whichever page table happens to be active" question entirely by
+using QEMU's own *native* PSCI implementation (`target/arm/tcg/psci.c` -
+the same C-level SMC interception the `virt` machine type uses for SMP boot)
+for calls made after u-boot's own handoff. QEMU intercepts a `psci_conduit`
+CPU's `smc` *before* any guest instruction fetch happens for it at all, so
+guest page tables become irrelevant.
+
+Can't just set `cpu->psci_conduit = QEMU_PSCI_CONDUIT_SMC` unconditionally
+from machine start, though: `arm_is_psci_call()` intercepts *every* `smc`
+regardless of function ID (checked before the instruction executes) - it
+would also swallow appsbl's own Qualcomm-specific SCM_SVC_FUSE calls. QEMU's
+PSCI handler's "unrecognized function ID" case returns
+`r0 = QEMU_PSCI_RET_NOT_SUPPORTED` (`-1`, `target/arm/kvm-consts.h`), which
+appsbl's own `arch/arm/cpu/armv7/qca/common/scm.c`'s `scm_remap_error()`
+maps to `-EIO` (`-1` matches `SCM_ERROR`, checked *before*
+`SCM_EOPNOTSUPP = -4` in that switch) - not `-EOPNOTSUPP`, which is exactly
+the value `do_bootipq()` branches on (section 21) - reintroducing the
+original silent-reset bug this session already fixed once.
+
+So it's gated dynamically in `board/mr80x.c`: a periodic `QEMU_CLOCK_VIRTUAL`
+timer (`mr80x_psci_watch_tick()`, 5ms interval, pure QEMU-side polling, no
+guest involvement) watches the CPU's PC and flips `psci_conduit` to `SMC`
+the first time PC lands outside appsbl's own ~1MiB code footprint
+(`< MR80X_APPSBL_ENTRY` or `>= MR80X_APPSBL_ENTRY + MiB`) - a simple,
+FIT-image-independent proxy for "u-boot is done, this has to be the kernel
+(or later)" that doesn't require hardcoding any specific kernel load address
+(varies per FIT image/build). Reset back to `DISABLED` on every machine
+reset (`mr80x_reset()`), so the console `reset` command's second boot cycle -
+which re-runs appsbl's own SCM_SVC_FUSE calls from scratch - keeps working
+exactly as it did before this existed (section 21).
+
+Verified via `-d int`: the same PSCI-probe `smc` that used to fault now shows
+`...handled as PSCI call` with no abort at all, confirmed across a fresh full
+boot from `FULL_FIRMWARE.bin`.
+
+**Still open**: even with the crash gone, no kernel console output has been
+observed yet. Confirmed via `printenv bootargs` at the u-boot console:
+`bootargs=console=ttyMSM0,115200n8` - the kernel *is* told to use the same
+physical UART (`ttyMSM0`, the MSM/QUP serial block at `0x078AF000`) u-boot's
+own console already uses, so this isn't a missing-`console=` problem. That
+narrows it specifically to the Linux `msm_serial` driver's own register-level
+expectations (interrupt-driven, DT-`compatible`-string-matched, quite
+different code from u-boot's bare-metal `qca_uart.c` polling loop this
+emulator's UART model was built against) not lining up with what this board
+model provides - `-d int` shows no further exceptions after the PSCI fix,
+meaning execution is proceeding normally, just silently as far as this
+emulator's UART model can tell. This is meaningfully bigger in scope than everything
+else in this file: it's the difference between "emulate what u-boot needs"
+(this project's original, now largely complete goal - SPI/NAND geometry,
+partitions, Ethernet, UART, recovery HTTP, signature verification, reboot)
+and "emulate what a full Linux kernel needs" (earlycon/console driver
+register semantics, GIC interrupt controller, ARM generic timer as the
+kernel sees it - not just u-boot's simpler polling use of it, etc.) - a
+materially larger, more open-ended undertaking than the bootloader-focused
+scope this file has tracked so far.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
@@ -1365,15 +1461,32 @@ u-boot locating and loading `kernel` from UBI.
     `FULL_FIRMWARE.bin` now attaches the populated UBI, finds two user
     volumes, reads the `kernel` volume, validates/decompresses the FIT
     image and reaches `Starting kernel ...`.
-20. **Next, still open**: no kernel console output has been observed yet
-    after `Starting kernel ...`; investigate Linux entry/earlycon/DT/SoC
-    devices now that u-boot's UBI/kernel-load path is working.
-21. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
+20. [done] MILESTONE (section 25): fixed the kernel's own crash on its
+    first post-handoff `smc` (PSCI probe/CPU_ON, per the DT's two-CPU
+    `enable-method = "psci"`) - was faulting with a translation fault
+    at the MVBAR trampoline's physical address because the kernel's
+    own page tables (unlike u-boot's) don't map it. Fixed via a
+    PC-watching QEMU timer that switches to QEMU's *native* PSCI
+    implementation once execution leaves appsbl's own code range,
+    while appsbl's own SCM_SVC_FUSE calls (including on the console
+    `reset` command's second boot cycle) keep using the guest
+    trampoline as before. Verified via `-d int`: no more abort, PSCI
+    calls now show `...handled as PSCI call`.
+21. **Next, still open, and a materially bigger undertaking than
+    everything above**: even past the PSCI crash, no kernel console
+    output has been observed. Likely an ordinary "serial driver
+    register semantics"/`console=` bootarg gap rather than another
+    crash (no further exceptions seen), but chasing full Linux dmesg
+    output means emulating what a *kernel* needs (earlycon, GIC,
+    kernel-facing generic timer semantics), not just what *u-boot*
+    needs - a different, larger scope than this project has targeted
+    so far.
+22. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
     driven - real flashing after signature verification (section 16)
     still fails with "Attempt to write outside the flash area". Lower
     priority since it doesn't block the recovery/signing test flow
     (the HTTP response is "Upgrade Success" regardless).
-22. Once kernel handoff and NAND write both work: test `out/appsbl-dual-key.bin`
+23. Once kernel handoff and NAND write both work: test `out/appsbl-dual-key.bin`
     (accepts either the original vendor key or the swapped-in custom
     one) and a full-size real firmware image, not just a small test
     payload.
