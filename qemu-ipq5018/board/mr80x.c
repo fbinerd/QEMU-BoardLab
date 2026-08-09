@@ -45,6 +45,31 @@
 #define MR80X_GCC_BASE      0x01800000
 #define MR80X_GCC_SIZE      (256 * KiB)
 
+/* ---- SMEM (arch/arm/cpu/armv7/qca/common/smem.c) ----
+ * Real hardware has SBL populate this before appsbl ever runs; since we
+ * don't execute sbl1 (see BRINGUP-NOTES.md section 7b), fdtdec_setup()'s
+ * call to smem_get_board_platform_type() would otherwise read zeroed RAM
+ * and hang() (confirmed empirically: first boot attempt hit exactly this
+ * hang, at the fdtdec_setup->parse_combined_fdt->hang() call chain).
+ * CONFIG_SMEM_VERSION_C is NOT set for this board (checked
+ * build/u-boot-2016/.config), so smem_read_alloc_entry() uses the older,
+ * simple `struct smem { proc_comm[4]; version_info[32]; heap_info;
+ * alloc_info[SMEM_MAX_SIZE]; }` layout directly at CONFIG_QCA_SMEM_BASE,
+ * not the newer partition-table format - only one alloc_info entry
+ * needs to be valid: SMEM_MACHID_INFO_LOCATION (=425 in
+ * board/qca/arm/ipq5018/ipq5018.h's smem_mem_type_t), pointing at an
+ * 8-byte {format,machid} struct smem_machid_info (format is never
+ * validated by smem_get_board_platform_type(), only machid is used). */
+#define MR80X_SMEM_BASE          0x4AB00000
+#define MR80X_SMEM_ALLOC_INFO_OFF (4 * 16 + 32 * 4 + 4 * 4) /* 0x1B60 */
+#define MR80X_SMEM_MACHID_TYPE    425
+#define MR80X_SMEM_MACHID_DATA_OFF 0x4000 /* clear of alloc_info[506] end */
+/* Targets ipq5018-emulation.dts's machid - Qualcomm's own reduced
+ * bring-up profile, deliberately chosen over hunting down MR80X v5's
+ * real machid among ~18 near-identical board DTS files (BRINGUP-NOTES.md
+ * section 7). */
+#define MR80X_TARGET_MACHID       0x0F040000
+
 /* GCC BLSP1 UART1 clock registers (ipq5018.h) - offsets are absolute
  * addresses in the vendor header; store relative to MR80X_GCC_BASE. */
 #define GCC_BLSP1_UART1_APPS_CBCR      (0x0180203C - MR80X_GCC_BASE)
@@ -163,6 +188,52 @@ static void mr80x_gcc_write(void *opaque, hwaddr offset, uint64_t value,
 static const MemoryRegionOps mr80x_gcc_ops = {
     .read = mr80x_gcc_read,
     .write = mr80x_gcc_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/* ============================================================
+ * Generic timer counter-view MMIO registers (gcnt_cntcv_lo/hi from the
+ * /timer DT node in ipq5018-soc.dtsi - 0x4A2000/0x4A2004), read by
+ * arch/arm/cpu/armv7/qca/common/timer.c's read_counter(), which
+ * __udelay() spins on. Not wired to a real clock: each read of the LO
+ * half just advances a free-running counter by a large step, so any
+ * delay-loop-until-elapsed check on real silicon terminates almost
+ * immediately here too - we don't need wall-clock-accurate delays for
+ * this to boot correctly, just forward progress.
+ * ============================================================ */
+
+#define MR80X_TIMER_BASE 0x4A2000
+#define MR80X_TIMER_SIZE 0x8
+#define MR80X_TIMER_STEP 0x100000
+
+typedef struct MR80XTimerState {
+    MemoryRegion iomem;
+    uint64_t counter;
+} MR80XTimerState;
+
+static uint64_t mr80x_timer_read(void *opaque, hwaddr offset, unsigned size)
+{
+    MR80XTimerState *s = opaque;
+
+    if (offset == 0x0) {
+        s->counter += MR80X_TIMER_STEP;
+        return (uint32_t)s->counter;
+    } else if (offset == 0x4) {
+        return (uint32_t)(s->counter >> 32);
+    }
+    return 0;
+}
+
+static void mr80x_timer_write(void *opaque, hwaddr offset, uint64_t value,
+                               unsigned size)
+{
+    /* real hardware: read-only counter view; ignore writes */
+}
+
+static const MemoryRegionOps mr80x_timer_ops = {
+    .read = mr80x_timer_read,
+    .write = mr80x_timer_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
@@ -303,6 +374,28 @@ static void mr80x_init(MachineState *machine)
 
     memory_region_add_subregion(sysmem, MR80X_RAM_BASE, machine->ram);
 
+    /* Fake just enough SMEM for fdtdec_setup()'s machid lookup to
+     * succeed - see the comment by MR80X_SMEM_BASE above. */
+    {
+        uint32_t v;
+        hwaddr entry = MR80X_SMEM_BASE + MR80X_SMEM_ALLOC_INFO_OFF +
+                        MR80X_SMEM_MACHID_TYPE * 16;
+
+        v = cpu_to_le32(1);
+        cpu_physical_memory_write(entry + 0, &v, 4);   /* allocated */
+        v = cpu_to_le32(MR80X_SMEM_MACHID_DATA_OFF);
+        cpu_physical_memory_write(entry + 4, &v, 4);   /* offset */
+        v = cpu_to_le32(8);
+        cpu_physical_memory_write(entry + 8, &v, 4);   /* size */
+
+        v = cpu_to_le32(0);
+        cpu_physical_memory_write(MR80X_SMEM_BASE + MR80X_SMEM_MACHID_DATA_OFF,
+                                   &v, 4);              /* format */
+        v = cpu_to_le32(MR80X_TARGET_MACHID);
+        cpu_physical_memory_write(
+            MR80X_SMEM_BASE + MR80X_SMEM_MACHID_DATA_OFF + 4, &v, 4);
+    }
+
     if (!machine->kernel_filename) {
         error_report("mr80x: use -kernel to load appsbl.unpadded.elf "
                       "(or an -kernel-compatible raw appsbl.bin via "
@@ -334,6 +427,12 @@ static void mr80x_init(MachineState *machine)
     memory_region_init_io(&gcc->iomem, NULL, &mr80x_gcc_ops, gcc,
                            "mr80x.gcc", MR80X_GCC_SIZE);
     memory_region_add_subregion(sysmem, MR80X_GCC_BASE, &gcc->iomem);
+
+    /* Generic timer counter-view registers */
+    MR80XTimerState *timer = g_new0(MR80XTimerState, 1);
+    memory_region_init_io(&timer->iomem, NULL, &mr80x_timer_ops, timer,
+                           "mr80x.timer", MR80X_TIMER_SIZE);
+    memory_region_add_subregion(sysmem, MR80X_TIMER_BASE, &timer->iomem);
 
     /* UART */
     MR80XUartState *uart = g_new0(MR80XUartState, 1);

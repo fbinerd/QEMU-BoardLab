@@ -14,13 +14,13 @@ RUN tar xf qemu-9.1.0.tar.xz && rm qemu-9.1.0.tar.xz
 COPY board/mr80x.c /build/qemu-9.1.0/hw/arm/mr80x.c
 COPY board/Kconfig.fragment /build/kconfig.fragment
 RUN cat /build/kconfig.fragment >> /build/qemu-9.1.0/hw/arm/Kconfig && \
-    sed -i "/system_ss.add(when: 'CONFIG_COLLIE'/a system_ss.add(when: 'CONFIG_MR80X', if_true: files('mr80x.c'))" \
+    sed -i "/arm_ss.add(when: 'CONFIG_HIGHBANK'/a arm_ss.add(when: 'CONFIG_MR80X', if_true: files('mr80x.c'))" \
         /build/qemu-9.1.0/hw/arm/meson.build
 
 WORKDIR /build/qemu-9.1.0
 RUN ./configure --target-list=arm-softmmu --disable-docs --disable-tools \
         --disable-guest-agent --without-default-features \
         --enable-tcg --enable-slirp \
-    && ninja -C build arm-softmmu/qemu-system-arm -j"$(nproc)"
+    && ninja -C build qemu-system-arm -j"$(nproc)"
 
 WORKDIR /src

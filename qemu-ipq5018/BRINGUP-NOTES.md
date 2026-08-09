@@ -233,23 +233,137 @@ is still present in the backing flash image (section 4b) so anything
 `appsbl` itself reads from those partitions (mibib partition table via
 `smeminfo`, ART MAC/calibration, etc.) resolves to real values.
 
+## 8. MILESTONE (2026-08-09): real appsbl.bin boots to an interactive console
+
+First working end-to-end boot, against the real, unmodified
+`appsbl/out/appsbl.unpadded.elf` (not a test stub):
+
+```
+U-Boot 2016.01 (Nov 11 2024 - 20:42:13 +0800)
+DRAM:  256 MiB
+...
+machid: f040000
+...
+key 14 addr 0x0100e004 val 0x0
+FW GPIO is pressed. Enter firmware recovery mode!
+...
+Start web server.
+...
+IPQ5018#
+```
+
+The `U-Boot 2016.01 (Nov 11 2024 - 20:42:13 +0800)` banner is
+byte-for-byte the same string already documented from the real hardware
+in `openwrt-build-tools`'s `recovery_mr80x_v5.md`. `machid: f040000`
+confirms the SMEM fake-out (section 7c below) is working exactly as
+designed. Unexpectedly, since GPIO reads currently fall through to the
+TLMM catch-all stub (always returns 0) and this device treats
+GPIO14=0 as "reset button held", it **auto-entered firmware recovery
+mode and started the HTTP recovery server** - the exact subsystem this
+whole project has spent months on - which was not the target for this
+milestone but means the emulator is already deep enough to potentially
+test HTTP recovery uploads (including `tplink-cloud-sign.py`-signed
+images) without real hardware, once Ethernet is modeled. Ethernet
+itself isn't wired yet, so the recovery server's own link-state polling
+loop fails and it falls through back to the normal boot flow, still
+reaching the `IPQ5018#` shell prompt either way.
+
+### What got fixed to reach this point, in order
+
+1. UART base address corrected (0x78AF000, not 0x78b0000 - section 3).
+2. GCC clock stub for `uart1_trigger_update()`'s polling loop (section 4).
+3. **SMEM machid fake-out** (new, section 7c below) - without it,
+   `fdtdec_setup()` → `smem_get_board_platform_type()` reads
+   uninitialized RAM (since we don't execute sbl1, which would normally
+   populate SMEM) and `parse_combined_fdt()` calls `hang()` when no DTB
+   entry in the combined blob matches. Fixed by writing a single valid
+   `smem_alloc_info` entry (type `SMEM_MACHID_INFO_LOCATION`=425, the
+   *older* non-partition-table SMEM layout - confirmed
+   `CONFIG_SMEM_VERSION_C` is unset for this board, so the simple
+   `struct smem { proc_comm[4]; version_info[32]; heap_info;
+   alloc_info[506]; }` applies directly at `CONFIG_QCA_SMEM_BASE`
+   (`0x4AB00000`), no partition-table parsing needed) pointing at an
+   8-byte `{format, machid}` struct with `machid = 0x0F040000`
+   (`ipq5018-emulation.dts`'s machid, per the section 7 decision).
+4. **Generic timer counter-view registers** (new, section 7d below) -
+   `read_counter()`/`__udelay()` polls `gcnt_cntcv_lo`/`gcnt_cntcv_hi`
+   at `0x4A2000`/`0x4A2004` (from the `/timer` DT node in
+   `ipq5018-soc.dtsi`); without a model, the poll loop spun forever on
+   an always-zero "elapsed time". Modeled as a free-running counter that
+   jumps forward by a large step on every read of the LO half - not
+   wall-clock accurate, but delay loops complete essentially instantly,
+   which is what we want for fast iteration anyway.
+
+## 7c. SMEM MMIO region (board/qca/arm/ipq5018/, arch/arm/cpu/armv7/qca/common/smem.c)
+
+`MR80X_SMEM_BASE = 0x4AB00000` (`CONFIG_QCA_SMEM_BASE`). Struct layout
+(all fields plain `unsigned`, naturally 4-byte aligned, no padding):
+
+```
+struct smem {
+    struct smem_proc_comm proc_comm[4];   // 4 * 16 bytes, offset 0x000
+    unsigned version_info[32];             // 32 * 4 bytes, offset 0x040
+    struct smem_heap_info heap_info;       // 16 bytes,     offset 0x0C0
+    struct smem_alloc_info alloc_info[506];// 506*16 bytes, offset 0x0D0
+};
+struct smem_alloc_info { unsigned allocated, offset, size, reserved; }; // 16 bytes
+```
+
+Only `alloc_info[425]` (`SMEM_MACHID_INFO_LOCATION`, from
+`board/qca/arm/ipq5018/ipq5018.h`'s `smem_mem_type_t`) needs to be
+valid for `smem_get_board_platform_type()`'s first lookup path to
+succeed and return immediately - its `format` field is never checked,
+only `machid`. Byte offset of `alloc_info[425]` = `0xD0 + 425*16` =
+`0x1B60`. Currently written directly into guest RAM in `mr80x_init()`
+via `cpu_physical_memory_write()` (not a real MMIO device - SMEM is
+just plain shared RAM on real hardware too, no register semantics to
+model, just needs the right bytes present before boot).
+
+Every OTHER `smem_read_alloc_entry()` call in the boot log
+(`SMEM_BOOT_FLASH_TYPE`, `SMEM_BOOT_FLASH_INDEX`, etc. - the repeated
+"smem: read ... failed" lines) fails gracefully with a printed warning
+and a hardcoded fallback default - none of them block boot, so none
+needed faking (yet - revisit if a later feature depends on one
+resolving to a real value instead of its default).
+
+## 7d. Generic timer counter-view registers
+
+`MR80X_TIMER_BASE = 0x4A2000..0x4A2007` (`gcnt_cntcv_lo`/`gcnt_cntcv_hi`
+from the `/timer` node in `ipq5018-soc.dtsi`, lines 30-31). Modeled as
+a free-running 64-bit counter, LO half advances by `0x100000` on every
+read (arbitrary - large enough that any real delay-until-elapsed loop
+in `read_counter()`/`__udelay()`/`get_timer()` finishes in a handful of
+reads instead of spinning). Not tied to `QEMU_CLOCK_VIRTUAL` or real
+wall-clock time - intentional, since fast/deterministic boot matters
+more here than timing accuracy for delays that are typically
+microsecond-scale on real hardware anyway.
+
 ## Status / next steps (in order)
 
-1. [done] Boot-entry and memory-map research (this document).
-2. [in progress] Finish extracting exact register maps: UART `SR`/`RF`
-   offsets, GCC clock controller addresses for `uart1_clock_config()`,
-   QPIC NAND register map, DesignWare base address for the real (not
-   emulation-DTS) board.
-3. Stand up the QEMU source build (Dockerfile, vendored/pinned QEMU
-   9.1.0 source, new `hw/arm/mr80x.c` skeleton wired into
-   `hw/arm/Kconfig` + `hw/arm/meson.build`) with just CPU+RAM+a
-   log-everything catch-all MMIO stub device covering the regions we
-   haven't modeled yet, to see exactly where boot actually gets stuck
-   against ground truth rather than more static analysis.
-4. Implement UART properly, confirm real console text appears.
-5. Implement clock stub for UART's polling loops.
-6. Implement QPIC NAND backed by a file.
-7. Implement/wire Ethernet.
-8. Iterate against `out/appsbl.bin` (known-good, byte-identical to real
-   hardware) first, then `out/appsbl-custom.bin`/`appsbl-dual-key.bin`,
-   then finally test a `tplink-cloud-sign.py`-signed image end-to-end.
+1. [done] Boot-entry and memory-map research.
+2. [done] UART, GCC clock stub, SMEM machid fake-out, generic timer -
+   real `appsbl.unpadded.elf` reaches the `IPQ5018#` interactive
+   console prompt (section 8).
+3. [done] QEMU source build (Dockerfile, vendored QEMU 9.1.0,
+   `hw/arm/mr80x.c` wired into `hw/arm/Kconfig` + `hw/arm/meson.build`
+   under `arm_ss` - NOT `system_ss`, that was the first build error,
+   `system_ss` files don't get the `-I` path for `cpu.h`).
+4. Next: QPIC NAND backed by `FULL_FIRMWARE.bin` (section 4b/5) -
+   currently falls through to "Unknown flash type" / "Qpic controller
+   not support serial NAND", gracefully non-fatal but means no real
+   partition data is reachable yet.
+5. Next: DesignWare Ethernet (section 6) - currently the GMAC init
+   writes land in the catch-all stub and link-state polling always
+   fails ("Link status/Get speed/Get duplex not mapped FAIL"), so the
+   auto-triggered HTTP recovery server (see section 8) can start but
+   can't actually serve anything yet.
+6. GPIO/TLMM currently an unmodeled catch-all stub that happens to
+   return 0 for everything, including GPIO14 (reset button) - that's
+   why recovery mode auto-triggers on every boot right now. Worth a
+   real (if simple) GPIO model once NAND/Ethernet are in, so boot mode
+   is deliberately selectable instead of an accident of the stub's
+   default return value.
+7. Once NAND + Ethernet work: test `out/appsbl-custom.bin` and
+   `out/appsbl-dual-key.bin` (not just plain `appsbl.bin`), then
+   finally a `tplink-cloud-sign.py`-signed image through the actual
+   HTTP recovery upload path - the original point of building this.
