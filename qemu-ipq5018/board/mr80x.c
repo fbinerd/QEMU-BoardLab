@@ -939,10 +939,12 @@ static void mr80x_uart_event(void *opaque, QEMUChrEvent event) {}
  * ============================================================ */
 
 #define GMAC_DMA_OFFSET          0x1000
+#define GMAC_DMA_BUSMODE         (GMAC_DMA_OFFSET + 0x00)
 #define GMAC_DMA_TXPOLLDEMAND    (GMAC_DMA_OFFSET + 0x04)
 #define GMAC_DMA_RXPOLLDEMAND    (GMAC_DMA_OFFSET + 0x08)
 #define GMAC_DMA_RXBASEADDR      (GMAC_DMA_OFFSET + 0x0C)
 #define GMAC_DMA_TXBASEADDR      (GMAC_DMA_OFFSET + 0x10)
+#define DMAMAC_SRST              (1 << 0)
 
 #define DESC_OWN_BY_DMA          0x80000000u
 #define DESC_FRAME_LEN_MASK      0x3FFF0000u
@@ -1051,6 +1053,19 @@ static int mr80x_gmac_can_receive(NetClientState *nc)
 static uint64_t mr80x_gmac_read(void *opaque, hwaddr offset, unsigned size)
 {
     MR80XGmacState *s = opaque;
+
+    /* ipq_mac_reset() writes DMAMAC_SRST then busy-polls busmode until
+     * it self-clears (real DMA hardware clears it within a few bus
+     * cycles). Model that by clearing it on readback - without this,
+     * the poll spins forever and ipq_eth_init() never reaches its RX/
+     * TX descriptor ring setup, so no packet can ever be sent or
+     * received despite PHY link-up succeeding earlier in the same
+     * function (that's why "eth0 up Speed :100" printed but no ARP
+     * reply for 192.168.0.1 ever went out - the RX ring was never
+     * programmed for the driver to have anything to receive into). */
+    if (offset == GMAC_DMA_BUSMODE) {
+        s->regs[offset / 4] &= ~DMAMAC_SRST;
+    }
     return s->regs[offset / 4];
 }
 

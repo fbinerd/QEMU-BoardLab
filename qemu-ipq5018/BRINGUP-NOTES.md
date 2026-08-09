@@ -555,6 +555,133 @@ if crash-recovery-triggered resets matter for some future test (mainline
 non-crash reboots, e.g. a `reset` console command, would hit the same
 `qti_scm_pshold()` path and are equally unverified yet).
 
+## 13. QPIC NAND: device ID detection via a real BAM cmd-pipe model
+
+Implemented the `NAND_VERSION` gate (`board+0x4F08`, needs
+`hw_ver>=2`) so `board_nand_init()` stops bailing out immediately with
+"Qpic controller not support serial NAND". Past that gate,
+`qpic_nand_fetch_id()`/`qpic_nand_read_reg()` don't touch NAND
+registers directly at all - they build a `struct cmd_element` array in
+RAM, wrap it in one `struct bam_desc`, write it into the "cmd pipe"'s
+descriptor FIFO, then kick the BAM engine by writing the new FIFO
+offset to `BAM_P_EVNT_REGn(2,...)` (base `0x07984000`). Modeled a
+minimal synchronous BAM: on that kick write, read back the new
+descriptor, and when `BAM_DESC_CMD_FLAG` is set, interpret its buffer
+as concatenated `cmd_element`s and apply each as a direct read/write
+against a shared NAND register file (the same one plain MMIO to
+`0x079B0000` uses) - `CE_WRITE_TYPE` writes the register, `CE_READ_TYPE`
+writes the register's value out to the RAM address the driver gave
+(see `bam_add_cmd_element()`'s "value is a destination pointer for
+reads" comment). `addr_n_cmd` only keeps the register address's low 24
+bits (top byte repurposed for cmd type) - reconstructable as
+`0x07000000 | low24` since every QPIC NAND register lives at
+`0x079Bxxxx`. `NAND_EXEC_CMD` write with a `NAND_FLASH_CMD` value of
+`NAND_CMD_FETCH_ID` (`0x0B`) synthesizes a fake GigaDevice
+`GD5F1GQ4RE9IG` ID (`{0xc8,0xc1}`, chosen because its
+page/block/density already match the SMEM flash-type fakes from
+section 9). Confirmed: `Serial Nand Device Found With ID : 0xc8 0xc1
+... Device Size:128 MiB, Page size:2048 ...`. Only ID/probe works -
+real page data (kernel/env/rootfs) still isn't backed by anything, see
+next-steps.
+
+## 14. MILESTONE: MVBAR/SMC trampoline - normal boot survives past autoboot
+
+The GPIO14 fix (section 12) exposed a *different* crash after "Hit any
+key to stop autoboot", byte-identical (`lr=0x4a82286c`) whether or not
+NAND ID detection (section 13) succeeds - proof it was never a NAND
+issue. Root cause: `do_bootipq()`'s very first hardware access is
+`qca_scm_call(SCM_SVC_FUSE, QFPROM_IS_AUTHENTICATE_CMD, ...)` - a bare
+`smc #0` instruction (`arch/arm/cpu/armv7/qca/common/scm.c`). No
+secure-world firmware runs in this machine (section 7b), so `MVBAR`
+(Monitor mode's vector base) was never programmed by anyone, and `smc`
+faulted into nothing.
+
+Fixed by writing a 2-instruction trampoline (`mvn r0,#3 ; movs pc,lr`
+- sets r0 to `SCM_EOPNOTSUPP`/-4 and returns) and pointing the CPU's
+`env.cp15.mvbar` at it directly from board C code at reset time (guest
+code has no legitimate way to set MVBAR itself without secure
+firmware). `scm.c`'s own error-remap table turns `SCM_EOPNOTSUPP` into
+`-EOPNOTSUPP`, which every caller already treats as "SCM not present,
+continue without it" - matching real hardware-without-TrustZone
+behavior. `is_scm_armv8()`'s own calling-convention probe also just
+reads r0, so one trampoline transparently handles both the legacy and
+"armv8_32" SCM call conventions used across this file.
+
+Getting the trampoline's *address* right took three tries, root-caused
+via `-d int` exception tracing (`IFSR 0xd` = permission fault):
+`arch/arm/lib/cache-cp15.c`'s `dram_bank_mmu_setup()`
+(`CONFIG_IPQ_NO_RELOC` path, which `ipq5018.h` enables) marks the
+*entire* 4GB address space `SHARED_DEVICE` (execute-unfriendly) first,
+then for DRAM specifically marks only the *one* 1MiB section
+containing `CONFIG_SYS_TEXT_BASE` (`0x4A920000`) as exec-friendly -
+every other MiB of DRAM, even real backing RAM QEMU provides, keeps
+the device-like attribute and can't be fetched from. The trampoline
+now lives at `appsbl-entry - 0x1000`, guaranteed inside that one safe
+section, written *after* the ELF/image load so it can't be clobbered.
+
+Confirmed: normal boot now reaches "Hit any key to stop autoboot",
+correctly proceeds (GPIO14 read as not-pressed), and - since no real
+kernel data is readable yet - cycles through a *clean* reset instead
+of corrupting state, exactly what real hardware would do finding no
+valid kernel.
+
+## 15. GMAC1 DMA reset-poll fix + MR80X_RECOVERY - reaching the real recovery HTTP server
+
+Two more fixes were needed to actually reach and test the recovery
+HTTP server (the original point of this whole emulator):
+
+**a) `ipq_mac_reset()`'s reset-bit poll never terminated.** It writes
+`DMAMAC_SRST` (bit 0) into `dma_reg->busmode`
+(`gmac_base+0x1000+0x00`) then busy-polls until it self-clears (real
+DMA hardware clears it within a few bus cycles) - our generic
+register-latch model just stored whatever was written, so the poll
+spun forever, and `ipq_eth_init()` never reached its RX/TX descriptor
+ring setup. This is why `eth0 up Speed :100` printed (PHY link check,
+*before* the reset call) but no ARP reply for the guest's own IP ever
+went out - the RX ring was never programmed for the driver to have
+anywhere to receive an incoming packet into. Fixed by clearing bit 0
+on readback of `busmode`, same convention already used for the GCC
+block's `*_CMD_RCGR` busy bits.
+
+**b) Recovery mode needs a deliberate way in.** Added `MR80X_RECOVERY`
+env var (checked once in `mr80x_init()`): when set, GPIO14 reads as
+pressed (bit0 clear) instead of the section-12 default of "not
+pressed" - i.e. models holding the real reset button, without
+regressing the section-12 fix (default boot is still normal boot).
+
+**c) docker's own `-p` port mapping breaks slirp's hostfwd.**
+Confirmed via `-object filter-dump` packet capture: connections
+arriving through docker's `-p HOST:CONTAINER` mapping have their
+source address rewritten to docker's bridge gateway (`172.17.0.1`
+typically) before slirp ever sees them. Slirp faithfully reflects that
+address into the guest-visible SYN packet; the guest then tries to ARP
+for `172.17.0.1` to route its SYN-ACK back, gets no reply (that
+address isn't on the emulated LAN subnet at all), and the connection
+just times out forever - looks identical to a "the guest can't do TCP"
+bug from the outside, but is entirely a docker networking artifact.
+Fixed in `run.sh` by using `--network host` instead of `-p`, removing
+docker's NAT layer entirely.
+
+**d) The guest's own recovery-mode IP is 192.168.1.1, not
+192.168.0.1.** `NetLoopHttpd()` (`net/net.c`) hardcodes
+`uip_sethostaddr(192.168.0.1)` - but "`*** Warning - readenv() failed,
+using default environment`" (printed every boot, since real NAND page
+reads aren't implemented yet - section 13 only does ID detection) means
+that hardcoded value gets overridden by whatever the *compiled-in*
+default environment's own network setup applies, which turned out to
+be `192.168.1.1` (verified by reading `uip_hostaddr`'s raw memory,
+`net.c`'s `B uip_hostaddr` symbol, from QEMU C code at packet-receive
+time - not by touching vendor source). `run.sh` now defaults
+`--guest-ip` to `192.168.1.1` accordingly, with a `--guest-ip` override
+in case a future real-NAND-backed environment changes this.
+
+**Confirmed end-to-end**: `./run.sh --recovery appsbl.unpadded.elf`,
+then `curl http://localhost:8080/` from the host returns the *real*
+recovery-mode "Firmware Upgrade" HTML page served by the genuine,
+unmodified `appsbl.unpadded.elf` - ARP resolves, TCP handshake
+completes, HTTP GET is answered correctly by uIP's httpd running
+inside the emulated CPU.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
@@ -573,25 +700,29 @@ non-crash reboots, e.g. a `reset` console command, would hit the same
    setup (writes to `0x100c`/`0x1010`/`0x1018`/`0x0`/`0x4`/`0x18` -
    TX/RX descriptor ring addresses + MAC config/DMA control, a
    DesignWare-ish layout).
-6. [done] Real GMAC1 DMA TX/RX + `slirp` networking (section 11) - TCP
-   handshake with a real host-side `curl` succeeds against the real
-   `appsbl.unpadded.elf`. HTTP-level response not confirmed working
-   yet past the handshake - see section 11 for the specific open
-   question and how to debug it next.
-7. Next: QPIC NAND backed by `FULL_FIRMWARE.bin` (section 4b/5) -
-   currently falls through to "Unknown flash type" / "Qpic controller
-   not support serial NAND", gracefully non-fatal but means no real
-   partition data (ART, rootfs, etc.) is reachable yet - and the fake
-   `smem_ptable` (section 9) only has one partition (`APPSBLENV`), not
-   the full real layout, so partition lookups other than the env one
-   will also come up empty until this is backed by real NAND.
-8. GPIO/TLMM currently an unmodeled catch-all stub that happens to
-   return 0 for everything, including GPIO14 (reset button) - that's
-   why recovery mode auto-triggers on every boot right now. Worth a
-   real (if simple) GPIO model once NAND/Ethernet are in, so boot mode
-   is deliberately selectable instead of an accident of the stub's
-   default return value.
-9. Once NAND + Ethernet work: test `out/appsbl-custom.bin` and
-   `out/appsbl-dual-key.bin` (not just plain `appsbl.bin`), then
-   finally a `tplink-cloud-sign.py`-signed image through the actual
-   HTTP recovery upload path - the original point of building this.
+6. [done] Real GMAC1 DMA TX/RX + `slirp` networking (section 11).
+7. [done] QPIC NAND device ID detection via a real BAM cmd-pipe model
+   (section 13) - device found and identified correctly, but real
+   *page data* still isn't backed by anything.
+8. [done] GPIO14/TLMM: normal boot by default (section 12), deliberate
+   recovery mode via `MR80X_RECOVERY` (section 15b).
+9. [done] MILESTONE: MVBAR/SMC trampoline (section 14) - normal boot
+   survives past autoboot instead of crash-looping.
+10. [done] MILESTONE (section 15): real recovery HTTP server reachable
+    end-to-end from the host - `./run.sh --recovery <elf>` +
+    `curl http://localhost:8080/` returns the genuine firmware-upgrade
+    page. Needed: GMAC reset-poll fix (15a), `--network host` instead
+    of docker `-p` (15c), correct guest IP (15d).
+11. Next: QPIC NAND *page* reads (real data, not just ID) backed by
+    `FULL_FIRMWARE.bin` (section 4b/5) via the same BAM data pipes
+    (index 0/1, not yet driven - see section 13) - needed for
+    `readenv()` to find the real environment (fixing the 192.168.1.1
+    vs 192.168.0.1 discrepancy at the source instead of via
+    `--guest-ip`), and for the *normal* (non-recovery) boot path to
+    find a real kernel/rootfs instead of cleanly resetting forever.
+12. Test `out/appsbl-custom.bin` and `out/appsbl-dual-key.bin` (not
+    just plain `appsbl.bin`), then a `tplink-cloud-sign.py`-signed
+    image through the actual HTTP recovery upload path - the original
+    point of building this. The recovery page's upload form posts to
+    `testurl` (`multipart/form-data`, field name `firmware`) - now
+    reachable and ready to test.
