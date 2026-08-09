@@ -33,6 +33,7 @@
 #include "hw/loader.h"
 #include "sysemu/sysemu.h"
 #include "qemu/timer.h"
+#include "qemu/cutils.h"
 #include "sysemu/reset.h"
 #include "sysemu/runstate.h"
 #include "chardev/char-fe.h"
@@ -1573,13 +1574,52 @@ static void mr80x_populate_ram(MachineState *machine)
     }
 
     /* SMEM_AARM_PARTITION_TABLE - see the comment by
-     * MR80X_SMEM_PTABLE_TYPE above. Rest of the 912-byte struct
-     * (len=0 partitions) is left as already-zeroed fresh RAM. */
+     * MR80X_SMEM_PTABLE_TYPE above. All 16 real partitions from the
+     * flash dump (BRINGUP-NOTES.md section 4b), not just the 3 this
+     * emulator originally needed to unblock specific boot steps -
+     * requested so every real partition is visible/usable from the
+     * console (`smeminfo`, `nand` commands, etc) without needing to
+     * extend this table by hand each time a new one turns out to
+     * matter. Names/offsets/sizes for "0:APPSBLENV", "rootfs" and
+     * "0:ART" are confirmed exact matches against real lookup calls
+     * (board_init.c, nm_fwup.c, ethaddr.c respectively - grepped the
+     * literal strings). The rest follow the same *convention* every
+     * Qualcomm MIBIB partition table on this SoC family uses
+     * ("0:NAME" uppercase for firmware/system partitions; bare
+     * lowercase for UBI-hosted OS/data partitions, matching rootfs's
+     * own confirmed pattern) but aren't individually
+     * source-confirmed the way those three are - if one turns out to
+     * be looked up under a different exact string, only that one
+     * entry needs correcting. Rest of the 912-byte struct (unused
+     * slots) is left as already-zeroed fresh RAM. */
     {
+        static const struct {
+            const char *name;
+            uint32_t start;
+            uint32_t size;
+        } parts[] = {
+            { "0:SBL1",       0x000000, 0x080000 },
+            { "0:MIBIB",      0x080000, 0x080000 },
+            { "0:BOOTCONFIG", 0x100000, 0x040000 },
+            { "0:BOOTCONFIG1",0x140000, 0x040000 },
+            { "0:QSEE",       0x180000, 0x100000 },
+            { "0:DEVCFG",     0x280000, 0x040000 },
+            { "0:CDT",        0x2C0000, 0x040000 },
+            { "0:APPSBLENV",  0x300000, 0x080000 },
+            { "0:APPSBL",     0x380000, 0x140000 },
+            { "0:ART",        0x4C0000, 0x100000 },
+            { "0:TRAINING",   0x5C0000, 0x080000 },
+            { "rootfs",       0x640000, 0x2A00000 },
+            { "rootfs_1",     0x3040000, 0x2A00000 },
+            { "tp-data",      0x5A40000, 0x840000 },
+            { "radio",        0x6280000, 0x440000 },
+            { "data",         0x66C0000, 0x080000 },
+        };
         uint32_t v;
         hwaddr entry = MR80X_SMEM_BASE + MR80X_SMEM_ALLOC_INFO_OFF +
                         MR80X_SMEM_PTABLE_TYPE * 16;
         hwaddr data = MR80X_SMEM_BASE + MR80X_SMEM_PTABLE_DATA_OFF;
+        unsigned i;
 
         v = cpu_to_le32(1);
         cpu_physical_memory_write(entry + 0, &v, 4);
@@ -1594,62 +1634,24 @@ static void mr80x_populate_ram(MachineState *machine)
         cpu_physical_memory_write(data + 4, &v, 4);
         v = cpu_to_le32(1); /* version */
         cpu_physical_memory_write(data + 8, &v, 4);
-        v = cpu_to_le32(3); /* len - 0:APPSBLENV, rootfs, 0:ART */
+        v = cpu_to_le32(ARRAY_SIZE(parts));
         cpu_physical_memory_write(data + 12, &v, 4);
 
         /* struct smem_ptn { char name[16]; u32 start; u32 size; u32 attr; }
-         * (packed, 28 bytes) - board_init() hard-requires finding
-         * "0:APPSBLENV" via smem_getpart() (offset/size returned in
-         * units of flash_block_size, 0x20000 - see
-         * MR80X_SMEM_FLASH_BLOCK_SIZE_TYPE above) or it aborts boot
-         * the same fatal way ptable itself did. Real offset/size
-         * (0x300000/0x80000) from the actual flash dump - see
-         * BRINGUP-NOTES.md section 4b's partition table. */
-        {
-            static const char name[16] = "0:APPSBLENV";
-            hwaddr part = data + 16;
-            cpu_physical_memory_write(part + 0, name, 16);
-            v = cpu_to_le32(0x300000 / 0x20000); /* start, in blocks */
-            cpu_physical_memory_write(part + 16, &v, 4);
-            v = cpu_to_le32(0x80000 / 0x20000); /* size, in blocks */
-            cpu_physical_memory_write(part + 20, &v, 4);
-            v = cpu_to_le32(0);
-            cpu_physical_memory_write(part + 24, &v, 4); /* attr */
-        }
+         * (packed, 28 bytes), start/size in flash_block_size (0x20000)
+         * units - board_init() hard-requires finding "0:APPSBLENV" via
+         * smem_getpart() or it aborts boot the same fatal way ptable
+         * itself did. */
+        for (i = 0; i < ARRAY_SIZE(parts); i++) {
+            char name[16];
+            hwaddr part = data + 16 + i * 28;
 
-        /* "rootfs" (no "0:" prefix, unlike APPSBLENV - matches the real
-         * flash dump exactly, see BRINGUP-NOTES.md section 4b partition
-         * #11) - needed for nm_upgradeFirmware()'s "does this upload fit"
-         * size check (lib/nvrammanager/nm_fwup.c) to find a nonzero
-         * rootfs_flash_size instead of always rejecting every upload
-         * with "Bad file size: ... flash: 0". Real offset/size
-         * (0x640000/0x2A00000) from the actual flash dump. */
-        {
-            static const char name[16] = "rootfs";
-            hwaddr part = data + 16 + 28;
+            memset(name, 0, sizeof(name));
+            pstrcpy(name, sizeof(name), parts[i].name);
             cpu_physical_memory_write(part + 0, name, 16);
-            v = cpu_to_le32(0x640000 / 0x20000); /* start, in blocks */
+            v = cpu_to_le32(parts[i].start / 0x20000);
             cpu_physical_memory_write(part + 16, &v, 4);
-            v = cpu_to_le32(0x2A00000 / 0x20000); /* size, in blocks */
-            cpu_physical_memory_write(part + 20, &v, 4);
-            v = cpu_to_le32(0);
-            cpu_physical_memory_write(part + 24, &v, 4); /* attr */
-        }
-
-        /* "0:ART" (Antenna Reference Table - WiFi calibration + real
-         * MAC addresses, board/qca/arm/common/ethaddr.c) - the real
-         * flash dump has genuine non-blank data here (confirmed by
-         * inspection, unlike the appsblenv region below), see
-         * BRINGUP-NOTES.md section 4b partition #9. Without this
-         * entry, ethaddr.c's smem_getpart("0:ART") fails and prints
-         * "No ART partition found" on every boot. */
-        {
-            static const char name[16] = "0:ART";
-            hwaddr part = data + 16 + 28 + 28;
-            cpu_physical_memory_write(part + 0, name, 16);
-            v = cpu_to_le32(0x4C0000 / 0x20000); /* start, in blocks */
-            cpu_physical_memory_write(part + 16, &v, 4);
-            v = cpu_to_le32(0x100000 / 0x20000); /* size, in blocks */
+            v = cpu_to_le32(parts[i].size / 0x20000);
             cpu_physical_memory_write(part + 20, &v, 4);
             v = cpu_to_le32(0);
             cpu_physical_memory_write(part + 24, &v, 4); /* attr */

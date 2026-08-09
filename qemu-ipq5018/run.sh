@@ -27,14 +27,17 @@
 # already sees one - zero timing dependency, unlike an actual keypress.
 # --nand-image: back real QPIC NAND page reads with a raw full-flash
 # dump (BRINGUP-NOTES.md section 4b/17b) instead of returning 0xFF for
-# every page. Without this flag, NAND device *identification* still
-# works (real driver code path, genuine ID match) but there's no real
-# data behind it - readenv() and any real kernel/rootfs load will
-# always fail, same as before this flag existed. With it, real
-# partition data becomes readable (confirmed: rootfs's real UBI header
-# reads back correctly) - but note the *env* partition specifically is
-# genuinely blank in the one capture used for this project so far, see
-# section 17b - that "bad CRC" warning is not a bug this flag fixes.
+# every page. Auto-detected if not given (see DEFAULT_NAND_IMAGE
+# below) - only needed explicitly if your dump lives somewhere else.
+# Without any real image, NAND device *identification* still works
+# (real driver code path, genuine ID match) but there's no real data
+# behind it - readenv() and any real kernel/rootfs load will always
+# fail. With one, real partition data becomes readable (confirmed:
+# rootfs's real UBI header reads back correctly, and `smeminfo` at the
+# console lists all 16 real partitions, section 20) - but note the
+# *env* partition specifically is genuinely blank in the one capture
+# used for this project so far, see section 17b - that "bad CRC"
+# warning is not a bug either flag fixes.
 #
 # Console: this terminal IS the TTL/UART connection - type at the
 # prompt exactly like you would over a real serial adapter. Ctrl-A X
@@ -112,6 +115,19 @@ done
 if [[ -z "${KERNEL:-}" ]]; then
     echo "usage: $0 [--recovery] [--no-net] [--http-port PORT] [--guest-ip IP] [--nand-image PATH] [--stop-autoboot] <path-to-appsbl-elf-or-bin>" >&2
     exit 1
+fi
+
+# Auto-detect the real flash dump if --nand-image wasn't given, so
+# every real partition (smeminfo, section 4b/17b/20) just shows up
+# without needing to remember and type the path every time. Only
+# kicks in when the file actually exists - falls back to the old
+# "no real NAND data" behavior otherwise, same as before this existed.
+if [[ -z "$NAND_IMAGE" ]]; then
+    DEFAULT_NAND_IMAGE="/media/dados_2tb/opw/openwrt-build-tools/tools/firmware-lab/work/fw_extracted/FULL_FIRMWARE.bin"
+    if [[ -f "$DEFAULT_NAND_IMAGE" ]]; then
+        NAND_IMAGE="$DEFAULT_NAND_IMAGE"
+        echo "Auto-detected real flash dump: ${NAND_IMAGE} (pass --nand-image PATH to use a different one)"
+    fi
 fi
 
 KERNEL_DIR="$(cd "$(dirname "$KERNEL")" && pwd)"
