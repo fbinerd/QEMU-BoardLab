@@ -897,6 +897,89 @@ the RAM-repopulation-on-reset change is kept regardless since it's
 still a real correctness improvement (accurately mimics a real
 power-cycle) with zero observed regressions.
 
+## 19. Real-time-accurate timer + more SMEM fakes - closing the "doesn't look like the real router" gap
+
+The user pushed back hard on section 17's boot log, correctly pointing
+out several messages that a real router wouldn't print on every boot.
+Went through each one individually rather than assuming they're all
+the same kind of issue:
+
+- **"ipq_spi: SPI Flash not found"** and **"PCI1 is not defined in the
+  device tree"**: NOT emulation bugs. Both come from driver probes
+  reading the device tree blob *compiled into the appsbl binary
+  itself* - identical bytes to what real hardware boots from. This
+  board genuinely has no SPI-attached flash (only the QPIC-attached
+  serial NAND) and its DTS genuinely doesn't define a second PCI
+  controller - a real MR80X v5 printing these on its own serial
+  console would be entirely expected, not a bug to "fix" here.
+- **"smem: Get socinfo - version failed"** (x2) and **"No ART
+  partition found"**: genuine emulation gaps, now fixed.
+  `ipq_smem_get_socinfo_version()`/`_cpu_type()`
+  (`arch/arm/cpu/armv7/qca/common/smem.c`) read SMEM type
+  `SMEM_HW_SW_BUILD_ID` (137) into a `union qca_platform`, trying
+  `sizeof(qca_platform_v1)`=72 bytes first -
+  `smem_read_alloc_entry()` requires an *exact* size match against
+  the alloc_info entry's declared size (not just "big enough"), so
+  faked a 72-byte all-zero entry (both call sites only check the
+  return status, not field values). Separately, added a `"0:ART"`
+  partition table entry (real offset/size from the flash dump,
+  BRINGUP-NOTES section 4b partition #9) alongside the existing
+  `0:APPSBLENV`/`rootfs` ones - `board/qca/arm/common/ethaddr.c`'s
+  `smem_getpart("0:ART", ...)` now succeeds. Confirmed: both "failed"
+  messages are gone; "No ART partition found" is replaced by "eth0/
+  eth1 MAC Address from ART is not valid" - the partition is now
+  genuinely found and read (progress - a *different*, more accurate
+  message), but the specific MAC-address bytes at the expected
+  sub-offset within ART aren't validating, which may be a real gap
+  in this specific captured dump (same class of issue as
+  `appsblenv` being blank, section 17b) or a sub-offset this hasn't
+  been chased down yet - not further investigated this pass.
+- **"Hit any key to stop autoboot: 0" appearing immediately, no real
+  chance to press a key**: a genuine, now-fixed emulation bug,
+  separate from the malloc() hang (section 18). The generic timer
+  (`MR80X_TIMER_BASE`, read by `read_counter()`/`get_timer()` in
+  `arch/arm/cpu/armv7/qca/common/timer.c`) was modeled as a
+  free-running counter that jumped forward by a large fixed step on
+  *every* read - deliberately, so short hardware busy-wait polling
+  loops (a clock-control busy bit, a NAND status register) would
+  resolve in a handful of TCG instructions instead of real
+  microseconds. But `get_timer()`-based *human-scale* waits use the
+  exact same counter, including the multi-read
+  `CONFIG_BOOTDELAY`-based autoboot countdown (this device's
+  `CONFIG_TP_IMAGE` build uses `CONFIG_BOOTDELAY=1`, one second) -
+  the artificial step made even *that* appear to have already
+  elapsed on the very first read. Replaced with a counter driven by
+  QEMU's own virtual clock (`qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)`),
+  scaled to `GPT_FREQ_HZ` (240000, from the DTS `gpt_freq_hz`
+  property baked into this exact binary) via `muldiv64()` - genuinely
+  real elapsed wall-clock time, matching real hardware's own
+  behavior. Confirmed: the countdown now shows "1  0" (a real,
+  if short, 1-second window) instead of jumping straight to "0".
+  Short hardware-poll loops are unaffected in outcome, just no longer
+  artificially compressed to "already done" on the first read either
+  - they now take correspondingly real (still tiny, microsecond-scale)
+  time, same as a real chip would need.
+
+Verified no regression across all of these changes together: recovery
+mode + real NAND data + a `tplink-cloud-sign.py`-signed upload against
+`out/appsbl-custom.bin` still passes RSA verification and returns
+"Upgrade Success".
+
+**Remaining, NOT fixed this pass**: `*** Warning - bad CRC, using
+default environment` - confirmed (again) genuinely accurate: the
+entire 512KiB `appsblenv` region in `FULL_FIRMWARE.bin` is `0xFF`
+(erased), byte-for-byte, not just at the specific offset `readenv()`
+happens to read from. Every *other* partition checked (`sbl1`,
+`mibib`, `bootconfig`, `qsee`, `devcfg`, `cdt`, `appsbl`, `art`) has
+real, mostly-non-`0xFF` content - `appsblenv` (and `training`, which
+is *expected* to be blank/regenerated-per-boot cached DDR timing data)
+are the outliers. This means the specific `FULL_FIRMWARE.bin` capture
+in hand didn't preserve valid environment data for this unit, not
+that this emulator is reading the wrong location - fixing the
+*message itself* would mean fabricating plausible-but-fake env
+content, which hasn't been done since it would misrepresent what's
+actually known about the real device's real state.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.

@@ -32,6 +32,7 @@
 #include "hw/boards.h"
 #include "hw/loader.h"
 #include "sysemu/sysemu.h"
+#include "qemu/timer.h"
 #include "sysemu/reset.h"
 #include "sysemu/runstate.h"
 #include "chardev/char-fe.h"
@@ -113,6 +114,24 @@
 #define MR80X_SMEM_FLASH_DENSITY_TYPE      502
 #define MR80X_SMEM_BOOT_NAND_FLASH         2
 #define MR80X_SMEM_FLASH_DATA_OFF 0x4100 /* clear of the machid data slot */
+
+/* SMEM_HW_SW_BUILD_ID (=137) - smem_read_platform_type()
+ * (arch/arm/cpu/armv7/qca/common/smem.c) reads this into a `union
+ * qca_platform`, trying sizeof(qca_platform_v1)=72 bytes first (an
+ * exact match against smem_read_alloc_entry()'s `size` check, which
+ * requires the alloc_info entry's declared size to equal the
+ * requested read length exactly, 8-byte-aligned - 72 already is).
+ * Without this fake, ipq_smem_get_socinfo_version()/_cpu_type() print
+ * "smem: Get socinfo - version/cpu type failed" (real hardware's SBL
+ * always populates this; we skip SBL entirely, section 7b). All
+ * fields zeroed (matches the rest of the SMEM region, already
+ * zero-filled by mr80x_populate_ram()'s memset) - both call sites
+ * only check the return status, not specific field values, so plain
+ * zeros are enough to make them succeed without inventing plausible-
+ * looking-but-fake chip identification data. */
+#define MR80X_SMEM_HW_SW_BUILD_ID_TYPE     137
+#define MR80X_SMEM_SOCINFO_DATA_OFF        0x4600
+#define MR80X_SMEM_SOCINFO_SIZE            72
 
 /* SMEM_AARM_PARTITION_TABLE (=9) - a nonzero flash_type routes
  * board_init() into the `default:` switch case (see board_init.c),
@@ -315,31 +334,57 @@ static const MemoryRegionOps mr80x_gcc_ops = {
  * Generic timer counter-view MMIO registers (gcnt_cntcv_lo/hi from the
  * /timer DT node in ipq5018-soc.dtsi - 0x4A2000/0x4A2004), read by
  * arch/arm/cpu/armv7/qca/common/timer.c's read_counter(), which
- * __udelay() spins on. Not wired to a real clock: each read of the LO
- * half just advances a free-running counter by a large step, so any
- * delay-loop-until-elapsed check on real silicon terminates almost
- * immediately here too - we don't need wall-clock-accurate delays for
- * this to boot correctly, just forward progress.
+ * __udelay() *and* get_timer()/CONFIG_BOOTDELAY's autoboot countdown
+ * both spin on (get_timer() divides raw ticks by
+ * GPT_FREQ_HZ/CONFIG_SYS_HZ - GPT_FREQ_HZ comes from the "gpt_freq_hz"
+ * DT property, 240000 in every board DTS checked, including the one
+ * baked into this exact appsbl binary).
+ *
+ * Originally modeled as a free-running counter that jumps forward by
+ * a large fixed step on every read, specifically so tight hardware
+ * busy-wait loops (polling a clock-control busy bit, a NAND status
+ * register, microsecond-scale udelay()s) would resolve in a handful
+ * of TCG-time instructions instead of real wall-clock microseconds -
+ * fine for those, but it also meant get_timer()-based *human-scale*
+ * waits (the several-second "Hit any key to stop autoboot" countdown
+ * being the one a user actually notices) always appeared to have
+ * already elapsed by the time the guest read it, even on the very
+ * first read - the countdown printed "0" immediately, with no real
+ * window to actually press a key interactively.
+ *
+ * Now driven by QEMU's own virtual clock (real elapsed wall-clock
+ * time since the guest started, scaled to GPT_FREQ_HZ) instead of an
+ * artificial step. This makes get_timer()-based delays take
+ * genuinely real time - correct for a console someone is meant to
+ * interact with - while still not requiring any change on the
+ * *short* hardware-poll side: those loops just do correspondingly
+ * more (cheap, TCG-fast) re-reads over the same real microseconds a
+ * real chip would also need, not a change in outcome, just no longer
+ * artificially compressed to "already done" the first time either.
  * ============================================================ */
 
 #define MR80X_TIMER_BASE 0x4A2000
 #define MR80X_TIMER_SIZE 0x8
-#define MR80X_TIMER_STEP 0x100000
+#define MR80X_TIMER_FREQ_HZ 240000
 
 typedef struct MR80XTimerState {
     MemoryRegion iomem;
-    uint64_t counter;
 } MR80XTimerState;
+
+static uint64_t mr80x_timer_counter(void)
+{
+    int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return muldiv64(now_ns, MR80X_TIMER_FREQ_HZ, NANOSECONDS_PER_SECOND);
+}
 
 static uint64_t mr80x_timer_read(void *opaque, hwaddr offset, unsigned size)
 {
-    MR80XTimerState *s = opaque;
+    uint64_t counter = mr80x_timer_counter();
 
     if (offset == 0x0) {
-        s->counter += MR80X_TIMER_STEP;
-        return (uint32_t)s->counter;
+        return (uint32_t)counter;
     } else if (offset == 0x4) {
-        return (uint32_t)(s->counter >> 32);
+        return (uint32_t)(counter >> 32);
     }
     return 0;
 }
@@ -1462,6 +1507,23 @@ static void mr80x_populate_ram(MachineState *machine)
                                MR80X_SMEM_FLASH_DATA_OFF + 0x40,
                                128 * 1024 * 1024);
 
+    /* SMEM_HW_SW_BUILD_ID - see the comment by
+     * MR80X_SMEM_HW_SW_BUILD_ID_TYPE above. All-zero payload (already
+     * zeroed by memset above), only the alloc_info triplet needs
+     * writing. */
+    {
+        uint32_t v;
+        hwaddr entry = MR80X_SMEM_BASE + MR80X_SMEM_ALLOC_INFO_OFF +
+                        MR80X_SMEM_HW_SW_BUILD_ID_TYPE * 16;
+
+        v = cpu_to_le32(1);
+        cpu_physical_memory_write(entry + 0, &v, 4);   /* allocated */
+        v = cpu_to_le32(MR80X_SMEM_SOCINFO_DATA_OFF);
+        cpu_physical_memory_write(entry + 4, &v, 4);   /* offset */
+        v = cpu_to_le32(MR80X_SMEM_SOCINFO_SIZE);
+        cpu_physical_memory_write(entry + 8, &v, 4);   /* size */
+    }
+
     /* SMEM_AARM_PARTITION_TABLE - see the comment by
      * MR80X_SMEM_PTABLE_TYPE above. Rest of the 912-byte struct
      * (len=0 partitions) is left as already-zeroed fresh RAM. */
@@ -1484,7 +1546,7 @@ static void mr80x_populate_ram(MachineState *machine)
         cpu_physical_memory_write(data + 4, &v, 4);
         v = cpu_to_le32(1); /* version */
         cpu_physical_memory_write(data + 8, &v, 4);
-        v = cpu_to_le32(2); /* len - 0:APPSBLENV and rootfs */
+        v = cpu_to_le32(3); /* len - 0:APPSBLENV, rootfs, 0:ART */
         cpu_physical_memory_write(data + 12, &v, 4);
 
         /* struct smem_ptn { char name[16]; u32 start; u32 size; u32 attr; }
@@ -1521,6 +1583,25 @@ static void mr80x_populate_ram(MachineState *machine)
             v = cpu_to_le32(0x640000 / 0x20000); /* start, in blocks */
             cpu_physical_memory_write(part + 16, &v, 4);
             v = cpu_to_le32(0x2A00000 / 0x20000); /* size, in blocks */
+            cpu_physical_memory_write(part + 20, &v, 4);
+            v = cpu_to_le32(0);
+            cpu_physical_memory_write(part + 24, &v, 4); /* attr */
+        }
+
+        /* "0:ART" (Antenna Reference Table - WiFi calibration + real
+         * MAC addresses, board/qca/arm/common/ethaddr.c) - the real
+         * flash dump has genuine non-blank data here (confirmed by
+         * inspection, unlike the appsblenv region below), see
+         * BRINGUP-NOTES.md section 4b partition #9. Without this
+         * entry, ethaddr.c's smem_getpart("0:ART") fails and prints
+         * "No ART partition found" on every boot. */
+        {
+            static const char name[16] = "0:ART";
+            hwaddr part = data + 16 + 28 + 28;
+            cpu_physical_memory_write(part + 0, name, 16);
+            v = cpu_to_le32(0x4C0000 / 0x20000); /* start, in blocks */
+            cpu_physical_memory_write(part + 16, &v, 4);
+            v = cpu_to_le32(0x100000 / 0x20000); /* size, in blocks */
             cpu_physical_memory_write(part + 20, &v, 4);
             v = cpu_to_le32(0);
             cpu_physical_memory_write(part + 24, &v, 4); /* attr */
