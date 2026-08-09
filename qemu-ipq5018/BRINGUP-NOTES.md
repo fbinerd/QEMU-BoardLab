@@ -456,6 +456,52 @@ instead of enumerating each of the ~18 `*_CMD_RCGR` addresses by name -
 harmless for non-`CMD_RCGR` registers since nothing reads their bit 0
 back expecting anything else.
 
+## 11. MILESTONE (2026-08-09): real GMAC1 DMA + a genuine TCP handshake from the host
+
+Implemented `MR80XGmacState` as a proper `SysBusDevice` with a real
+`NICState` (wired to whatever `-nic`/`-netdev` the invocation supplies)
+instead of the earlier catch-all stub - see the big comment block above
+`struct MR80XGmacState` in `mr80x.c` for the full design. Key point:
+`ipq_eth_send()`/`ipq_eth_recv()` (`drivers/net/ipq5018/ipq5018_gmac.c`)
+drive TX/RX by polling an ownership bit **inside the 32-byte descriptor
+struct in guest RAM itself**, not a hardware status register - so the
+device model's job on a `DmaTxPollDemand` write is simply: read the
+current descriptor, extract `buffer1`/`length`, `qemu_send_packet()`,
+clear the ownership bit, advance to the next descriptor via its own
+`data1` chain pointer (the ring is a driver-maintained linked list, not
+a fixed stride). RX is the mirror, driven by the NIC's `.receive`
+callback instead of a register write.
+
+Two connection-plumbing gotchas, both fixed:
+
+- `-netdev user,id=net0` alone left `qemu_configure_nic_device()` unable
+  to find a match ("nic mr80x-gmac.0 has no peer") - it searches
+  `nd_table`, which only `-nic`/legacy `-net nic` populate, not a bare
+  `-netdev`. Use `-nic user,model=mr80x-gmac,...` instead.
+- appsbl's recovery `httpd` hardcodes its own IP to `192.168.0.1`
+  (`net.c`: `uip_ipaddr(ipaddr, 192,168,0,1); uip_sethostaddr(ipaddr);`)
+  rather than obtaining one via DHCP (it *serves* DHCP, doesn't consume
+  it) - slirp's default subnet is `10.0.2.0/24` and doesn't route to
+  that address on its own. Needs `net=192.168.0.0/24,host=192.168.0.2`
+  plus a `hostfwd=tcp::8080-192.168.0.1:80` rule to actually reach it
+  from outside.
+
+Result with both fixed: `curl http://localhost:<hostfwd-port>/` from
+the **host**, against the real, unmodified `appsbl.unpadded.elf`
+running inside QEMU, gets past the TCP handshake (`curl` reports
+"Connected") - meaning a real SYN reached the guest through
+`mr80x_gmac_receive()`, `uip_input()` processed it, and a real SYN-ACK
+came back out through `mr80x_gmac_do_tx()` to the host. The GET
+request after that doesn't get an HTTP response yet within a several-
+second window - not yet root-caused (candidates: uIP's periodic timer
+processing not being driven correctly by the fast/non-realtime timer
+model in section 7d, or a bug in `cur_rx_desc`/`cur_tx_desc` chain
+advancement past the very first packet - only confirmed one full
+round trip so far, not sustained traffic). Next debugging session:
+same `gdb-multiarch` approach as section 9, or add temporary
+`qemu_log_mask` tracing to `mr80x_gmac_receive`/`do_tx` to see whether
+the GET request's packet is even reaching `mr80x_gmac_receive` at all.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
@@ -474,10 +520,11 @@ back expecting anything else.
    setup (writes to `0x100c`/`0x1010`/`0x1018`/`0x0`/`0x4`/`0x18` -
    TX/RX descriptor ring addresses + MAC config/DMA control, a
    DesignWare-ish layout).
-6. Next: real GMAC1 DMA TX/RX (descriptor rings, MAC config, wired to
-   QEMU's `slirp` usermode networking so a host-side `curl` can reach
-   the emulated HTTP recovery server) - the actual remaining gate for
-   testing an upload end-to-end. GMAC2 can stay a stub.
+6. [done] Real GMAC1 DMA TX/RX + `slirp` networking (section 11) - TCP
+   handshake with a real host-side `curl` succeeds against the real
+   `appsbl.unpadded.elf`. HTTP-level response not confirmed working
+   yet past the handshake - see section 11 for the specific open
+   question and how to debug it next.
 7. Next: QPIC NAND backed by `FULL_FIRMWARE.bin` (section 4b/5) -
    currently falls through to "Unknown flash type" / "Qpic controller
    not support serial NAND", gracefully non-fatal but means no real

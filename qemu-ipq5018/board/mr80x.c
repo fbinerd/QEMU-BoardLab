@@ -32,6 +32,8 @@
 #include "cpu.h"
 #include "qom/object.h"
 #include "elf.h"
+#include "net/net.h"
+#include "hw/qdev-properties.h"
 
 /* ---- memory map (appsbl/CLEAN_ROOM_STATUS.md, ipq5018.h) ---- */
 
@@ -505,6 +507,228 @@ static int mr80x_uart_can_rx(void *opaque)
 static void mr80x_uart_event(void *opaque, QEMUChrEvent event) {}
 
 /* ============================================================
+ * GMAC1 - MAC config registers at base+0x0/+0x4, DesignWare-style DMA
+ * block at base+0x1000 (drivers/net/ipq5018/ipq5018_gmac.c,
+ * arch-ipq5018/ipq5018_gmac.h - NOT drivers/net/designware.c, this
+ * SoC has its own copy, see BRINGUP-NOTES.md section 10). TX/RX are
+ * driven by the driver polling an OWNERSHIP BIT inside the descriptor
+ * structs themselves (in guest RAM), not a hardware status register -
+ * ipq_eth_send() writes DmaTxPollDemand then spins re-reading its own
+ * descriptor's status word until bit31 (DescOwnByDma) clears.  That
+ * means the "device" side of TX is entirely: on the poll-demand
+ * write, read the current descriptor, do the send, clear the bit,
+ * write it back - no interrupt or async completion needed. RX is the
+ * mirror: on a real incoming packet, find the current RX descriptor,
+ * check *it* still has the ownership bit set (meaning it's free for
+ * us to fill), write the packet + frame length, clear the bit.
+ *
+ * struct ipq_gmac_desc_t (32 bytes, 8-word enhanced descriptor):
+ *   +0  status   (u32, bit31 DescOwnByDma, RX frame length in bits 29:16)
+ *   +4  length   (u32, TX buffer1 size in bits 12:0)
+ *   +8  buffer1  (u32, physical address of packet data)
+ *   +12 data1    (u32, NEXT descriptor's physical address - the ring is a
+ *                 chain of pointers set up by the driver, not computed
+ *                 from a fixed stride)
+ *   +16..28 extstatus/reserved1/timestamplow/timestamphigh (unused here)
+ * ============================================================ */
+
+#define GMAC_DMA_OFFSET          0x1000
+#define GMAC_DMA_TXPOLLDEMAND    (GMAC_DMA_OFFSET + 0x04)
+#define GMAC_DMA_RXPOLLDEMAND    (GMAC_DMA_OFFSET + 0x08)
+#define GMAC_DMA_RXBASEADDR      (GMAC_DMA_OFFSET + 0x0C)
+#define GMAC_DMA_TXBASEADDR      (GMAC_DMA_OFFSET + 0x10)
+
+#define DESC_OWN_BY_DMA          0x80000000u
+#define DESC_FRAME_LEN_MASK      0x3FFF0000u
+#define DESC_FRAME_LEN_SHIFT     16
+#define DESC_SIZE1_MASK          0x00001FFFu
+
+#define GMAC_MAX_FRAME 2048
+
+#define TYPE_MR80X_GMAC "mr80x-gmac"
+OBJECT_DECLARE_SIMPLE_TYPE(MR80XGmacState, MR80X_GMAC)
+
+struct MR80XGmacState {
+    SysBusDevice parent_obj;
+    MemoryRegion iomem;
+    NICState *nic;
+    NICConf conf;
+    uint32_t regs[0x2000 / 4]; /* covers the whole iomem region below */
+    hwaddr cur_tx_desc;
+    hwaddr cur_rx_desc;
+    bool have_rx_desc;
+};
+
+static void mr80x_gmac_do_tx(MR80XGmacState *s)
+{
+    hwaddr d = s->cur_tx_desc;
+    uint32_t status, length, buffer1, next;
+    uint8_t buf[GMAC_MAX_FRAME];
+    unsigned len;
+
+    if (!d) {
+        return;
+    }
+    cpu_physical_memory_read(d + 0, &status, 4);
+    status = le32_to_cpu(status);
+    if (!(status & DESC_OWN_BY_DMA)) {
+        return; /* nothing queued */
+    }
+    cpu_physical_memory_read(d + 4, &length, 4);
+    cpu_physical_memory_read(d + 8, &buffer1, 4);
+    cpu_physical_memory_read(d + 12, &next, 4);
+    length = le32_to_cpu(length);
+    buffer1 = le32_to_cpu(buffer1);
+    next = le32_to_cpu(next);
+
+    len = length & DESC_SIZE1_MASK;
+    if (len > sizeof(buf)) {
+        len = sizeof(buf);
+    }
+    cpu_physical_memory_read(buffer1, buf, len);
+    qemu_send_packet(qemu_get_queue(s->nic), buf, len);
+
+    status &= ~DESC_OWN_BY_DMA;
+    status = cpu_to_le32(status);
+    cpu_physical_memory_write(d + 0, &status, 4);
+
+    s->cur_tx_desc = next;
+}
+
+static ssize_t mr80x_gmac_receive(NetClientState *nc, const uint8_t *buf,
+                                   size_t size)
+{
+    MR80XGmacState *s = qemu_get_nic_opaque(nc);
+    hwaddr d = s->cur_rx_desc;
+    uint32_t status, buffer1, next, framelen;
+
+    if (!s->have_rx_desc || !d || size > GMAC_MAX_FRAME - 4) {
+        return 0;
+    }
+    cpu_physical_memory_read(d + 0, &status, 4);
+    status = le32_to_cpu(status);
+    if (!(status & DESC_OWN_BY_DMA)) {
+        return 0; /* driver hasn't given this slot back to us yet */
+    }
+    cpu_physical_memory_read(d + 8, &buffer1, 4);
+    cpu_physical_memory_read(d + 12, &next, 4);
+    buffer1 = le32_to_cpu(buffer1);
+    next = le32_to_cpu(next);
+
+    cpu_physical_memory_write(buffer1, buf, size);
+
+    /* ipq_eth_recv() does `length - 4` assuming a 4-byte FCS trailer
+     * that real MAC hardware strips-but-still-counts; our virtual NIC
+     * packets have no FCS, so report size+4 to keep that math correct
+     * without actually needing 4 extra real bytes in the buffer. */
+    framelen = ((uint32_t)(size + 4) << DESC_FRAME_LEN_SHIFT) &
+               DESC_FRAME_LEN_MASK;
+    status = cpu_to_le32(framelen); /* ownership bit cleared: hand to driver */
+    cpu_physical_memory_write(d + 0, &status, 4);
+
+    s->cur_rx_desc = next;
+    return size;
+}
+
+static int mr80x_gmac_can_receive(NetClientState *nc)
+{
+    MR80XGmacState *s = qemu_get_nic_opaque(nc);
+    uint32_t status;
+
+    if (!s->have_rx_desc || !s->cur_rx_desc) {
+        return 0;
+    }
+    cpu_physical_memory_read(s->cur_rx_desc, &status, 4);
+    return (le32_to_cpu(status) & DESC_OWN_BY_DMA) != 0;
+}
+
+static uint64_t mr80x_gmac_read(void *opaque, hwaddr offset, unsigned size)
+{
+    MR80XGmacState *s = opaque;
+    return s->regs[offset / 4];
+}
+
+static void mr80x_gmac_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    MR80XGmacState *s = opaque;
+    s->regs[offset / 4] = (uint32_t)value;
+
+    switch (offset) {
+    case GMAC_DMA_RXBASEADDR:
+        s->cur_rx_desc = value;
+        s->have_rx_desc = true;
+        break;
+    case GMAC_DMA_TXBASEADDR:
+        s->cur_tx_desc = value;
+        break;
+    case GMAC_DMA_TXPOLLDEMAND:
+        mr80x_gmac_do_tx(s);
+        break;
+    case GMAC_DMA_RXPOLLDEMAND:
+        /* Nothing to do - we push received packets in as they arrive
+         * via mr80x_gmac_receive() rather than waiting to be polled;
+         * this write just means "driver refilled a descriptor". */
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps mr80x_gmac_ops = {
+    .read = mr80x_gmac_read,
+    .write = mr80x_gmac_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+static NetClientInfo mr80x_gmac_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .receive = mr80x_gmac_receive,
+    .can_receive = mr80x_gmac_can_receive,
+};
+
+static void mr80x_gmac_realize(DeviceState *dev, Error **errp)
+{
+    MR80XGmacState *s = MR80X_GMAC(dev);
+
+    memory_region_init_io(&s->iomem, OBJECT(dev), &mr80x_gmac_ops, s,
+                           "mr80x.gmac", 0x2000);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+
+    qemu_macaddr_default_if_unset(&s->conf.macaddr);
+    s->nic = qemu_new_nic(&mr80x_gmac_net_info, &s->conf,
+                           object_get_typename(OBJECT(dev)), dev->id,
+                           &dev->mem_reentrancy_guard, s);
+    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+}
+
+static const Property mr80x_gmac_properties[] = {
+    DEFINE_NIC_PROPERTIES(MR80XGmacState, conf),
+};
+
+static void mr80x_gmac_class_init(ObjectClass *oc, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+    dc->realize = mr80x_gmac_realize;
+    device_class_set_props(dc, mr80x_gmac_properties);
+}
+
+static const TypeInfo mr80x_gmac_typeinfo = {
+    .name = TYPE_MR80X_GMAC,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(MR80XGmacState),
+    .class_init = mr80x_gmac_class_init,
+};
+
+static void mr80x_gmac_register_types(void)
+{
+    type_register_static(&mr80x_gmac_typeinfo);
+}
+type_init(mr80x_gmac_register_types);
+
+/* ============================================================
  * Machine init
  * ============================================================ */
 
@@ -696,12 +920,23 @@ static void mr80x_init(MachineState *machine)
                             0x01900000, 16 * MiB);
     mr80x_add_unimp_region(sysmem, "mr80x.unimp-nand-0x79B0000",
                             0x079B0000, 1 * MiB);
-    mr80x_add_unimp_region(sysmem, "mr80x.unimp-gmac1-0x39C00000",
-                            0x39C00000, 1 * MiB);
     mr80x_add_unimp_region(sysmem, "mr80x.unimp-gmac2-0x39D00000",
                             0x39D00000, 1 * MiB);
     mr80x_add_unimp_region(sysmem, "mr80x.unimp-tlmm-0x01000000",
                             0x01000000, 1 * MiB);
+
+    /* GMAC1 - real device (see mr80x_gmac_realize and friends above).
+     * gmac1_cfg's "base" in every DTB checked, including our target
+     * ipq5018-emulation.dts, is 0x39C00000. Wired to whatever -netdev
+     * the user supplies (or QEMU's default usermode/slirp netdev if
+     * none is given) via qemu_configure_nic_device, same as any other
+     * board's onboard NIC. */
+    {
+        DeviceState *gmac1 = qdev_new(TYPE_MR80X_GMAC);
+        qemu_configure_nic_device(gmac1, true, NULL);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(gmac1), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(gmac1), 0, 0x39C00000);
+    }
 }
 
 static void mr80x_machine_class_init(ObjectClass *oc, void *data)
