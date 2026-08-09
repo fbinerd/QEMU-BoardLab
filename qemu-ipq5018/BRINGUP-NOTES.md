@@ -103,6 +103,46 @@ wrong, don't trust this file blindly once the vendor source changes.
   bit the polling loops are checking - determine the exact bits by reading
   `uart1_clock_config()`'s source once this phase starts, not guessed here.
 
+## 4b. Full flash partition table (real dump, not guesswork)
+
+`appsbl` is the complete u-boot (2016.01) - this whole project's clean-room
+reproduction of it - but it's only ONE partition among many in the real
+SPI-NAND flash; everything before it (sbl1, qsee) runs on the real device
+before appsbl ever starts and is out of scope for execution here (see
+decision below), but their DATA and every other partition's DATA should
+still be present in the emulated flash so u-boot sees the same partition
+table (`smeminfo`/`mtdparts`) and content a real device would.
+
+Source: a full, real flash dump, already split into per-partition files at
+`/media/dados_2tb/opw/openwrt-build-tools/tools/firmware-lab/work/fw_extracted/`.
+Confirmed (byte-exact size sum AND SHA-256 of the appsbl slice, which
+matches this project's own byte-identical build's hash
+`1c8fbfd9...` exactly) that `FULL_FIRMWARE.bin` in that same directory is
+simply these 16 partitions concatenated with zero gaps in mtd-number
+order - use it directly as the QEMU NAND backing file, no manual
+reassembly needed.
+
+| mtd | name | offset | size | purpose |
+|---|---|---|---|---|
+| 0 | sbl1 | 0x000000 | 0x080000 | Secondary Boot Loader - Qualcomm proprietary, runs first (loaded by the on-chip ROM/PBL), brings up DDR/PMIC/clocks, loads+hands off to qsee/appsbl. Not executed here (see scope decision, section 7b). |
+| 1 | mibib | 0x080000 | 0x080000 | Multi-Image Boot Information Block - Qualcomm's own partition table. This is what `smeminfo` actually reads; it's *why* that command works and partitions show up by name instead of raw mtd numbers. |
+| 2 | bootconfig | 0x100000 | 0x040000 | Active rootfs slot selection (A/B boot state). |
+| 3 | bootconfig1 | 0x140000 | 0x040000 | Redundant copy of bootconfig, for power-loss safety during a slot switch. |
+| 4 | qsee | 0x180000 | 0x100000 | TrustZone/Secure Execution Environment, AArch64 ELF. Not executed here. |
+| 5 | devcfg | 0x280000 | 0x040000 | Device/peripheral protection config consumed by TrustZone. |
+| 6 | cdt | 0x2C0000 | 0x040000 | Customer/Chip Data Table - board-specific hardware calibration (RF chains, GPIO, PMIC rails), read very early in boot. |
+| 7 | appsblenv | 0x300000 | 0x080000 | u-boot environment variables (`bootcmd`, `ipaddr`, `tp_boot_idx`, etc - the ones fixed by hand earlier this project when a prior sysupgrade corrupted them). |
+| 8 | appsbl | 0x380000 | 0x140000 | The bootloader itself - what this project reproduces from GPL source. Confirmed byte-identical (SHA-256) to `appsbl/out/appsbl.bin`. |
+| 9 | art | 0x4C0000 | 0x100000 | Antenna Reference Table - WiFi radio calibration data and the device's real MAC addresses. |
+| 10 | training | 0x5C0000 | 0x080000 | Cached DDR PHY training/timing results from a previous boot, reused by sbl1 to skip a full retrain. |
+| 11 | rootfs | 0x640000 | 0x2A00000 | Primary OS partition (UBI). Matches the offset already documented independently in `openwrt-build-tools`'s `recovery_mr80x_v5.md` note - cross-check passed. |
+| 12 | rootfs_1 | 0x3040000 | 0x2A00000 | Secondary/alternate OS partition (UBI), same cross-check. |
+| 13 | tp-data | 0x5A40000 | 0x840000 | TP-Link/Mercusys vendor persistent data (UBI). |
+| 14 | radio | 0x6280000 | 0x440000 | Additional per-radio board/calibration data (UBI), separate from ART. |
+| 15 | data | 0x66C0000 | 0x080000 | General persistent config/data partition (UBI) - OpenWrt `rootfs_data`-equivalent. |
+
+Total: `0x6740000` (108,265,472 bytes), matches `FULL_FIRMWARE.bin` exactly.
+
 ## 5. QPIC NAND (`drivers/mtd/nand/qpic_nand.c`, board hook
    `board_nand_init()` at `ipq5018.c:774`, clock helper
    `qpic_set_clk_rate()` at `ipq5018.c:717`)
@@ -123,13 +163,17 @@ wrong, don't trust this file blindly once the vendor source changes.
 - Register map not yet extracted - next step. Given we have full driver
   source, this is a transcription task (find the `writel`/`readl` calls
   and their base+offset macros), not blind reverse engineering.
-- **Backing store**: model should read/write a flat file on the QEMU host
-  representing the whole flash (or at minimum the appsbl+env+rootfs
-  partitions we care about), so `out/appsbl-dual-key.bin` and
-  `keys/private/*.pem`-signed test images (via
-  `openwrt`'s `tplink-cloud-sign.py`) can be written into a virtual flash
-  image and read back through the SAME code path a real device would use
-  - that's the actual point of building this.
+- **Backing store, decided**: use
+  `openwrt-build-tools/tools/firmware-lab/work/fw_extracted/FULL_FIRMWARE.bin`
+  directly (confirmed byte-exact concatenation of all 16 real partitions,
+  see section 4b) as the QEMU NAND model's backing file - `cp` a working
+  copy per test run so writes never touch the source dump. This means
+  `smeminfo`/`mtdparts` inside the emulator see the SAME real partition
+  table, ART MAC addresses, CDT, etc. a real device has, not synthetic
+  placeholders. To test a new appsbl build, patch just the appsbl slice
+  (offset `0x380000`, length `0x140000` - see table in 4b) of a working
+  copy of this file before boot, e.g. with `out/appsbl-dual-key.bin` or a
+  `tplink-cloud-sign.py`-signed test image dropped into the rootfs slice.
 
 ## 6. Ethernet (`drivers/net/designware.c`)
 
@@ -168,6 +212,22 @@ wrong, don't trust this file blindly once the vendor source changes.
   full peripheral set. Document this choice inline in the QEMU board file
   when it's written, so it's not mistaken for real-hardware-accurate
   later.
+
+## 7b. Scope decision, confirmed with user: sbl1/qsee are data-only, not executed
+
+`sbl1` (Qualcomm proprietary, undocumented header magic `d1dc4b84...`, not
+a plain ELF) and `qsee` (TrustZone, AArch64 ELF) are real binaries we have
+byte-for-byte from the flash dump, but reverse-engineering them well
+enough to actually *execute* inside QEMU - proprietary DDR/PMIC
+sequencing, secure boot crypto, AArch64-to-AArch32 handoff - is an
+open-ended undertaking with no public documentation to check against,
+unlike `appsbl` where we have full GPL source. Decided (2026-08-09): QEMU
+starts CPU execution directly at `appsbl`'s entry (`0x4A920000`), the same
+way this project already does on real hardware via `bootelf`/`go` from a
+u-boot console - not re-simulating sbl1/qsee's own execution. Their DATA
+is still present in the backing flash image (section 4b) so anything
+`appsbl` itself reads from those partitions (mibib partition table via
+`smeminfo`, ART MAC/calibration, etc.) resolves to real values.
 
 ## Status / next steps (in order)
 
