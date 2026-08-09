@@ -24,6 +24,9 @@
 #include "qemu/log.h"
 #include "qemu/bswap.h"
 #include "qemu/error-report.h"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include "qapi/error.h"
 #include "hw/sysbus.h"
 #include "hw/boards.h"
@@ -433,12 +436,15 @@ static const MemoryRegionOps mr80x_pshold_ops = {
 /* Register offsets from arch-qca-common/qpic_nand.h - the small subset
  * qpic_nand_fetch_id()/qpic_nand_read_reg() actually touch. */
 #define NAND_FLASH_CMD_OFF        0x0000
+#define NAND_ADDR0_OFF            0x0004
+#define NAND_ADDR1_OFF            0x0008
 #define NAND_EXEC_CMD_OFF         0x0010
 #define NAND_FLASH_STATUS_OFF     0x0014
 #define NAND_READ_ID_OFF          0x0040
 #define NAND_DEV_CMD_VLD_V1_5_20_OFF 0x70AC
 
 #define NAND_CMD_FETCH_ID 0x0B
+#define MR80X_NAND_PAGE_SIZE 2048
 
 /* Fake serial NAND identity: GigaDevice GD5F1GQ4RE9IG (id bytes
  * {0xc8,0xc1} in qpic_serial_nand_tbl[]) - chosen because its
@@ -451,6 +457,18 @@ static const MemoryRegionOps mr80x_pshold_ops = {
 
 typedef struct MR80XNandState {
     uint32_t regs[MR80X_NAND_SIZE / 4];
+    /* Real flash *data* backing (see MR80X_BAM_DATA_PRODUCER_PIPE
+     * handling below) - a read-only mmap of a real full-flash dump,
+     * MR80X_NAND_IMAGE env var. NULL if not provided: page reads then
+     * fall back to returning 0xFF (erased-flash convention) instead
+     * of real data, same as before this existed. */
+    const uint8_t *image_data;
+    size_t image_size;
+    /* Running byte offset into the page currently being read, reset
+     * to 0 whenever NAND_ADDR0 is written (start of a new page-scope
+     * read op) and advanced by each data-pipe descriptor's size as
+     * codewords stream through - see MR80X_BAM_DATA_PRODUCER_PIPE. */
+    uint32_t page_read_offset;
 } MR80XNandState;
 
 static uint32_t mr80x_nand_reg_read(MR80XNandState *s, hwaddr offset)
@@ -468,6 +486,10 @@ static void mr80x_nand_reg_write(MR80XNandState *s, hwaddr offset,
                                   uint32_t value, uint32_t mask)
 {
     s->regs[offset / 4] = (s->regs[offset / 4] & ~mask) | (value & mask);
+
+    if (offset == NAND_ADDR0_OFF) {
+        s->page_read_offset = 0;
+    }
 
     if (offset == NAND_EXEC_CMD_OFF && (value & mask & 0x1)) {
         uint32_t cmd = s->regs[NAND_FLASH_CMD_OFF / 4] & 0xFF;
@@ -537,17 +559,24 @@ static const MemoryRegionOps mr80x_nand_ops = {
  * BAM_P_SW_OFSTSn's value is read by bam_read_offset_update() but
  * assigned to a local variable that's never used - safe to return 0.
  *
- * Only the cmd pipe (index/pipe_num 2) actually executes cmd_elements;
- * the data pipes (0,1, for real page read/write DMA) are latched but
- * not yet driven - real flash *data* (kernel/rootfs) isn't reachable
- * yet, only device identification, which is what unblocks the next
- * boot step.
+ * The data-producer pipe (index/pipe_num 1) and status pipe (index 3)
+ * carry real page *data* for qpic_nand_page_scope_read() - see
+ * mr80x_bam_process_raw_desc() below: each codeword's data descriptor
+ * copies real bytes from MR80X_NAND_IMAGE (if provided) at the
+ * current page's file offset, and each status descriptor reports a
+ * clean (no-error) 12-byte auto-status record, matching
+ * qpic_nand_check_read_status()'s success path. The data-consumer
+ * pipe (index 0, real flash *writes*) isn't driven yet - see
+ * BRINGUP-NOTES.md.
  * ============================================================ */
 
 #define MR80X_BAM_BASE 0x07984000
 #define MR80X_BAM_SIZE 0x20000
 #define MR80X_BAM_NUM_PIPES 4
+#define MR80X_BAM_DATA_CONSUMER_PIPE 0  /* writes (guest -> flash), not driven yet */
+#define MR80X_BAM_DATA_PRODUCER_PIPE 1  /* reads (flash -> guest) */
 #define MR80X_BAM_CMD_PIPE 2
+#define MR80X_BAM_STATUS_PIPE 3         /* per-codeword auto-status, page-scope reads */
 #define MR80X_BAM_EE 0
 
 #define BAM_P_CTRLn_BASE          0x00013000
@@ -566,6 +595,15 @@ static const MemoryRegionOps mr80x_nand_ops = {
 typedef struct MR80XBamPipe {
     hwaddr fifo_base;
     uint32_t irq_stts;
+    uint32_t last_evnt_off;
+    uint32_t fifo_size; /* bytes, from BAM_P_FIFO_SIZESn - real hardware
+                          * masks the event/offset register modulo this,
+                          * NOT a fixed 16-bit wrap (bam_sys_gen_event()'s
+                          * `val &= fifo.size*BAM_DESC_SIZE - 1`). Getting
+                          * this wrong silently corrupts which guest
+                          * memory a later kick's descriptor is read
+                          * from once enough kicks accumulate past a
+                          * small pipe's real (small) FIFO. */
 } MR80XBamPipe;
 
 typedef struct MR80XBamState {
@@ -627,6 +665,65 @@ static void mr80x_bam_process_cmd_desc(MR80XBamState *s, hwaddr desc_addr)
     }
 }
 
+/* Data-producer pipe (real page reads) and status pipe (per-codeword
+ * auto-status) descriptors are plain {dest, len} buffers, not
+ * cmd_element batches - see the comment block above. The *source*
+ * side (which bytes of real flash a given descriptor should deliver)
+ * is tracked separately in MR80XNandState.page_read_offset, reset to
+ * 0 whenever NAND_ADDR0 is written (qpic_nand_page_scope_read()'s
+ * i==0 codeword) and advanced by each descriptor's length as
+ * codewords stream through in order - the *destination* address is
+ * always taken directly from the descriptor itself, since the real
+ * driver already computes a distinct, correctly-offset buffer
+ * pointer per codeword (qpic_nand.c's `buffer += data_bytes`
+ * between iterations, not shown in the cmd/data split above but
+ * present in the real loop). Once page_read_offset reaches
+ * MR80X_NAND_PAGE_SIZE (2048), any further bytes in this same page
+ * read are OOB/spare data (real serial NAND spare-area bytes, not
+ * captured by a raw MR80X_NAND_IMAGE dump) - filled with 0xFF
+ * ("erased flash") rather than real content, which is fine: nothing
+ * that matters for booting (env parsing, kernel/rootfs loading)
+ * reads OOB data, only the main 2048 bytes/page. */
+static void mr80x_bam_process_raw_desc(MR80XBamState *s, int pipe,
+                                        hwaddr desc_addr)
+{
+    uint8_t desc[8];
+    uint32_t dest_addr;
+    uint16_t len;
+    uint8_t buf[MR80X_NAND_PAGE_SIZE];
+    MR80XNandState *nand = s->nand;
+
+    cpu_physical_memory_read(desc_addr, desc, sizeof(desc));
+    dest_addr = ldl_le_p(desc + 0);
+    len = lduw_le_p(desc + 4);
+    if (len > sizeof(buf)) {
+        len = sizeof(buf);
+    }
+
+    if (pipe == MR80X_BAM_STATUS_PIPE) {
+        memset(buf, 0, len); /* flash_sts=buffer_sts=erased_cw_sts=0 */
+        cpu_physical_memory_write(dest_addr, buf, len);
+        return;
+    }
+
+    /* MR80X_BAM_DATA_PRODUCER_PIPE */
+    {
+        uint32_t page = (nand->regs[NAND_ADDR0_OFF / 4] >> 16) |
+                         (nand->regs[NAND_ADDR1_OFF / 4] << 16);
+        uint64_t file_off = (uint64_t)page * MR80X_NAND_PAGE_SIZE +
+                             nand->page_read_offset;
+
+        if (nand->image_data && nand->page_read_offset < MR80X_NAND_PAGE_SIZE &&
+            file_off + len <= nand->image_size) {
+            memcpy(buf, nand->image_data + file_off, len);
+        } else {
+            memset(buf, 0xFF, len);
+        }
+        cpu_physical_memory_write(dest_addr, buf, len);
+        nand->page_read_offset += len;
+    }
+}
+
 static uint64_t mr80x_bam_read(void *opaque, hwaddr offset, unsigned size)
 {
     MR80XBamState *s = opaque;
@@ -672,6 +769,14 @@ static void mr80x_bam_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
 
+    if (offset >= BAM_P_FIFO_SIZESn_BASE &&
+        offset < BAM_P_FIFO_SIZESn_BASE + 0x1000 * MR80X_BAM_NUM_PIPES &&
+        (offset - BAM_P_FIFO_SIZESn_BASE) % 0x1000 == 0) {
+        uint32_t n = (offset - BAM_P_FIFO_SIZESn_BASE) / 0x1000;
+        s->pipe[n].fifo_size = value; /* already in bytes, bam_pipe_fifo_init() */
+        return;
+    }
+
     if (offset >= BAM_P_IRQ_CLRn_BASE &&
         offset < BAM_P_IRQ_CLRn_BASE + 0x1000 * MR80X_BAM_NUM_PIPES &&
         (offset - BAM_P_IRQ_CLRn_BASE) % 0x1000 == 0) {
@@ -685,15 +790,30 @@ static void mr80x_bam_write(void *opaque, hwaddr offset, uint64_t value,
         (offset - BAM_P_EVNT_REGn_BASE) % 0x1000 == 0) {
         uint32_t n = (offset - BAM_P_EVNT_REGn_BASE) / 0x1000;
 
-        /* The "kick": a new descriptor was appended right before the
-         * new write-offset given here. We only track the cmd pipe -
-         * the driver always adds exactly one descriptor per kick in
-         * this code path, so the newest descriptor sits 8 bytes
-         * before the new offset in the (power-of-2-sized) ring. */
-        if (n == MR80X_BAM_CMD_PIPE && s->pipe[n].fifo_base) {
+        /* The "kick": one or more descriptors were appended between
+         * the pipe's last-known offset and this new write-offset -
+         * almost always exactly one (matching bam_sys_gen_event()'s
+         * usual num_desc=1 call), except qpic_nand_page_scope_read()'s
+         * last codeword, which batches 2 data descriptors (user data
+         * + OOB/spare) into a single kick. Process each in FIFO order. */
+        if (s->pipe[n].fifo_base && s->pipe[n].fifo_size) {
+            uint32_t mask = s->pipe[n].fifo_size - 1; /* fifo_size is pow2 */
             uint32_t new_off = (uint32_t)value;
-            uint32_t desc_off = (new_off - 8) & 0xFFFF;
-            mr80x_bam_process_cmd_desc(s, s->pipe[n].fifo_base + desc_off);
+            uint32_t old_off = s->pipe[n].last_evnt_off;
+            uint32_t delta = (new_off - old_off) & mask;
+            uint32_t i;
+
+            for (i = 0; i < delta; i += 8) {
+                hwaddr desc_addr = s->pipe[n].fifo_base +
+                                    ((old_off + i) & mask);
+                if (n == MR80X_BAM_CMD_PIPE) {
+                    mr80x_bam_process_cmd_desc(s, desc_addr);
+                } else if (n == MR80X_BAM_DATA_PRODUCER_PIPE ||
+                           n == MR80X_BAM_STATUS_PIPE) {
+                    mr80x_bam_process_raw_desc(s, n, desc_addr);
+                }
+            }
+            s->pipe[n].last_evnt_off = new_off;
         }
         s->pipe[n].irq_stts |= BAM_P_PRCSD_DESC_MASK;
         return;
@@ -1480,6 +1600,36 @@ static void mr80x_init(MachineState *machine)
     /* QPIC NAND - see the MR80X_NAND_BASE comment block above */
     MR80XNandState *nand_state = g_new0(MR80XNandState, 1);
     nand_state->regs[NAND_VERSION_OFF / 4] = 0x20000000u;
+    /* Real page *data* backing for MR80X_BAM_DATA_PRODUCER_PIPE - a
+     * raw full-flash dump (e.g. FULL_FIRMWARE.bin, BRINGUP-NOTES.md
+     * section 4b), mmap'd read-only. Optional: without it, page reads
+     * just return 0xFF (same as before this existed) - readenv() and
+     * kernel/rootfs loading will still fail, but nothing crashes. */
+    {
+        const char *path = getenv("MR80X_NAND_IMAGE");
+        if (path) {
+            int fd = open(path, O_RDONLY);
+            struct stat st;
+            if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {
+                void *m = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (m != MAP_FAILED) {
+                    nand_state->image_data = m;
+                    nand_state->image_size = st.st_size;
+                    info_report("mr80x: NAND backed by '%s' (%" PRIu64
+                                 " bytes)", path, (uint64_t)st.st_size);
+                } else {
+                    warn_report("mr80x: mmap('%s') failed: %s", path,
+                                strerror(errno));
+                }
+            } else {
+                warn_report("mr80x: could not open MR80X_NAND_IMAGE '%s': %s",
+                            path, strerror(errno));
+            }
+            if (fd >= 0) {
+                close(fd);
+            }
+        }
+    }
     {
         MemoryRegion *nand = g_new0(MemoryRegion, 1);
         memory_region_init_io(nand, NULL, &mr80x_nand_ops, nand_state,
