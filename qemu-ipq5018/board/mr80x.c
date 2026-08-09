@@ -22,6 +22,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/log.h"
+#include "qemu/bswap.h"
 #include "qapi/error.h"
 #include "hw/sysbus.h"
 #include "hw/boards.h"
@@ -412,28 +413,279 @@ static const MemoryRegionOps mr80x_pshold_ops = {
 #define MR80X_NAND_SIZE 0x10000
 #define NAND_VERSION_OFF 0x4F08
 
+/* Register offsets from arch-qca-common/qpic_nand.h - the small subset
+ * qpic_nand_fetch_id()/qpic_nand_read_reg() actually touch. */
+#define NAND_FLASH_CMD_OFF        0x0000
+#define NAND_EXEC_CMD_OFF         0x0010
+#define NAND_FLASH_STATUS_OFF     0x0014
+#define NAND_READ_ID_OFF          0x0040
+#define NAND_DEV_CMD_VLD_V1_5_20_OFF 0x70AC
+
+#define NAND_CMD_FETCH_ID 0x0B
+
+/* Fake serial NAND identity: GigaDevice GD5F1GQ4RE9IG (id bytes
+ * {0xc8,0xc1} in qpic_serial_nand_tbl[]) - chosen because its
+ * page_size=2048/erase_blk_size=0x20000/density=0x08000000 (128MiB)
+ * exactly match the SMEM flash-type block_size/density fakes already
+ * set up in mr80x_init(). NAND_READ_ID's low two bytes are
+ * {vendor,device} = {id&0xff, (id>>8)&0xff}, so id=0x0000c1c8 yields
+ * vendor=0xc8, device=0xc1. */
+#define MR80X_FAKE_NAND_ID 0x0000c1c8u
+
+typedef struct MR80XNandState {
+    uint32_t regs[MR80X_NAND_SIZE / 4];
+} MR80XNandState;
+
+static uint32_t mr80x_nand_reg_read(MR80XNandState *s, hwaddr offset)
+{
+    return s->regs[offset / 4];
+}
+
+/* Shared by both direct-MMIO writes and the BAM cmd-pipe engine below -
+ * on real hardware both paths ultimately land on the same NANDc
+ * register file. Writing NAND_EXEC_CMD (the "go" trigger) is where we
+ * synthesize a result for whatever opcode was latched into
+ * NAND_FLASH_CMD, mirroring what the real controller would have done
+ * against actual flash. */
+static void mr80x_nand_reg_write(MR80XNandState *s, hwaddr offset,
+                                  uint32_t value, uint32_t mask)
+{
+    s->regs[offset / 4] = (s->regs[offset / 4] & ~mask) | (value & mask);
+
+    if (offset == NAND_EXEC_CMD_OFF && (value & mask & 0x1)) {
+        uint32_t cmd = s->regs[NAND_FLASH_CMD_OFF / 4] & 0xFF;
+
+        s->regs[NAND_FLASH_STATUS_OFF / 4] = 0; /* no NAND_FLASH_ERR bits */
+        if (cmd == NAND_CMD_FETCH_ID) {
+            s->regs[NAND_READ_ID_OFF / 4] = MR80X_FAKE_NAND_ID;
+        }
+    }
+}
+
 static uint64_t mr80x_nand_read(void *opaque, hwaddr offset, unsigned size)
 {
-    if (offset == NAND_VERSION_OFF) {
-        return 0x20000000u; /* hw_ver=2 (QCA_QPIC_V2_1_1) in bits 31:28 */
-    }
-    qemu_log_mask(LOG_UNIMP,
-                  "mr80x: nand READ  off=0x%" HWADDR_PRIx " size=%u -> 0\n",
-                  offset, size);
-    return 0;
+    MR80XNandState *s = opaque;
+    return mr80x_nand_reg_read(s, offset);
 }
 
 static void mr80x_nand_write(void *opaque, hwaddr offset, uint64_t value,
                               unsigned size)
 {
-    qemu_log_mask(LOG_UNIMP,
-                  "mr80x: nand WRITE off=0x%" HWADDR_PRIx " size=%u val=0x%"
-                  PRIx64 "\n", offset, size, value);
+    MR80XNandState *s = opaque;
+    mr80x_nand_reg_write(s, offset, (uint32_t)value, 0xFFFFFFFFu);
 }
 
 static const MemoryRegionOps mr80x_nand_ops = {
     .read = mr80x_nand_read,
     .write = mr80x_nand_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 8 },
+};
+
+/* ============================================================
+ * QPIC BAM (Bus Access Manager) - drivers/dma/bam.c,
+ * arch-qca-common/bam.h. Base QPIC_BAM_CTRL_BASE = 0x07984000.
+ *
+ * Real hardware: a DMA engine that walks descriptor rings in guest
+ * RAM. qpic_nand.c's register accesses (qpic_nand_fetch_id(),
+ * qpic_nand_read_reg()) don't touch NAND_* registers directly at all
+ * - they build an array of `struct cmd_element` (16 bytes:
+ * addr_n_cmd, reg_data, reg_mask, reserved) in RAM, wrap it in one
+ * `struct bam_desc` (8 bytes: addr, size, reserved, flags) written
+ * into the "cmd pipe" (pipe_num=CMD_PIPE=2)'s descriptor FIFO, then
+ * kick the BAM by writing the new FIFO write-offset to
+ * BAM_P_EVNT_REGn(2, ee). The actual NANDc register read/write only
+ * happens once the BAM processes that descriptor.
+ *
+ * Modeled behavior: process synchronously on the EVNT_REGn kick write
+ * - read back the just-added bam_desc, and when BAM_DESC_CMD_FLAG is
+ * set, interpret its buffer as concatenated cmd_elements and apply
+ * each directly against MR80XNandState's register file (the very
+ * struct mr80x_nand_read/write above also use, so either access path
+ * observes the same state):
+ *   - CE_WRITE_TYPE (cmd_type=0): reg_data & reg_mask -> register.
+ *   - CE_READ_TYPE  (cmd_type=1): register's value is written OUT to
+ *     the RAM address held in reg_data - see bam_add_cmd_element()'s
+ *     dcache-flush-of-`value` comment: for a read CE, the value field
+ *     is a destination pointer, not data.
+ * Addressing quirk: addr_n_cmd keeps only the low 24 bits of the real
+ * register address (`reg_addr & ~BAM_CE_REG_ADDR_MASK`, top byte
+ * repurposed for cmd_type). Every QPIC NAND register lives at
+ * 0x079Bxxxx, so the discarded top byte is always reconstructable as
+ * 0x07.
+ * bam_wait_for_interrupt()'s poll loop (BAM_IRQ_SRCS then
+ * BAM_P_IRQ_STTSn, looking for P_PRCSD_DESC_EN_MASK=1) succeeds
+ * immediately since we set both synchronously inside the kick write.
+ * BAM_P_SW_OFSTSn's value is read by bam_read_offset_update() but
+ * assigned to a local variable that's never used - safe to return 0.
+ *
+ * Only the cmd pipe (index/pipe_num 2) actually executes cmd_elements;
+ * the data pipes (0,1, for real page read/write DMA) are latched but
+ * not yet driven - real flash *data* (kernel/rootfs) isn't reachable
+ * yet, only device identification, which is what unblocks the next
+ * boot step.
+ * ============================================================ */
+
+#define MR80X_BAM_BASE 0x07984000
+#define MR80X_BAM_SIZE 0x20000
+#define MR80X_BAM_NUM_PIPES 4
+#define MR80X_BAM_CMD_PIPE 2
+#define MR80X_BAM_EE 0
+
+#define BAM_P_CTRLn_BASE          0x00013000
+#define BAM_P_RSTn_BASE           0x00013004
+#define BAM_P_IRQ_STTSn_BASE      0x00013010
+#define BAM_P_IRQ_CLRn_BASE       0x00013014
+#define BAM_P_IRQ_ENn_BASE        0x00013018
+#define BAM_P_SW_OFSTSn_BASE      0x00013800
+#define BAM_P_EVNT_REGn_BASE      0x00013818
+#define BAM_P_DESC_FIFO_ADDRn_BASE 0x0001381C
+#define BAM_P_FIFO_SIZESn_BASE   0x00013820
+#define BAM_IRQ_SRCS_BASE         0x00003000
+#define BAM_DESC_CMD_FLAG (1 << 3)
+#define BAM_P_PRCSD_DESC_MASK 1
+
+typedef struct MR80XBamPipe {
+    hwaddr fifo_base;
+    uint32_t irq_stts;
+} MR80XBamPipe;
+
+typedef struct MR80XBamState {
+    MemoryRegion iomem;
+    MR80XNandState *nand;
+    MR80XBamPipe pipe[MR80X_BAM_NUM_PIPES];
+    uint32_t generic_regs[MR80X_BAM_SIZE / 4];
+} MR80XBamState;
+
+static void mr80x_bam_process_cmd_desc(MR80XBamState *s, hwaddr desc_addr)
+{
+    uint8_t desc[8];
+    uint32_t buf_addr, i;
+    uint16_t buf_size;
+    uint8_t flags;
+
+    cpu_physical_memory_read(desc_addr, desc, sizeof(desc));
+    buf_addr = ldl_le_p(desc + 0);
+    buf_size = lduw_le_p(desc + 4);
+    flags = desc[7];
+
+    if (!(flags & BAM_DESC_CMD_FLAG)) {
+        return; /* data-pipe transfer, not a cmd_element batch */
+    }
+
+    for (i = 0; i + 16 <= buf_size; i += 16) {
+        uint8_t ce[16];
+        uint32_t addr_n_cmd, reg_data;
+        hwaddr reg_addr;
+        int cmd_type;
+
+        cpu_physical_memory_read(buf_addr + i, ce, sizeof(ce));
+        addr_n_cmd = ldl_le_p(ce + 0);
+        reg_data = ldl_le_p(ce + 4);
+        /* reg_mask at ce+8 is always 0xFFFFFFFF in this driver -
+         * not needed for correct behavior here. */
+
+        reg_addr = 0x07000000u | (addr_n_cmd & 0x00FFFFFFu);
+        cmd_type = (addr_n_cmd >> 24) & 0xFF;
+
+        if (reg_addr < MR80X_NAND_BASE ||
+            reg_addr >= MR80X_NAND_BASE + MR80X_NAND_SIZE) {
+            qemu_log_mask(LOG_UNIMP,
+                          "mr80x: bam cmd_element targets unmodeled reg "
+                          "0x%" HWADDR_PRIx "\n", reg_addr);
+            continue;
+        }
+
+        if (cmd_type == 1) { /* CE_READ_TYPE: reg_data is a dest pointer */
+            uint32_t val = mr80x_nand_reg_read(s->nand,
+                                                reg_addr - MR80X_NAND_BASE);
+            uint8_t le[4];
+            stl_le_p(le, val);
+            cpu_physical_memory_write(reg_data, le, 4);
+        } else { /* CE_WRITE_TYPE */
+            mr80x_nand_reg_write(s->nand, reg_addr - MR80X_NAND_BASE,
+                                  reg_data, 0xFFFFFFFFu);
+        }
+    }
+}
+
+static uint64_t mr80x_bam_read(void *opaque, hwaddr offset, unsigned size)
+{
+    MR80XBamState *s = opaque;
+
+    if (offset >= BAM_IRQ_SRCS_BASE &&
+        offset < BAM_IRQ_SRCS_BASE + 0x1000 * MR80X_BAM_NUM_PIPES) {
+        uint32_t n = (offset - BAM_IRQ_SRCS_BASE) / 0x1000;
+        uint32_t sub = (offset - BAM_IRQ_SRCS_BASE) % 0x1000;
+        if (sub == 0 && n == MR80X_BAM_EE) {
+            uint32_t srcs = 0, p;
+            for (p = 0; p < MR80X_BAM_NUM_PIPES; p++) {
+                if (s->pipe[p].irq_stts) {
+                    srcs |= (1u << p);
+                }
+            }
+            return srcs;
+        }
+    }
+
+    if (offset >= BAM_P_IRQ_STTSn_BASE &&
+        offset < BAM_P_IRQ_STTSn_BASE + 0x1000 * MR80X_BAM_NUM_PIPES) {
+        uint32_t n = (offset - BAM_P_IRQ_STTSn_BASE) / 0x1000;
+        if ((offset - BAM_P_IRQ_STTSn_BASE) % 0x1000 == 0) {
+            return s->pipe[n].irq_stts;
+        }
+    }
+
+    return s->generic_regs[offset / 4];
+}
+
+static void mr80x_bam_write(void *opaque, hwaddr offset, uint64_t value,
+                             unsigned size)
+{
+    MR80XBamState *s = opaque;
+
+    s->generic_regs[offset / 4] = (uint32_t)value;
+
+    if (offset >= BAM_P_DESC_FIFO_ADDRn_BASE &&
+        offset < BAM_P_DESC_FIFO_ADDRn_BASE + 0x1000 * MR80X_BAM_NUM_PIPES &&
+        (offset - BAM_P_DESC_FIFO_ADDRn_BASE) % 0x1000 == 0) {
+        uint32_t n = (offset - BAM_P_DESC_FIFO_ADDRn_BASE) / 0x1000;
+        s->pipe[n].fifo_base = value;
+        return;
+    }
+
+    if (offset >= BAM_P_IRQ_CLRn_BASE &&
+        offset < BAM_P_IRQ_CLRn_BASE + 0x1000 * MR80X_BAM_NUM_PIPES &&
+        (offset - BAM_P_IRQ_CLRn_BASE) % 0x1000 == 0) {
+        uint32_t n = (offset - BAM_P_IRQ_CLRn_BASE) / 0x1000;
+        s->pipe[n].irq_stts &= ~(uint32_t)value;
+        return;
+    }
+
+    if (offset >= BAM_P_EVNT_REGn_BASE &&
+        offset < BAM_P_EVNT_REGn_BASE + 0x1000 * MR80X_BAM_NUM_PIPES &&
+        (offset - BAM_P_EVNT_REGn_BASE) % 0x1000 == 0) {
+        uint32_t n = (offset - BAM_P_EVNT_REGn_BASE) / 0x1000;
+
+        /* The "kick": a new descriptor was appended right before the
+         * new write-offset given here. We only track the cmd pipe -
+         * the driver always adds exactly one descriptor per kick in
+         * this code path, so the newest descriptor sits 8 bytes
+         * before the new offset in the (power-of-2-sized) ring. */
+        if (n == MR80X_BAM_CMD_PIPE && s->pipe[n].fifo_base) {
+            uint32_t new_off = (uint32_t)value;
+            uint32_t desc_off = (new_off - 8) & 0xFFFF;
+            mr80x_bam_process_cmd_desc(s, s->pipe[n].fifo_base + desc_off);
+        }
+        s->pipe[n].irq_stts |= BAM_P_PRCSD_DESC_MASK;
+        return;
+    }
+}
+
+static const MemoryRegionOps mr80x_bam_ops = {
+    .read = mr80x_bam_read,
+    .write = mr80x_bam_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 8 },
     .impl = { .min_access_size = 1, .max_access_size = 8 },
@@ -891,6 +1143,63 @@ static void mr80x_smem_fake_u32_entry(unsigned type, hwaddr data_off,
     cpu_physical_memory_write(MR80X_SMEM_BASE + data_off, &v, 4);
 }
 
+/* ============================================================
+ * Monitor-mode SMC trampoline. appsbl runs with no real secure
+ * monitor (sbl1/qsee, BRINGUP-NOTES.md section 7b) present, yet
+ * several early boot-path functions - do_bootipq()'s QFPROM
+ * authenticate check, qti_scm_pshold()'s reset fallback,
+ * is_scm_armv8()'s own calling-convention probe (all in
+ * arch/arm/cpu/armv7/qca/common/scm.c) - issue a bare `smc #0` and
+ * expect a well-defined error code back in r0, not a crash.
+ *
+ * Without any code at the CPU's Monitor-mode SMC vector
+ * (MVBAR + 0x08), `smc` traps into whatever garbage/unmapped memory
+ * MVBAR happens to reset to (0, architecturally, since only Secure
+ * firmware we don't run would ever program it) - this was the exact
+ * cause of the prefetch-abort-at-pc=0xc crash immediately after
+ * "Hit any key to stop autoboot": do_bootipq() calls
+ * qca_scm_call(SCM_SVC_FUSE, QFPROM_IS_AUTHENTICATE_CMD, ...) as its
+ * very first hardware access, before ever touching NAND - confirmed
+ * by the crash's LR being byte-identical whether or not NAND
+ * identification (section above) succeeds.
+ *
+ * Fix: point MVBAR (set directly on the QEMU CPU object at reset,
+ * since no guest code path can ever legitimately set it without
+ * secure firmware) at a 2-instruction trampoline placed at this
+ * vector's slot:
+ *     mvn  r0, #3   ; r0 = 0xFFFFFFFC = SCM_EOPNOTSUPP (-4)
+ *     movs pc, lr   ; return from Monitor mode to the smc's caller
+ * scm.c's own error-remap table turns SCM_EOPNOTSUPP into
+ * -EOPNOTSUPP, which every caller in this codebase already treats
+ * as "SCM feature not present, continue without it" - exactly the
+ * real-hardware-without-TrustZone-firmware behavior we want instead
+ * of a crash. is_scm_armv8()'s version-probe call also just reads
+ * r0: a nonzero/failing r0 there correctly makes it fall back to the
+ * legacy SCM calling convention for every later call too, so one
+ * trampoline handles both call conventions used in this file.
+ * ============================================================ */
+
+/* Lives 4KiB below the appsbl entry point, inside the SAME 1MiB
+ * section as CONFIG_SYS_TEXT_BASE (0x4A920000) - NOT some arbitrary
+ * "unused" RAM address. Three earlier attempts elsewhere in RAM
+ * (0x00080000; top of the full 512MiB QEMU is given; top of the
+ * 256MiB the "DRAM: 256 MiB" boot message reports) all still faulted
+ * instruction fetch with IFSR 0xd (Permission fault), confirmed via
+ * `-d int` exception tracing. Root cause, found in
+ * arch/arm/lib/cache-cp15.c's dram_bank_mmu_setup()
+ * (CONFIG_IPQ_NO_RELOC path, which ipq5018.h enables): u-boot's own
+ * static page table first marks the *entire* 4GB address space
+ * SHARED_DEVICE (execute-unfriendly), then for DRAM specifically
+ * marks only the one 1MiB section containing CONFIG_SYS_TEXT_BASE
+ * with the exec-friendly UBOOT_CACHE_SETUP attribute - every other
+ * MiB, including ones that are perfectly valid backing RAM in QEMU,
+ * keeps the earlier device-like attribute and cannot be fetched from.
+ * This address is guaranteed to fall in that one safe section
+ * regardless of exactly how large u-boot believes DRAM to be. */
+#define MR80X_MVBAR_BASE (MR80X_APPSBL_ENTRY - 0x1000)
+#define MR80X_MVBAR_SIZE 0x20
+#define MR80X_MVBAR_SMC_OFF 0x08
+
 static void mr80x_reset(void *opaque)
 {
     ARMCPU *cpu = opaque;
@@ -898,6 +1207,7 @@ static void mr80x_reset(void *opaque)
 
     cpu_reset(cs);
     cpu_set_pc(cs, MR80X_APPSBL_ENTRY);
+    cpu->env.cp15.mvbar = MR80X_MVBAR_BASE;
 }
 
 static void mr80x_init(MachineState *machine)
@@ -1019,6 +1329,18 @@ static void mr80x_init(MachineState *machine)
         }
     }
 
+    /* Monitor-mode SMC trampoline - see the MR80X_MVBAR_BASE comment
+     * block above mr80x_reset(). Written after the ELF/image load
+     * above so nothing overwrites it. */
+    {
+        static const uint8_t trampoline[] = {
+            0x03, 0x00, 0xE0, 0xE3, /* mvn  r0, #3   (little-endian) */
+            0x0E, 0xF0, 0xB0, 0xE1, /* movs pc, lr                  */
+        };
+        cpu_physical_memory_write(MR80X_MVBAR_BASE + MR80X_MVBAR_SMC_OFF,
+                                   trampoline, sizeof(trampoline));
+    }
+
     qemu_register_reset(mr80x_reset, cpu);
 
     /* GCC clock controller stub */
@@ -1065,15 +1387,28 @@ static void mr80x_init(MachineState *machine)
                             0x01900000, 16 * MiB);
 
     /* QPIC NAND - see the MR80X_NAND_BASE comment block above */
+    MR80XNandState *nand_state = g_new0(MR80XNandState, 1);
+    nand_state->regs[NAND_VERSION_OFF / 4] = 0x20000000u;
     {
         MemoryRegion *nand = g_new0(MemoryRegion, 1);
-        memory_region_init_io(nand, NULL, &mr80x_nand_ops, NULL,
+        memory_region_init_io(nand, NULL, &mr80x_nand_ops, nand_state,
                                "mr80x.nand", MR80X_NAND_SIZE);
         memory_region_add_subregion(sysmem, MR80X_NAND_BASE, nand);
     }
     /* remainder of the 1MiB NAND-adjacent range not yet modeled */
     mr80x_add_unimp_region(sysmem, "mr80x.unimp-nand-rest-0x79C0000",
                             0x079C0000, 1 * MiB - MR80X_NAND_SIZE);
+
+    /* QPIC BAM - see the MR80X_BAM_BASE comment block above. Shares
+     * nand_state so cmd_element-driven register accesses land in the
+     * same backing store as direct MMIO to the NAND region. */
+    {
+        MR80XBamState *bam = g_new0(MR80XBamState, 1);
+        bam->nand = nand_state;
+        memory_region_init_io(&bam->iomem, NULL, &mr80x_bam_ops, bam,
+                               "mr80x.bam", MR80X_BAM_SIZE);
+        memory_region_add_subregion(sysmem, MR80X_BAM_BASE, &bam->iomem);
+    }
     mr80x_add_unimp_region(sysmem, "mr80x.unimp-gmac2-0x39D00000",
                             0x39D00000, 1 * MiB);
     {
