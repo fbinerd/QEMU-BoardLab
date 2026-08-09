@@ -6,12 +6,24 @@
 # server reachable from the host.
 #
 # Usage:
-#   ./run.sh [--recovery] [--no-net] [--http-port PORT] [--guest-ip IP] <path-to-appsbl.unpadded.elf-or-.bin>
+#   ./run.sh [--recovery] [--no-net] [--http-port PORT] [--guest-ip IP] [--nand-image PATH] <path-to-appsbl.unpadded.elf-or-.bin>
 #
 # Examples:
 #   ./run.sh /media/dados_2tb/appsbl/out/appsbl.unpadded.elf
 #   ./run.sh --recovery /media/dados_2tb/appsbl/out/appsbl.unpadded.elf
 #   ./run.sh --http-port 9090 /media/dados_2tb/appsbl/out/appsbl.unpadded.elf
+#   ./run.sh --nand-image /path/to/FULL_FIRMWARE.bin /media/dados_2tb/appsbl/out/appsbl.unpadded.elf
+#
+# --nand-image: back real QPIC NAND page reads with a raw full-flash
+# dump (BRINGUP-NOTES.md section 4b/17b) instead of returning 0xFF for
+# every page. Without this flag, NAND device *identification* still
+# works (real driver code path, genuine ID match) but there's no real
+# data behind it - readenv() and any real kernel/rootfs load will
+# always fail, same as before this flag existed. With it, real
+# partition data becomes readable (confirmed: rootfs's real UBI header
+# reads back correctly) - but note the *env* partition specifically is
+# genuinely blank in the one capture used for this project so far, see
+# section 17b - that "bad CRC" warning is not a bug this flag fixes.
 #
 # Console: this terminal IS the TTL/UART connection - type at the
 # prompt exactly like you would over a real serial adapter. Ctrl-A X
@@ -50,6 +62,7 @@ HTTP_PORT=8080
 GUEST_IP=192.168.1.1
 RECOVERY=0
 NO_NET=0
+NAND_IMAGE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -67,6 +80,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --guest-ip)
             GUEST_IP="$2"
+            shift 2
+            ;;
+        --nand-image)
+            NAND_IMAGE="$2"
             shift 2
             ;;
         *)
@@ -96,8 +113,17 @@ fi
 
 DOCKER_ENV=()
 if [[ "$RECOVERY" -eq 1 ]]; then
-    DOCKER_ENV=(-e MR80X_RECOVERY=1)
+    DOCKER_ENV+=(-e MR80X_RECOVERY=1)
     echo "Recovery mode: modeling the reset button held down, same as real hardware."
+fi
+
+DOCKER_VOLUMES=()
+if [[ -n "$NAND_IMAGE" ]]; then
+    NAND_DIR="$(cd "$(dirname "$NAND_IMAGE")" && pwd)"
+    NAND_FILE="$(basename "$NAND_IMAGE")"
+    DOCKER_VOLUMES+=(-v "${NAND_DIR}:/nand:ro")
+    DOCKER_ENV+=(-e "MR80X_NAND_IMAGE=/nand/${NAND_FILE}")
+    echo "NAND backed by real flash data: ${NAND_IMAGE}"
 fi
 
 echo "Console below IS the TTL/UART connection. Ctrl-A X to quit."
@@ -106,6 +132,7 @@ echo
 exec docker run --rm -it \
     --network host \
     -v "${KERNEL_DIR}:/fw:ro" \
+    "${DOCKER_VOLUMES[@]}" \
     "${DOCKER_ENV[@]}" \
     "$IMAGE" \
     /build/qemu-9.1.0/build/qemu-system-arm -M mr80x -nographic -monitor none \

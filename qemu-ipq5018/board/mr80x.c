@@ -1069,16 +1069,11 @@ static void mr80x_uart_write(void *opaque, hwaddr offset, uint64_t value,
             }
             s->tx_eol_pending = true;
             qemu_chr_fe_write_all(&s->chr, (const uint8_t *)"\r\n", 2);
-            g_usleep(87);
             return;
         }
         s->tx_eol_pending = false;
 
         qemu_chr_fe_write_all(&s->chr, &c, 1);
-        /* Pace output to roughly a real 115200-baud UART (~87us/byte,
-         * 8N1) so an interactive terminal renders the boot log at a
-         * readable, natural speed instead of all at once. */
-        g_usleep(87);
         return;
     }
     case UART_SR:
