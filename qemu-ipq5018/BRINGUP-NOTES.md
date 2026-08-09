@@ -1030,6 +1030,111 @@ environment (`bootcmd=bootipq`, `bootdelay=1`, `ipaddr=192.168.1.1`,
 `ethaddr=00:11:22:33:44:55`, etc.) - full command round-trip through
 the fixed RX path, confirmed working end-to-end, not just TX.
 
+## 21. MILESTONE: root-caused and fixed the real normal-boot crash *and* the second-boot-cycle malloc() hang - both were the same bug
+
+Section 17's "next, still open" and section 18's malloc() hang were two
+symptoms of one root cause, found by working entirely without gdb this
+time (the earlier gdb single-step trace through the trampoline, section
+17/summary carryover, turned out to be internally contradictory - raw
+`x/8xb` showed correct bytes but `x/2i` disassembly and register
+behavior during `stepi` showed a zeroed trampoline; that contradiction
+was itself the clue, resolved below) - instead using: QEMU's `-d int`
+exception trace (non-invasive, doesn't perturb timing), direct
+`fprintf(stderr, ...)` instrumentation added temporarily to
+`mr80x_pshold_write()`, and - most decisively - temporary `printf("DBG:
+...")` statements added directly to appsbl's own
+`board/qca/arm/common/cmd_bootqca.c` (`do_bootipq()`), rebuilt via
+`make build`, and reverted once the root cause was confirmed (`make
+build` re-verified byte-identical to `reference/OpenWrt.mtd8.0-appsbl.bin`
+afterward).
+
+**Symptom, precisely**: normal boot printed nothing at all between
+"Hit any key to stop autoboot" resolving and a second, silent
+"U-Boot 2016.01 ... DRAM: 256 MiB" banner - no crash dump, no `bad_mode()`
+panic text, no `GCNT_PSHOLD write` log line (confirmed via the
+`fprintf` above: the PSHOLD reset path, section 14/18's original
+suspect, was never touched). `-d int` showed only *one* `Secure Monitor
+Call` exception in the entire session (a genuinely unrelated, very
+early `smc` in `start.S`-era code, `pc≈0x4a920304`, before `board_init_r`)
+- meaning `do_bootipq()`'s own `qca_scm_call()` never even reached its
+`smc` instruction, let alone faulted. The appsbl-side DBG prints
+pinned it exactly: `"DBG: about to call qca_scm_call"` printed, then
+nothing - the reset happens *inside* `qca_scm_call()` → `is_scm_armv8()`,
+before its `smc #0`.
+
+**Root cause**: the MVBAR/SMC trampoline (section 14) lived at
+`appsbl_entry - 0x1000`. That address is *inside* DRAM, in the same
+1MiB MMU section as `CONFIG_SYS_TEXT_BASE` (so it's execute-permitted,
+which was the entire reason it was picked) - but `ipq5018.h`'s own
+memory-map comment (the ascii diagram above `CONFIG_SYS_INIT_SP_ADDR`)
+shows that exact region, immediately *below* `text_base`, is where
+u-boot's malloc heap (`CONFIG_SYS_MALLOC_LEN` = 756KiB), page table,
+`gd`/`bd` structs and all three exception stacks live -
+`reserve_uboot()`/`reserve_malloc()` in `common/board_f.c` confirm it
+for the `GD_FLG_SKIP_RELOC` path this build uses:
+`gd->start_addr_sp = CONFIG_SYS_TEXT_BASE;` then subtracted downward
+from there. By the time boot reaches `do_bootipq()`, enough real
+`malloc()` activity (env parsing, driver/DM init) has touched that
+memory that the trampoline's 8 bytes - written once, at reset time, via
+`cpu_physical_memory_write()` - get silently overwritten as ordinary
+heap churn. Confirmed via gdb (`break is_scm_armv8` + `x/8xb` on the
+trampoline address, using the *unstripped* `build/u-boot-2016/u-boot`
+ELF for symbols since `appsbl.unpadded.elf` has no section/symbol
+table): bytes were all-zero by the time execution reached that
+breakpoint, despite being correct immediately after reset. This also
+retroactively explains the confusing/contradictory gdb single-step
+trace from the section-17 investigation: `x/8xb`'s raw byte read really
+was seeing correct bytes (read *before* the heap had touched that
+address in that particular gdb run's timing), while continuing further
+before disassembling hit the same race the real, undebugged crash did.
+
+A first relocation attempt - `appsbl_entry + 0xD0000`, chosen naively
+as "comfortably above the loaded image" - was *also* wrong, and zeroed
+by the same `is_scm_armv8()` breakpoint check: u-boot's BSS section
+(`__bss_start=0x4A9AF298` to `__bss_end=0x4A9F84E0` in this build's
+`u-boot.map`, ~295KiB) extends well past the raw image size the
+estimate was based on, and BSS gets zeroed by the C runtime very early
+- long before `is_scm_armv8()` runs.
+
+**Fix**: moved the trampoline to `appsbl_entry + 0xD9000`
+(`0x4A9F9000`) - past *both* the image and its BSS (`__bss_end`), with
+~2.8KiB of margin, and confirmed via the same `u-boot.map` that
+`reserve_mmu()`'s `GD_FLG_SKIP_RELOC`-path TLB/page-table placement
+(`CONFIG_SYS_TEXT_BASE + mon_len`, rounded up to the next 64KiB) lands
+at `0x4AA00000` - a full 1MiB section above this one, since `mon_len`
+tracks `__bss_end` and rounding pushes it past this section's
+`0x4A9FFFFF` boundary - so it doesn't reach back down into this
+leftover space either. Still safely inside the one exec-permitted
+1MiB section. Verified via gdb: bytes intact (not zeroed) at the
+`is_scm_armv8()` breakpoint, unlike both earlier locations.
+
+**Result, confirmed via real (non-gdb) boot tests**:
+- Normal boot: `qca_scm_call()` now genuinely returns `ret=-95`
+  (`-EOPNOTSUPP`) instead of never returning: `do_bootipq()` correctly
+  takes the `do_boot_unsignedimg` path, attempts a real UBI read
+  (fails to find a `kernel` volume - the pre-existing, separate,
+  already-tracked "empty MTD device detected" gap, item 17 in the
+  status list below), and falls through cleanly to
+  `"Both image corrupted, Enter http firmware recovery mode!"` and a
+  working HTTP recovery server - exactly matching real hardware
+  behavior for a device with no valid kernel, not a crash.
+- `reset` at the console (tested via `MR80X_STOP_AUTOBOOT` +
+  FIFO-injected `reset\n`): now genuinely completes a full second boot
+  cycle end-to-end (re-prints the banner, re-probes NAND, reaches
+  autoboot, reaches the recovery HTTP server *again*) with **no
+  hang** - meaning section 18's malloc() hang is fixed too, not just
+  worked around. Root cause for *that* symptom, in hindsight: the
+  trampoline's raw instruction bytes, sitting inside the malloc arena,
+  were being misinterpreted as free-list chunk metadata by dlmalloc-style
+  allocation/coalescing logic on whichever cycle's heap usage reached
+  that address - explaining the "chunk-size-masking region" hang PC
+  from section 18 without needing any RAM-staleness explanation at all.
+
+Both of the user's two most recently reported symptoms - "ainda nao
+inicia o kernel" (kernel still doesn't boot) and "o reset ainda nao da
+reboot no uboot" (reset still doesn't reboot) - are the same bug and
+are now fixed.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
@@ -1074,13 +1179,11 @@ the fixed RX path, confirmed working end-to-end, not just TX.
     correctly at the right offset).
 13. [done] Interactive TTL console readable - UART line-ending
     normalization (section 17a).
-14. [done, but didn't fix the actual malloc() hang] Moved SMEM
-    re-population + MVBAR trampoline rewrite into `mr80x_reset()`
-    (section 18 update) - a real correctness improvement (every reset
-    now mimics a power-cycle, not just the first boot), verified no
-    regression, but the second-boot-cycle `malloc()` hang turned out
-    to have a different, still-unknown root cause (stale RAM
-    conclusively ruled out).
+14. [done] Moved SMEM re-population + MVBAR trampoline rewrite into
+    `mr80x_reset()` (section 18 update) - a real correctness
+    improvement (every reset now mimics a power-cycle, not just the
+    first boot), verified no regression. The `malloc()` hang itself
+    turned out to have a different root cause, fixed in section 21.
 15. [done] MILESTONE (section 20): genuine interactive u-boot console
     access - fixed the *real* RX-detection bug (`UART_MISR`/`RXSTALE`
     and `UART_RX_TOTAL_SNAP`, not `UART_SR`/`RXRDY` as originally
@@ -1091,37 +1194,29 @@ the fixed RX path, confirmed working end-to-end, not just TX.
     exposed via the SMEM fake (not just the 3 originally added
     piecemeal), and `run.sh` auto-detects `FULL_FIRMWARE.bin` so real
     NAND data is on by default. Verified via `smeminfo` at the console.
-17. **Next, still open**: normal (non-recovery) boot still doesn't
-    successfully load a real kernel/rootfs, *even with real NAND data
-    present* - typing `bootipq` manually at the console (reachable via
-    `--stop-autoboot`) reproduces a crash/reset right after the
-    `check_fw_gpio()` check, before any kernel-loading messages print.
-    Traced partway via `gdb-multiarch`: `qca_scm_call()` is reached
-    correctly (`r0=8, r1=7` - a `SCM_SVC_FUSE`-shaped call) and the
-    MVBAR trampoline (section 14) *is* entered correctly with a sane
-    LR (confirmed: `pc=0x4a91f008 lr=0x4a921936`, a valid in-range
-    return address) - so the original SMC-crash fix is still working.
-    But single-stepping ~60 instructions past that point lands at
-    `pc=0x4a92051e lr=0x00000002` - `lr=2` is not a valid code address,
-    meaning something *after* a successful trampoline return corrupts
-    LR before this specific call chain (reached via manually invoking
-    `bootipq`, a different calling context than the original
-    automatic-autoboot path this was first fixed against) returns.
-    Not root-caused further this session - worth a dedicated
-    `gdb-multiarch` session tracing instruction-by-instruction from
-    the trampoline's return point forward, watching for exactly where
-    LR gets clobbered, rather than the wide 60-step jump used here.
-    Also worth checking whether `smeminfo`/`ubi0` output ("empty MTD
-    device detected", "UBI init error 28" - printed even though
-    `rootfs`'s real UBI header reads back correctly at its base
-    offset) points at a related or separate gap in the NAND
-    page-read model once this crash itself is resolved.
-18. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
+17. [done] MILESTONE (section 21): root-caused and fixed the real
+    normal-boot crash - the MVBAR/SMC trampoline was placed inside
+    u-boot's own malloc heap and got overwritten by ordinary heap
+    churn before `do_bootipq()` ever used it. Relocated past both the
+    loaded image and its BSS. Normal boot now cleanly reaches the
+    recovery HTTP server every time, and `reset` at the console now
+    completes a full second boot cycle with no hang (this also fixed
+    section 18's `malloc()` hang - same root cause, not a separate
+    bug). `smeminfo`/`ubi0`'s "empty MTD device detected" is still
+    open, see #18 below.
+18. **Next, still open**: `smeminfo`/`ubi0` output shows "empty MTD
+    device detected"/"UBI init error 28" even though `rootfs`'s real
+    UBI header reads back correctly at its base offset - likely a gap
+    in the NAND page-read model (UBI scanning reads many blocks across
+    the partition, not just the first) rather than a missing-data
+    issue. Blocks real kernel/rootfs loading even with
+    `MR80X_NAND_IMAGE` present.
+19. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
     driven - real flashing after signature verification (section 16)
     still fails with "Attempt to write outside the flash area". Lower
     priority since it doesn't block the recovery/signing test flow
     (the HTTP response is "Upgrade Success" regardless).
-19. Once #17 and NAND write both work: test `out/appsbl-dual-key.bin`
+20. Once #18 and NAND write both work: test `out/appsbl-dual-key.bin`
     (accepts either the original vendor key or the swapped-in custom
     one) and a full-size real firmware image, not just a small test
     payload.

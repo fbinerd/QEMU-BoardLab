@@ -36,6 +36,7 @@
 #include "qemu/cutils.h"
 #include "sysemu/reset.h"
 #include "sysemu/runstate.h"
+#include "exec/tb-flush.h"
 #include "chardev/char-fe.h"
 #include "cpu.h"
 #include "qom/object.h"
@@ -1465,14 +1466,13 @@ static void mr80x_smem_fake_u32_entry(unsigned type, hwaddr data_off,
  * trampoline handles both call conventions used in this file.
  * ============================================================ */
 
-/* Lives 4KiB below the appsbl entry point, inside the SAME 1MiB
- * section as CONFIG_SYS_TEXT_BASE (0x4A920000) - NOT some arbitrary
- * "unused" RAM address. Three earlier attempts elsewhere in RAM
- * (0x00080000; top of the full 512MiB QEMU is given; top of the
- * 256MiB the "DRAM: 256 MiB" boot message reports) all still faulted
- * instruction fetch with IFSR 0xd (Permission fault), confirmed via
- * `-d int` exception tracing. Root cause, found in
- * arch/arm/lib/cache-cp15.c's dram_bank_mmu_setup()
+/* Must live inside the SAME 1MiB section as CONFIG_SYS_TEXT_BASE
+ * (0x4A920000) - NOT some arbitrary "unused" RAM address. Three
+ * earlier attempts elsewhere in RAM (0x00080000; top of the full
+ * 512MiB QEMU is given; top of the 256MiB the "DRAM: 256 MiB" boot
+ * message reports) all still faulted instruction fetch with IFSR 0xd
+ * (Permission fault), confirmed via `-d int` exception tracing. Root
+ * cause, found in arch/arm/lib/cache-cp15.c's dram_bank_mmu_setup()
  * (CONFIG_IPQ_NO_RELOC path, which ipq5018.h enables): u-boot's own
  * static page table first marks the *entire* 4GB address space
  * SHARED_DEVICE (execute-unfriendly), then for DRAM specifically
@@ -1480,9 +1480,43 @@ static void mr80x_smem_fake_u32_entry(unsigned type, hwaddr data_off,
  * with the exec-friendly UBOOT_CACHE_SETUP attribute - every other
  * MiB, including ones that are perfectly valid backing RAM in QEMU,
  * keeps the earlier device-like attribute and cannot be fetched from.
- * This address is guaranteed to fall in that one safe section
- * regardless of exactly how large u-boot believes DRAM to be. */
-#define MR80X_MVBAR_BASE (MR80X_APPSBL_ENTRY - 0x1000)
+ *
+ * Originally placed 4KiB *below* the entry point - inside that same
+ * safe 1MiB section, but WRONG anyway: ipq5018.h's own memory map
+ * comment (ascii diagram above CONFIG_SYS_INIT_SP_ADDR) shows the
+ * malloc heap, page table, gd/bd structs and all three exception
+ * stacks are carved out of the ~1MiB region immediately *below*
+ * text_base, growing toward it - i.e. exactly where the trampoline
+ * sat. Confirmed via gdb: bytes at that address were the correct
+ * trampoline content at reset time, but had already been zeroed out
+ * (real malloc()/heap activity, not a QEMU bug) by the time execution
+ * reached is_scm_armv8() - explaining the "trampoline bytes correct
+ * at start, garbage/all-zero by the time it's actually used" mystery
+ * from earlier sessions, and the resulting silent
+ * reset-back-to-U-Boot-banner every normal boot hit right after
+ * "Hit any key to stop autoboot".
+ *
+ * First retry - entry + 0xD0000, "comfortably above the image" - was
+ * ALSO wrong, and zeroed too, for a different reason: u-boot's own
+ * BSS section (__bss_start=0x4A9AF298 to __bss_end=0x4A9F84E0 in this
+ * build's u-boot.map, ~295KiB) extends *well* past the raw image size
+ * used for that estimate, and BSS gets zeroed by the C runtime very
+ * early - long before is_scm_armv8() runs. 0x4A9F0008 sat inside it.
+ *
+ * Fixed for real by moving past *both* the image and its BSS:
+ * entry + 0xD9000 (0x4A9F9000) sits just above __bss_end (0x4A9F84E0)
+ * with ~2.8KiB margin, and reserve_mmu()'s SKIP_RELOC-path TLB table
+ * (CONFIG_SYS_TEXT_BASE + mon_len, rounded up to the next 64KiB - see
+ * common/board_f.c) lands at 0x4AA00000, a full 1MiB section *above*
+ * this one (mon_len tracks __bss_end, and 0x4A9F84E0 rounds up past
+ * the 0x4A9FFFFF section boundary) - so it doesn't reach back down
+ * into this leftover space either. Still safely inside the same
+ * exec-permitted 1MiB section (text_base sits 0x20000 into it, section
+ * ends at 0x4A9FFFFF, leaving ~0x6FFF bytes of headroom past this
+ * address). Verified via gdb that these bytes are still intact (not
+ * zeroed) at the is_scm_armv8() breakpoint, unlike both earlier
+ * locations. */
+#define MR80X_MVBAR_BASE (MR80X_APPSBL_ENTRY + 0xD9000)
 #define MR80X_MVBAR_SIZE 0x20
 #define MR80X_MVBAR_SMC_OFF 0x08
 
@@ -1658,6 +1692,27 @@ static void mr80x_populate_ram(MachineState *machine)
         }
     }
 
+    /* Monitor-mode SMC trampoline - see the MR80X_MVBAR_BASE comment
+     * block above mr80x_reset(). MUST be re-written here on every
+     * populate/reset cycle: this function's own memset() above wipes
+     * it out along with the rest of RAM otherwise - confirmed via
+     * gdb that this exact code was silently missing after an earlier
+     * refactor moved trampoline-writing out of mr80x_init() and into
+     * this function without actually bringing the write itself along,
+     * leaving the trampoline's memory as all-zero ("andeq r0,r0,r0")
+     * instead of the intended 2 instructions - explaining a
+     * from-here-on class of "SMC calls never return" crashes that
+     * looked like exotic ARM/QEMU Monitor-mode semantics but were
+     * really just this. */
+    {
+        static const uint8_t trampoline[] = {
+            0x03, 0x00, 0xE0, 0xE3, /* mvn  r0, #3   (little-endian) */
+            0x0E, 0xF0, 0xB0, 0xE1, /* movs pc, lr                  */
+        };
+        cpu_physical_memory_write(MR80X_MVBAR_BASE + MR80X_MVBAR_SMC_OFF,
+                                   trampoline, sizeof(trampoline));
+    }
+
     /* NOTE: the ELF/image itself is NOT (re-)loaded here - QEMU's own
      * loader functions (called once from mr80x_init(), below) already
      * register the loaded data as a "ROM" blob that QEMU automatically
@@ -1679,6 +1734,17 @@ static void mr80x_reset(void *opaque)
     mr80x_populate_ram(rs->machine);
     cpu_set_pc(cs, MR80X_APPSBL_ENTRY);
     rs->cpu->env.cp15.mvbar = MR80X_MVBAR_BASE;
+
+    /* mr80x_populate_ram() pokes RAM (including the MVBAR trampoline)
+     * via cpu_physical_memory_write() from board code, not via a
+     * guest CPU store - on the *second and later* reset cycles, TCG
+     * may still hold translation blocks compiled from the *previous*
+     * cycle's content at these same physical addresses (translated
+     * the first time this code ran as guest instructions). Force a
+     * full flush so every fetch after this reset re-translates from
+     * the RAM content we just wrote, instead of possibly executing a
+     * stale cached translation of whatever used to be here. */
+    tb_flush(cs);
 }
 
 static void mr80x_init(MachineState *machine)
