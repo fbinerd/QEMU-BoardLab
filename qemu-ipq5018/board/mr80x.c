@@ -23,6 +23,7 @@
 #include "qemu/units.h"
 #include "qemu/log.h"
 #include "qemu/bswap.h"
+#include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "hw/sysbus.h"
 #include "hw/boards.h"
@@ -223,10 +224,26 @@ static void mr80x_add_unimp_region(MemoryRegion *sysmem, const char *name,
  * observed so far, so one blanket policy for the whole block is
  * enough; split this into per-register handling only if something
  * else in this address range turns out to need a real value read
- * back. */
+ * back.
+ *
+ * GPIO_IN_OUT_ADDR(14) == TLMM_BASE + 0x4 + 14*0x1000 == offset
+ * 0xE004 within this region - the one exception to the blanket
+ * all-ones policy: when the MR80X_RECOVERY environment variable is
+ * set (checked once in mr80x_init(), stored in *opaque as a bool),
+ * this single register instead reads back with bit0 clear, which
+ * check_fw_gpio() reads as "button held down" - i.e. deliberately,
+ * explicitly entering firmware recovery mode the same way holding
+ * the real reset button does, without forcing it on every boot by
+ * default (that was the original bug this region fixed). */
+#define MR80X_TLMM_GPIO14_OFF 0xE004
 
 static uint64_t mr80x_tlmm_read(void *opaque, hwaddr offset, unsigned size)
 {
+    bool *recovery = opaque;
+
+    if (offset == MR80X_TLMM_GPIO14_OFF && recovery && *recovery) {
+        return 0x00000000u;
+    }
     qemu_log_mask(LOG_UNIMP,
                   "mr80x: tlmm READ  off=0x%" HWADDR_PRIx " size=%u -> ~0\n",
                   offset, size);
@@ -1413,7 +1430,15 @@ static void mr80x_init(MachineState *machine)
                             0x39D00000, 1 * MiB);
     {
         MemoryRegion *tlmm = g_new0(MemoryRegion, 1);
-        memory_region_init_io(tlmm, NULL, &mr80x_tlmm_ops, NULL,
+        bool *recovery = g_new0(bool, 1);
+        const char *env = getenv("MR80X_RECOVERY");
+        *recovery = (env && env[0] && strcmp(env, "0") != 0);
+        if (*recovery) {
+            info_report("mr80x: MR80X_RECOVERY set - GPIO14 (reset button) "
+                         "will read as held down, same as real hardware's "
+                         "firmware recovery mode entry");
+        }
+        memory_region_init_io(tlmm, NULL, &mr80x_tlmm_ops, recovery,
                                "mr80x.tlmm", 1 * MiB);
         memory_region_add_subregion(sysmem, 0x01000000, tlmm);
     }
