@@ -1197,6 +1197,14 @@ Normal full-flash boot is now simply:
 ./run.sh --nand-image /path/to/FULL_FIRMWARE.bin
 ```
 
+For a self-contained local workspace, keep the dump at
+`qemu-ipq5018/images/FULL_FIRMWARE.bin`. The whole `images/` directory is
+gitignored because the dump is 108265472 bytes and contains device-derived
+flash data; `run.sh` prefers this repository-local copy, then falls back to
+the original `openwrt-build-tools/.../fw_extracted/FULL_FIRMWARE.bin` path.
+The local copy currently verified for this workspace has SHA-256
+`69748b4392d116d54ac5fc30c63db45dc3fa56ec6cb704a60016e94250c647ed`.
+
 This models the result of the pre-u-boot boot chain, not execution of PBL,
 SBL1 or QSEE themselves. Executing those proprietary stages would require a
 separate model for secure boot, TrustZone, DDR training, PMIC and other early

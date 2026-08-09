@@ -77,6 +77,7 @@
 set -euo pipefail
 
 IMAGE=mr80x-qemu:9.1.0
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HTTP_PORT=8080
 GUEST_IP=192.168.1.1
 RECOVERY=0
@@ -119,13 +120,17 @@ done
 
 # Auto-detect the real flash dump if --nand-image wasn't given, so
 # every real partition (smeminfo, section 4b/17b/20) just shows up
-# without needing to remember and type the path every time. Only
-# kicks in when the file actually exists - falls back to the old
-# "no real NAND data" behavior otherwise, same as before this existed.
+# without needing to remember and type the path every time. Prefer the
+# repository-local, gitignored images/ copy; retain the original firmware-lab
+# location as a compatibility fallback for existing workspaces.
 if [[ -z "$NAND_IMAGE" ]]; then
-    DEFAULT_NAND_IMAGE="/media/dados_2tb/opw/openwrt-build-tools/tools/firmware-lab/work/fw_extracted/FULL_FIRMWARE.bin"
-    if [[ -f "$DEFAULT_NAND_IMAGE" ]]; then
-        NAND_IMAGE="$DEFAULT_NAND_IMAGE"
+    LOCAL_NAND_IMAGE="${SCRIPT_DIR}/images/FULL_FIRMWARE.bin"
+    FALLBACK_NAND_IMAGE="/media/dados_2tb/opw/openwrt-build-tools/tools/firmware-lab/work/fw_extracted/FULL_FIRMWARE.bin"
+    if [[ -f "$LOCAL_NAND_IMAGE" ]]; then
+        NAND_IMAGE="$LOCAL_NAND_IMAGE"
+        echo "Auto-detected repository-local flash dump: ${NAND_IMAGE}"
+    elif [[ -f "$FALLBACK_NAND_IMAGE" ]]; then
+        NAND_IMAGE="$FALLBACK_NAND_IMAGE"
         echo "Auto-detected real flash dump: ${NAND_IMAGE} (pass --nand-image PATH to use a different one)"
     fi
 fi
