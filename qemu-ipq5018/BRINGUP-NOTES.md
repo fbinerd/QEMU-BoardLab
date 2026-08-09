@@ -682,6 +682,61 @@ unmodified `appsbl.unpadded.elf` - ARP resolves, TCP handshake
 completes, HTTP GET is answered correctly by uIP's httpd running
 inside the emulated CPU.
 
+## 16. MILESTONE: a tplink-cloud-sign.py-signed image passes real RSA verification
+
+The actual point of this entire emulator, confirmed end-to-end:
+
+1. Added a second fake SMEM partition table entry, `"rootfs"` (no
+   `"0:"` prefix, matching the real flash dump exactly - see section
+   4b's partition #11, offset `0x640000`/size `0x2A00000`) alongside
+   the existing `0:APPSBLENV` one. Without it,
+   `nm_upgradeFirmware()`'s (`lib/nvrammanager/nm_fwup.c`) call to
+   `smeminfo` finds no partition named `QCA_ROOT_FS_PART_NAME`
+   (`"rootfs"`), leaving `rootfs_flash_size=0`, and every upload -
+   *regardless of signature validity* - was rejected upfront with
+   "Bad file size: ... flash: 0" before signature checking was ever
+   reached.
+2. `./run.sh --recovery out/appsbl-custom.bin` (the clean-room build
+   with our own RSA-2048 key swapped in, from earlier work in the
+   `appsbl` project).
+3. Signed a small test payload:
+   `tplink-cloud-sign.py sign --alg 2048 --private-key
+   keys/private/firmware-rsa2048-private.pem --payload ... --out
+   signed-test.bin` (the key matching what's embedded in
+   `appsbl-custom.bin`).
+4. `curl -X POST http://localhost:8080/testurl -F
+   firmware=@signed-test.bin` (the recovery page's real upload form -
+   `enctype="multipart/form-data"`, field name `firmware`, action
+   `testurl`) against the running emulator.
+
+**Console output confirms the real, unmodified vendor code path ran
+end-to-end**: multipart boundary parsing found the file correctly,
+`smeminfo` found the `rootfs` partition and its real size, the
+size-vs-flash check passed, then:
+
+```
+RSA2048 PSS
+Firmware checking passed
+```
+
+- the exact `NM_INFO`/verification-success trace from
+`rsaVerifyPSSSignByBase64EncodePublicKeyBlob()`
+(`lib/nvrammanager/nm_fwup.c`). This is independent, dynamic
+confirmation (not just static source reading) that
+`tplink-cloud-sign.py`'s from-scratch clean-room RSA-2048/PSS signing
+implementation is byte-accurate against the real vendor verification
+code, and that the `build-custom` key-swap process produces a
+genuinely working bootloader.
+
+The subsequent NAND erase/write does fail ("Attempt to write outside
+the flash area", "Writing to NAND... FAILED!") - expected, since real
+NAND page read/write still isn't implemented (only ID detection,
+section 13) - but this happens *after* signature verification already
+passed, so it doesn't affect the validation result. The HTTP response
+was still "Upgrade Success" (`nm_upgradeFirmware()`'s return path
+apparently doesn't propagate this specific later NAND failure back
+into the immediate HTTP response).
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
@@ -713,16 +768,22 @@ inside the emulated CPU.
     `curl http://localhost:8080/` returns the genuine firmware-upgrade
     page. Needed: GMAC reset-poll fix (15a), `--network host` instead
     of docker `-p` (15c), correct guest IP (15d).
-11. Next: QPIC NAND *page* reads (real data, not just ID) backed by
+11. [done] MILESTONE (section 16): a `tplink-cloud-sign.py`-signed
+    image, uploaded through the real HTTP recovery form against
+    `out/appsbl-custom.bin`, passes real RSA-2048/PSS signature
+    verification ("Firmware checking passed") - the original point of
+    building this whole emulator.
+12. Next: QPIC NAND *page* reads (real data, not just ID) backed by
     `FULL_FIRMWARE.bin` (section 4b/5) via the same BAM data pipes
-    (index 0/1, not yet driven - see section 13) - needed for
+    (index 0/1, not yet driven - see section 13) - needed for (a)
     `readenv()` to find the real environment (fixing the 192.168.1.1
     vs 192.168.0.1 discrepancy at the source instead of via
-    `--guest-ip`), and for the *normal* (non-recovery) boot path to
-    find a real kernel/rootfs instead of cleanly resetting forever.
-12. Test `out/appsbl-custom.bin` and `out/appsbl-dual-key.bin` (not
-    just plain `appsbl.bin`), then a `tplink-cloud-sign.py`-signed
-    image through the actual HTTP recovery upload path - the original
-    point of building this. The recovery page's upload form posts to
-    `testurl` (`multipart/form-data`, field name `firmware`) - now
-    reachable and ready to test.
+    `--guest-ip`), (b) the *normal* (non-recovery) boot path to find a
+    real kernel/rootfs instead of cleanly resetting forever, and (c)
+    NAND erase/write to actually succeed after signature verification
+    (section 16) instead of failing with "Attempt to write outside the
+    flash area".
+13. Once NAND page read/write works: also test `out/appsbl-dual-key.bin`
+    (accepts either the original vendor key or the swapped-in custom
+    one) and a full-size real firmware image, not just a small test
+    payload.

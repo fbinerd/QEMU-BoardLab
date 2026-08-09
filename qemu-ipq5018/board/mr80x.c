@@ -1313,7 +1313,7 @@ static void mr80x_init(MachineState *machine)
         cpu_physical_memory_write(data + 4, &v, 4);
         v = cpu_to_le32(1); /* version */
         cpu_physical_memory_write(data + 8, &v, 4);
-        v = cpu_to_le32(1); /* len - one partition: 0:APPSBLENV */
+        v = cpu_to_le32(2); /* len - 0:APPSBLENV and rootfs */
         cpu_physical_memory_write(data + 12, &v, 4);
 
         /* struct smem_ptn { char name[16]; u32 start; u32 size; u32 attr; }
@@ -1331,6 +1331,25 @@ static void mr80x_init(MachineState *machine)
             v = cpu_to_le32(0x300000 / 0x20000); /* start, in blocks */
             cpu_physical_memory_write(part + 16, &v, 4);
             v = cpu_to_le32(0x80000 / 0x20000); /* size, in blocks */
+            cpu_physical_memory_write(part + 20, &v, 4);
+            v = cpu_to_le32(0);
+            cpu_physical_memory_write(part + 24, &v, 4); /* attr */
+        }
+
+        /* "rootfs" (no "0:" prefix, unlike APPSBLENV - matches the real
+         * flash dump exactly, see BRINGUP-NOTES.md section 4b partition
+         * #11) - needed for nm_upgradeFirmware()'s "does this upload fit"
+         * size check (lib/nvrammanager/nm_fwup.c) to find a nonzero
+         * rootfs_flash_size instead of always rejecting every upload
+         * with "Bad file size: ... flash: 0". Real offset/size
+         * (0x640000/0x2A00000) from the actual flash dump. */
+        {
+            static const char name[16] = "rootfs";
+            hwaddr part = data + 16 + 28;
+            cpu_physical_memory_write(part + 0, name, 16);
+            v = cpu_to_le32(0x640000 / 0x20000); /* start, in blocks */
+            cpu_physical_memory_write(part + 16, &v, 4);
+            v = cpu_to_le32(0x2A00000 / 0x20000); /* size, in blocks */
             cpu_physical_memory_write(part + 20, &v, 4);
             v = cpu_to_le32(0);
             cpu_physical_memory_write(part + 24, &v, 4); /* attr */
