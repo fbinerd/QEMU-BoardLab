@@ -381,6 +381,65 @@ static const MemoryRegionOps mr80x_pshold_ops = {
 };
 
 /* ============================================================
+ * QPIC NAND controller (drivers/mtd/nand/qpic_nand.c,
+ * arch-qca-common/qpic_nand.h) - base QPIC_EBI2ND_BASE = 0x079B0000.
+ * board_nand_init() gates its *entire* probe on one register:
+ *
+ *   hw_ver = readl(NAND_VERSION) >> 28;
+ *   if (hw_ver >= QCA_QPIC_V2_1_1)  // enum: V1_4_20=0, V1_5_20=1, V2_1_1=2
+ *       printf("QPIC controller support serial NAND\n");
+ *   else {
+ *       printf("... Qpic controller not support serial NAND\n");
+ *       return;  // bails BEFORE qpic_nand_reset()/qpic_nand_onfi_probe()
+ *   }
+ *
+ * NAND_VERSION is at NAND_REG(0x4F08) i.e. base+0x4F08. The generic
+ * catch-all stub's default-zero read means hw_ver was always 0,
+ * failing this check on every boot - which the recovery-mode boot
+ * path handles gracefully (no NAND needed to serve HTTP) but the
+ * *normal* boot path does not: it still tries to load a kernel from
+ * NAND further down, hitting an uninitialized device/function table -
+ * see BRINGUP-NOTES.md section 12's prefetch-abort-at-pc=0xc writeup.
+ * Reporting hw_ver=2 here lets the real probe logic run instead of
+ * bailing immediately - what that logic then needs next (ID read,
+ * ONFI probe, BAM-based page read for the real env/kernel data in
+ * FULL_FIRMWARE.bin) is deliberately being discovered empirically,
+ * the same way every other peripheral in this file was, rather than
+ * guessed up front.
+ * ============================================================ */
+
+#define MR80X_NAND_BASE 0x079B0000
+#define MR80X_NAND_SIZE 0x10000
+#define NAND_VERSION_OFF 0x4F08
+
+static uint64_t mr80x_nand_read(void *opaque, hwaddr offset, unsigned size)
+{
+    if (offset == NAND_VERSION_OFF) {
+        return 0x20000000u; /* hw_ver=2 (QCA_QPIC_V2_1_1) in bits 31:28 */
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "mr80x: nand READ  off=0x%" HWADDR_PRIx " size=%u -> 0\n",
+                  offset, size);
+    return 0;
+}
+
+static void mr80x_nand_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP,
+                  "mr80x: nand WRITE off=0x%" HWADDR_PRIx " size=%u val=0x%"
+                  PRIx64 "\n", offset, size, value);
+}
+
+static const MemoryRegionOps mr80x_nand_ops = {
+    .read = mr80x_nand_read,
+    .write = mr80x_nand_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 8 },
+};
+
+/* ============================================================
  * IPQ5018 MDIO controller (drivers/net/ipq5018/ipq5018_mdio.c/.h) -
  * base 0x88000 (this is what the boot log's "Invalid read/write at
  * addr 0x88040/0x88044/0x88050" was: MDIO_CTRL_0/1/4_REG unmapped).
@@ -1004,8 +1063,17 @@ static void mr80x_init(MachineState *machine)
      * board_eth_init() reach for). */
     mr80x_add_unimp_region(sysmem, "mr80x.unimp-0x01900000",
                             0x01900000, 16 * MiB);
-    mr80x_add_unimp_region(sysmem, "mr80x.unimp-nand-0x79B0000",
-                            0x079B0000, 1 * MiB);
+
+    /* QPIC NAND - see the MR80X_NAND_BASE comment block above */
+    {
+        MemoryRegion *nand = g_new0(MemoryRegion, 1);
+        memory_region_init_io(nand, NULL, &mr80x_nand_ops, NULL,
+                               "mr80x.nand", MR80X_NAND_SIZE);
+        memory_region_add_subregion(sysmem, MR80X_NAND_BASE, nand);
+    }
+    /* remainder of the 1MiB NAND-adjacent range not yet modeled */
+    mr80x_add_unimp_region(sysmem, "mr80x.unimp-nand-rest-0x79C0000",
+                            0x079C0000, 1 * MiB - MR80X_NAND_SIZE);
     mr80x_add_unimp_region(sysmem, "mr80x.unimp-gmac2-0x39D00000",
                             0x39D00000, 1 * MiB);
     {
