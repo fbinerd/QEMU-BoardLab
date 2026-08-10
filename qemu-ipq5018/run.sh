@@ -65,6 +65,35 @@
 # default still applies to that image. A different dump with a valid
 # environment may use another guest IP; pass --guest-ip accordingly.
 #
+# --aarch64-openwrt: an entirely separate, isolated test path (section
+# 28) - boots a real, modern OpenWrt kernel (Image) + its own device
+# tree directly, bypassing appsbl/u-boot completely, on a genuinely
+# AArch64-capable CPU (cortex-a53) instead of the default cortex-a7.
+# Real IPQ5018 hardware turned out to be AArch64-capable all along
+# (confirmed: OpenWrt's own "qualcommax" target - a mature, real-
+# hardware-tested target, not experimental - builds ARCH=aarch64/
+# CPU_TYPE=cortex-a53 uniformly for this whole SoC family), but appsbl
+# itself stays permanently AArch32 on real hardware too - there's no
+# armv8 Qualcomm/IPQ5018 board port anywhere in this project's vendor
+# u-boot source, only the generic upstream armv8 support for unrelated
+# vendors (hisilicon/fsl-layerscape/zynqmp). This flag exists to test,
+# in isolation, whether this board's peripheral models (GIC, UART) are
+# compatible with a real, fully-sourced modern kernel at all - before
+# investing in genuinely emulating appsbl's AArch32->AArch64 SMC-
+# mediated handoff (jump_kernel64() in appsbl's own scm.c), which is
+# real, separate work. Auto-detects images/openwrt-mr80x-v5-Image +
+# images/openwrt-mr80x-v5.dtb (an official OpenWrt build for this
+# exact device, with two manual DTB fixes applied - see BRINGUP-
+# NOTES.md section 28 for the exact recipe: the memory node's `reg`
+# size field ships as 0, since real u-boot normally patches in the
+# detected DRAM size at boot time and nothing does that here; and
+# `bootargs` needs `earlycon console=ttyMSM0,115200n8` added, since
+# CONFIG_CMDLINE="" for this build and only `bootargs-append` - a
+# u-boot-side convention this bypassed path never processes - ships by
+# default). Uses the *initramfs* variant specifically (kernel with an
+# embedded rootfs) so it can reach a real userspace shell without also
+# needing working NAND/UBI.
+#
 # Uses --network host instead of docker's own -p port mapping: with
 # -p, connections from the host arrive at QEMU's slirp networking
 # with their source address rewritten to docker's bridge gateway
@@ -84,6 +113,7 @@ RECOVERY=0
 NO_NET=0
 NAND_IMAGE=""
 STOP_AUTOBOOT=0
+AARCH64_OPENWRT=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -111,12 +141,39 @@ while [[ $# -gt 0 ]]; do
             STOP_AUTOBOOT=1
             shift
             ;;
+        --aarch64-openwrt)
+            AARCH64_OPENWRT=1
+            shift
+            ;;
         *)
             KERNEL="$1"
             shift
             ;;
     esac
 done
+
+if [[ "$AARCH64_OPENWRT" -eq 1 ]]; then
+    AARCH64_KERNEL="${SCRIPT_DIR}/images/openwrt-mr80x-v5-Image"
+    AARCH64_DTB="${SCRIPT_DIR}/images/openwrt-mr80x-v5.dtb"
+    if [[ ! -f "$AARCH64_KERNEL" || ! -f "$AARCH64_DTB" ]]; then
+        echo "error: --aarch64-openwrt needs both:" >&2
+        echo "  ${AARCH64_KERNEL}" >&2
+        echo "  ${AARCH64_DTB}" >&2
+        echo "see BRINGUP-NOTES.md section 28 for how to produce them." >&2
+        exit 1
+    fi
+    echo "AArch64 test path: booting a real OpenWrt kernel+DT directly," \
+         "bypassing appsbl entirely (section 28)."
+    exec docker run --rm -it \
+        --network host \
+        -v "${SCRIPT_DIR}/images:/ow:ro" \
+        -e "MR80X_AARCH64_KERNEL=/ow/$(basename "$AARCH64_KERNEL")" \
+        -e "MR80X_AARCH64_DTB=/ow/$(basename "$AARCH64_DTB")" \
+        "$IMAGE" \
+        /build/qemu-9.1.0/build/qemu-system-aarch64 -M mr80x \
+        -cpu cortex-a53,aarch64=on,has_el3=off \
+        -nographic -monitor none -serial stdio -nic none
+fi
 
 # Auto-detect the real flash dump if --nand-image wasn't given, so
 # every real partition (smeminfo, section 4b/17b/20) just shows up
@@ -190,7 +247,7 @@ exec docker run --rm -it \
     "${DOCKER_VOLUMES[@]}" \
     "${DOCKER_ENV[@]}" \
     "$IMAGE" \
-    /build/qemu-9.1.0/build/qemu-system-arm -M mr80x -nographic -monitor none \
+    /build/qemu-9.1.0/build/qemu-system-aarch64 -M mr80x -nographic -monitor none \
     -serial stdio \
     "${NET_ARGS[@]}" \
     "${QEMU_BOOT_ARGS[@]}"

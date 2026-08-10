@@ -1595,6 +1595,164 @@ driver specifically, or something about multi-descriptor completion
 ordering across the "tx"/"cmd" pipes this synchronous, single-kick-at-a-
 time model doesn't capture).
 
+## 28. MILESTONE: real hardware is AArch64 (Cortex-A53) - a modern, fully-sourced OpenWrt kernel boots this board almost to a shell
+
+Prompted by the section 27 dead end (no source for appsbl's exact 4.4.60
+kernel/BAM driver fork) - the user pointed out this workspace *also* has a
+complete, modern OpenWrt build already targeting this exact device
+(`bin/targets/qualcommax/ipq50xx/openwrt-qualcommax-ipq50xx-mercusys_mr80x-v5-*`),
+with full driver source available (`build_dir/target-aarch64_cortex-a53_musl/
+linux-qualcommax_ipq50xx/`). Using that instead sidesteps the "no source"
+wall entirely - and, as it turns out, uncovers something more fundamental.
+
+**Real IPQ5018 hardware is AArch64-capable (Cortex-A53), not AArch32-only
+(Cortex-A7) as this whole project had assumed.** Two independent pieces of
+evidence, found *before* writing any code: OpenWrt's `qualcommax` target
+(covering ipq50xx/ipq60xx/ipq807x, a mature target with many real,
+physically-tested devices, not experimental) builds `ARCH=aarch64
+CPU_TYPE=cortex-a53` uniformly; and appsbl's own
+`arch/arm/cpu/armv7/qca/common/scm.c` has a dedicated `jump_kernel64()`
+function that uses an SCM call (`SCM_ARCH64_SWITCH_ID`/`SCM_EL1SWITCH_CMD_ID`)
+specifically to switch out of AArch32 right before handing off to a 64-bit
+kernel. The `[410fc075]` MIDR this project's own board model has printed
+all along (`cortex-a7` in QEMU's `-cpu`) was never independently confirmed
+against real hardware - it was this project's own emulated CPU identifying
+itself, taken on faith early on. **appsbl itself is, and stays, permanently
+AArch32 on real hardware too** - confirmed by checking: there is no armv8
+Qualcomm/IPQ5018 board port anywhere in this project's vendor u-boot
+source, only generic upstream armv8 support for unrelated vendors
+(hisilicon/fsl-layerscape/zynqmp/tegra). Building "a 64-bit appsbl" was
+considered and ruled out for two reasons: it wouldn't be faithful to real
+hardware (which never does this either), and the SoC-specific low-level
+code this whole project has been reverse-engineering (clocks, DDR, NAND,
+GMAC) simply doesn't exist in armv8 form to build from.
+
+Given this, decided to validate the *feasibility* of running a real,
+modern kernel on this board's existing peripheral models *before*
+investing in genuinely emulating appsbl's AArch32->AArch64 SMC-mediated
+handoff (real, separate work, deferred) - by booting the OpenWrt kernel
++ device tree directly, bypassing appsbl/u-boot entirely, gated behind
+new `MR80X_AARCH64_KERNEL`/`MR80X_AARCH64_DTB` env vars / `run.sh
+--aarch64-openwrt` (`mr80x_init_aarch64_test()`, a fully separate code
+path from the existing appsbl boot flow - zero risk of regression,
+confirmed by re-testing the original 32-bit flow end to end unaffected).
+Uses the OpenWrt *initramfs* build specifically (kernel with an embedded
+rootfs) so it can reach a real userspace shell without needing working
+NAND/UBI at all - decoupling "do the peripheral models work" from
+section 27's still-open NAND DMA problem entirely.
+
+**Build system**: `qemu-system-arm` (the `arm-softmmu` target this whole
+project built until now) fundamentally cannot instantiate a `cortex-a53`
+CPU at all ("unable to find CPU model") - not a machine/board issue, a
+hard QEMU target-list limitation. Switched the Dockerfile to
+`aarch64-softmmu` instead (a superset - includes every 32-bit ARM CPU
+model too, built from the exact same `hw/arm/mr80x.c` via the same shared
+`arm_ss` source set every other QEMU ARM board file uses regardless of
+target), producing `qemu-system-aarch64` - `run.sh` updated accordingly.
+Re-verified the existing 32-bit appsbl boot flow completely unaffected by
+this switch.
+
+**Getting the AArch64 CPU to actually start correctly took one real,
+now-understood fix**: `-cpu cortex-a53,aarch64=on` alone reset the CPU
+into EL3 (the highest, secure-monitor exception level) - real hardware's
+own TrustZone/secure-monitor firmware (not something this project models)
+would normally take over from there; without it, the very first thing
+QEMU's own reset logic did was an "exception return" from EL3 down to EL0
+(user mode, the *lowest* privilege level - useless for kernel boot) at
+PC 0, which the AArch64 Linux boot protocol never expects (it requires
+entry at EL2 or EL1) - the CPU then spun forever taking Undefined
+Instruction exceptions at EL0. Fixed with `-cpu
+cortex-a53,aarch64=on,has_el3=off`, the same kind of CPU property other
+QEMU AArch64 boards (e.g. `virt`) set when not modeling secure/TrustZone
+state - resets directly into EL2 AArch64, matching what the kernel Image
+expects, confirmed via `-d int`: real kernel code executing immediately,
+including a clean early HVC (hypervisor call) exception/return cycle
+(the kernel's own EL2 "hyp stub" install, standard early boot).
+
+**Two more real, concrete fixes needed to get *console output*, both
+because this test path deliberately bypasses real u-boot's own DT
+fixups**:
+
+- The kernel hit `Kernel panic - not syncing: Failed to allocate page
+  table page` (in `create_kpti_ng_temp_pgd`/`paging_init`) - traced via
+  gdb + this exact kernel's own `vmlinux-initramfs.elf`/`System.map`
+  (available locally, unlike section 27's dead end) to PC landing exactly
+  at `machine_restart`'s trailing safety loop, confirming a real panic-
+  triggered auto-reboot had fired. Root cause: the DT's `memory@40000000`
+  node ships with `reg = <0x0 0x40000000 0x0 0x0>` - a **zero size**. Real
+  u-boot always patches this field with the actual detected DRAM size
+  right before booting (a standard, universal u-boot convention this
+  bypassed path never runs) - with genuinely zero declared RAM, the
+  kernel's memblock allocator had nothing to hand out. Fixed by hand-
+  editing the size field to `0x20000000` (512MiB, matching
+  `MR80X_RAM_SIZE`) via `dtc`.
+- Even with that fixed, boot proceeded silently until the *same* kind of
+  panic-reboot loop, discovered by attaching gdb again with the correct
+  `vmlinux-initramfs.elf` this time: PC sat inside `tty_register_device_attr`
+  and other perfectly ordinary-looking driver-registration code - i.e.
+  *not* actually hung, just producing zero visible output because no
+  console/earlycon had ever been configured. `CONFIG_CMDLINE=""` for this
+  build (confirmed in the target's `.config`) and the DT's `chosen` node
+  only has `bootargs-append` (a u-boot-side convention this bypassed path
+  also never processes, same root issue as the memory node) - not a bare
+  `bootargs`, so the effective kernel command line was empty. Fixed by
+  adding `bootargs = "earlycon console=ttyMSM0,115200n8 ...";` - `msm_serial`'s
+  earlycon variant registers itself keyed by the DT node's own
+  `compatible` string (`OF_EARLYCON_DECLARE(msm_serial_dm, "qcom,msm-uartdm", ...)`,
+  confirmed by reading the driver source directly) and is auto-selected via
+  `/chosen/stdout-path` once the bare `earlycon` token is present - no
+  address/compatible needed on the cmdline itself.
+
+**Result, verified via a real (non-gdb) boot with both fixes applied**:
+
+```
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x410fd034]
+[    0.000000] Linux version 6.12.94 ...
+[    0.000000] Machine model: Mercusys MR80X v5
+[    0.000000] earlycon: msm_serial_dm0 at MMIO 0x00000000078af000 (options '115200n8')
+...
+[    2.700000] Freeing unused kernel memory: 11776K
+[    2.700000] Run /init as init process
+[    4.340000] init: Console is alive
+...
+[   14.850000] procd: - init -
+```
+
+`0x410fd034` decodes as MIDR part number `0xD03` - genuine Cortex-A53,
+confirming section 28's opening finding directly from the CPU's own ID
+register, not an assumption. The kernel reaches `procd: - init -` -
+OpenWrt's own init system's *final* stage before launching userspace init
+scripts and (normally) a login shell - a real, modern, correctly-sourced
+Linux kernel booting deep into userspace on this board's existing
+peripheral models (GIC + UART, both built for the *old* 4.4.60 kernel
+originally) with **no changes to either model needed**. Remaining
+warnings along the way are non-fatal and already-understood gaps, not
+new blockers: `gpll0_main failed to enable!` (repeated
+`clk-alpha-pll.c` warnings - this model doesn't provide a PLL lock-
+detect status bit the *modern* mainline-style clk driver polls for,
+unlike the old 4.4.60 kernel's own special-cased "dummy clocks for
+emulation" registration path); `bam-dma-engine ... failed with error -22`
+for the *other* two BAM instances (unrelated to console/boot, same
+already-tracked gap as section 27); USB/ext4/jbd2 module load failures
+(expected - this model doesn't have USB, and the initramfs doesn't need
+ext4); assorted `deferred probe pending` lines (crypto engine, cpufreq,
+smp2p-wcss, GMAC - none block reaching `procd: - init -`).
+
+Test artifacts saved under `images/` (gitignored, like `FULL_FIRMWARE.bin`):
+`openwrt-mr80x-v5-Image` (raw, decompressed kernel - `dumpimage -T flat_dt
+-p 0` on the OpenWrt-built `...-initramfs-uImage.itb`, then `gunzip`) and
+`openwrt-mr80x-v5.dtb` (extracted via `dumpimage -T flat_dt -p 1`, then the
+two fixes above applied via `dtc -I dtb -O dts` / hand-edit / `dtc -I dts
+-O dtb`). `run.sh --aarch64-openwrt` auto-detects both.
+
+**Not yet done**: reaching an actual interactive shell prompt (very
+close - `procd: - init -` is the last log line seen in a ~4 minute real-
+time test window; hasn't been confirmed to actually complete, could
+still hit something after) and, separately, genuinely emulating appsbl's
+own AArch32->AArch64 handoff so the *real* (non-bypassed) boot chain
+works end to end - this section's test path is deliberately a shortcut
+around that, not a replacement for it.
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
@@ -1698,23 +1856,40 @@ time model doesn't capture).
     (missing `BAM_REVISION`/`BAM_NUM_PIPES`) and wired the BAM's own
     interrupt to the GIC. Kernel now gets past all driver probing to
     attempting root mount.
-23. **Next, still open**: `qcom-nandc`'s DMA descriptor submission to
-    the QPIC/NAND BAM's "cmd" pipe still fails
+23. `qcom-nandc`'s DMA descriptor submission to the QPIC/NAND BAM's
+    "cmd" pipe fails for the *old* 4.4.60 kernel
     (`UBI error: cannot open mtd rootfs`) even though the descriptor
     content, addressing, and IRQ delivery all check out correctly
     against the closest available reference driver source (section 27
-    has full detail). This device's *exact* kernel (4.4.60, a
-    downstream Qualcomm fork) isn't available anywhere in this
-    workspace to pin down the remaining gap precisely - the first
-    point in this whole project where continuing needs either that
-    source or further blind experimentation, rather than being
-    directly traceable the way everything up to here was.
-24. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
+    has full detail). This device's *exact* old kernel source isn't
+    available anywhere in this workspace to pin down the remaining gap
+    precisely. Superseded in practical importance by #24 below - a
+    modern, fully-sourced kernel is a better target going forward.
+24. [done] MILESTONE (section 28): confirmed real hardware is
+    AArch64-capable (Cortex-A53, not Cortex-A7 as this whole project
+    had assumed - never independently verified before). A real, modern,
+    fully-sourced OpenWrt kernel for this exact device (already built
+    elsewhere in this workspace) now boots on this board's existing
+    peripheral models - unmodified GIC/UART built for the old kernel -
+    all the way to `procd: - init -`, OpenWrt's own init system's final
+    stage before userspace, via a new isolated test path
+    (`run.sh --aarch64-openwrt`) that bypasses appsbl entirely.
+25. **Next, still open**: two things, in order of value - (a) confirm
+    the AArch64 OpenWrt test path actually reaches a working shell
+    (very close, not yet confirmed complete - section 28); (b)
+    genuinely emulate appsbl's own AArch32->AArch64 handoff
+    (`jump_kernel64()`/`SCM_ARCH64_SWITCH_ID`) so the *real*, non-
+    bypassed boot chain (appsbl loading/verifying the kernel from NAND,
+    same as the whole rest of this project) reaches this same modern
+    kernel instead of the old, source-unavailable 4.4.60 one - the
+    harder, more architecturally faithful piece deliberately deferred
+    until (a) confirmed doing this was worthwhile at all.
+26. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
     driven - real flashing after signature verification (section 16)
     still fails with "Attempt to write outside the flash area". Lower
     priority since it doesn't block the recovery/signing test flow
     (the HTTP response is "Upgrade Success" regardless).
-25. Once kernel handoff and NAND write both work: test `out/appsbl-dual-key.bin`
+27. Once kernel handoff and NAND write both work: test `out/appsbl-dual-key.bin`
     (accepts either the original vendor key or the swapped-in custom
     one) and a full-size real firmware image, not just a small test
     payload.

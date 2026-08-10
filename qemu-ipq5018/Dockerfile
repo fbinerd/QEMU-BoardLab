@@ -18,10 +18,18 @@ RUN cat /build/kconfig.fragment >> /build/qemu-9.1.0/hw/arm/Kconfig && \
         /build/qemu-9.1.0/hw/arm/meson.build
 
 WORKDIR /build/qemu-9.1.0
-RUN ./configure --target-list=arm-softmmu --disable-docs --disable-tools \
+# aarch64-softmmu instead of arm-softmmu: it's a superset (includes every
+# 32-bit ARM CPU model - cortex-a7 etc, this machine's existing default -
+# *plus* AArch64-capable ones like cortex-a53) built from the exact same
+# hw/arm/mr80x.c via the same shared `arm_ss` source set every other ARM
+# board file uses regardless of target. Needed once real hardware turned
+# out to be AArch64-capable (BRINGUP-NOTES.md section 28) - qemu-system-arm
+# genuinely cannot instantiate a cortex-a53 CPU at all, "unable to find CPU
+# model" is a hard target-list limitation, not a machine/board issue.
+RUN ./configure --target-list=aarch64-softmmu --disable-docs --disable-tools \
         --disable-guest-agent --without-default-features \
         --enable-tcg --enable-slirp \
-    && ninja -C build qemu-system-arm -j"$(nproc)"
+    && ninja -C build qemu-system-aarch64 -j"$(nproc)"
 
 RUN DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gdb-multiarch \

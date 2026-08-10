@@ -2395,6 +2395,88 @@ static void mr80x_load_appsbl_from_nand(const char *path)
                 MR80X_APPSBL_FLASH_OFFSET + MR80X_APPSBL_FLASH_SIZE - 1, sz);
 }
 
+/* ============================================================
+ * Deliberately separate, isolated boot path: loads a raw AArch64
+ * Linux kernel `Image` and its own devicetree blob directly, bypassing
+ * appsbl entirely - the real IPQ5018 is a genuine AArch64-capable
+ * Cortex-A53 (confirmed: OpenWrt's mature, real-hardware-tested
+ * "qualcommax" target builds ARCH=aarch64/CPU_TYPE=cortex-a53
+ * uniformly for this whole SoC family, and appsbl's own
+ * arch/arm/cpu/armv7/qca/common/scm.c has a dedicated
+ * `jump_kernel64()` using an SCM call to switch out of AArch32 right
+ * before handing off to a 64-bit kernel - see BRINGUP-NOTES.md section
+ * 28), but appsbl itself is, and stays, permanently AArch32 the whole
+ * way through (no armv8 Qualcomm/IPQ5018 board port exists anywhere in
+ * this project's vendor u-boot source - only generic upstream armv8
+ * support for unrelated vendors). Actually emulating that AArch32->
+ * AArch64 SMC-mediated handoff is real, separate work (tracked next);
+ * this path exists to test - *before* investing in that - whether this
+ * board's existing peripheral models (GIC, UART) are even compatible
+ * with a real, modern, fully-sourced OpenWrt kernel for this exact
+ * device at all, decoupled from whether the handoff mechanism works.
+ * Enabled via MR80X_AARCH64_KERNEL (+ MR80X_AARCH64_DTB) - see
+ * run.sh. Uses the OpenWrt-built *initramfs* image specifically
+ * (kernel with an embedded rootfs) so it can reach a real userspace
+ * shell without also needing working NAND/UBI. */
+#define MR80X_AARCH64_KERNEL_BASE 0x41000000
+#define MR80X_AARCH64_DTB_BASE    0x44000000
+
+typedef struct MR80XAArch64ResetState {
+    ARMCPU *cpu;
+} MR80XAArch64ResetState;
+
+static void mr80x_aarch64_reset(void *opaque)
+{
+    MR80XAArch64ResetState *rs = opaque;
+    CPUState *cs = CPU(rs->cpu);
+
+    cpu_reset(cs);
+    cpu_set_pc(cs, MR80X_AARCH64_KERNEL_BASE);
+    /* AArch64 Linux boot protocol: x0 = DTB physical address,
+     * x1-x3 = 0 (already true after cpu_reset()). */
+    rs->cpu->env.xregs[0] = MR80X_AARCH64_DTB_BASE;
+    /* This test path's kernel makes real PSCI calls (CPU_ON for the
+     * second core, VERSION/FEATURES probes) same as section 25/26 -
+     * route them to QEMU's native PSCI handling from the very start,
+     * since there's no appsbl SCM traffic in this isolated path to
+     * conflict with (contrast mr80x_reset()'s watch-timer-gated
+     * version, needed there specifically to not break appsbl). */
+    rs->cpu->psci_conduit = QEMU_PSCI_CONDUIT_SMC;
+}
+
+static void mr80x_init_aarch64_test(MachineState *machine, ARMCPU *cpu,
+                                     const char *kernel_path,
+                                     const char *dtb_path)
+{
+    ssize_t sz;
+    MR80XAArch64ResetState *rs;
+
+    sz = load_image_targphys(kernel_path, MR80X_AARCH64_KERNEL_BASE,
+                              MR80X_RAM_SIZE -
+                              (MR80X_AARCH64_KERNEL_BASE - MR80X_RAM_BASE));
+    if (sz < 0) {
+        error_report("mr80x: could not load AArch64 kernel Image '%s'",
+                      kernel_path);
+        exit(1);
+    }
+    info_report("mr80x: loaded AArch64 kernel Image '%s' (%zd bytes) at "
+                "0x%x", kernel_path, sz, MR80X_AARCH64_KERNEL_BASE);
+
+    sz = load_image_targphys(dtb_path, MR80X_AARCH64_DTB_BASE,
+                              MR80X_RAM_SIZE -
+                              (MR80X_AARCH64_DTB_BASE - MR80X_RAM_BASE));
+    if (sz < 0) {
+        error_report("mr80x: could not load AArch64 DTB '%s'", dtb_path);
+        exit(1);
+    }
+    info_report("mr80x: loaded AArch64 DTB '%s' (%zd bytes) at 0x%x",
+                dtb_path, sz, MR80X_AARCH64_DTB_BASE);
+
+    rs = g_new0(MR80XAArch64ResetState, 1);
+    rs->cpu = cpu;
+    qemu_register_reset(mr80x_aarch64_reset, rs);
+}
+
 static void mr80x_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -2470,6 +2552,20 @@ static void mr80x_init(MachineState *machine)
 
     memory_region_add_subregion(sysmem, MR80X_RAM_BASE, machine->ram);
 
+    const char *aarch64_kernel = getenv("MR80X_AARCH64_KERNEL");
+
+    if (aarch64_kernel) {
+        const char *aarch64_dtb = getenv("MR80X_AARCH64_DTB");
+
+        if (!aarch64_dtb) {
+            error_report("mr80x: MR80X_AARCH64_KERNEL needs "
+                         "MR80X_AARCH64_DTB too");
+            exit(1);
+        }
+        mr80x_init_aarch64_test(machine, cpu, aarch64_kernel, aarch64_dtb);
+        goto peripherals;
+    }
+
     if (!machine->kernel_filename && !getenv("MR80X_NAND_IMAGE")) {
         error_report("mr80x: provide -kernel for a development APPSBL override "
                      "or MR80X_NAND_IMAGE to boot APPSBL from the full flash");
@@ -2522,6 +2618,8 @@ static void mr80x_init(MachineState *machine)
     } else {
         mr80x_load_appsbl_from_nand(getenv("MR80X_NAND_IMAGE"));
     }
+
+peripherals:
 
     /* GCC clock controller stub */
     MR80XGccState *gcc = g_new0(MR80XGccState, 1);
