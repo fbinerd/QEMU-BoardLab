@@ -346,6 +346,75 @@ static const MemoryRegionOps mr80x_tlmm_ops = {
  *   running, not 1 = stopped).
  * ============================================================ */
 
+/* ============================================================
+ * CMN PLL (Common PLL, feeds ethernet/serdes reference clocks) -
+ * drivers/clk/qcom/ipq-cmn-pll.c, a separate MMIO block from GCC
+ * ("qcom,ipq5018-cmn-pll", base 0x9b000, size 0x800) the old 4.4.60
+ * kernel never touched at all, so this board never modeled it. Plain
+ * read-write register storage (like the GCC stub) with sane non-zero
+ * reset defaults for the two fields clk_cmn_pll_recalc_rate() divides
+ * by: CMN_PLL_DIVIDER_CTRL's FACTOR field (offset 0x794, bits[9:0])
+ * and CMN_PLL_REFCLK_CONFIG's REFCLK_DIV field (offset 0x784,
+ * bits[8:4]) - both read as 0 with no reset default at all, hitting
+ * this function's own WARN_ON(factor == 0)/WARN_ON(ref_div == 0)
+ * every time it's called (twice per boot: once during
+ * devm_clk_hw_register(), again later via clk_set_rate() ->
+ * of_clk_set_defaults() - "WARNING: ... at drivers/clk/qcom/
+ * ipq-cmn-pll.c:211"/":216", seen with a real modern-kernel boot -
+ * BRINGUP-NOTES.md section 30). Defaults chosen to match what the
+ * driver's own init sequence (ipq_cmn_pll_clk_probe()) would
+ * otherwise program via regmap_update_bits() shortly after anyway
+ * (FIELD_PREP(CMN_PLL_REFCLK_DIV, 2), and factor=1 matches this same
+ * function's own "factor == 0 -> use 1" WARN_ON fallback), so a real
+ * write from the driver just overwrites them with the same effective
+ * values. CMN_PLL_LOCKED's CMN_PLL_CLKS_LOCKED status bit (offset
+ * 0x64, bit 8) is reported permanently set, matching this file's
+ * usual "no real PLL to lock, report instant success" convention for
+ * every other PLL-like device.
+ * ============================================================ */
+#define MR80X_CMN_PLL_BASE   0x0009B000
+#define MR80X_CMN_PLL_SIZE   0x800
+#define CMN_PLL_LOCKED_OFF          0x64
+#define CMN_PLL_CLKS_LOCKED_BIT     (1u << 8)
+#define CMN_PLL_REFCLK_CONFIG_OFF   0x784
+#define CMN_PLL_DIVIDER_CTRL_OFF    0x794
+
+typedef struct MR80XCmnPllState {
+    MemoryRegion iomem;
+    uint32_t regs[MR80X_CMN_PLL_SIZE / 4];
+} MR80XCmnPllState;
+
+static void mr80x_cmn_pll_reset(void *opaque)
+{
+    MR80XCmnPllState *s = opaque;
+
+    memset(s->regs, 0, sizeof(s->regs));
+    s->regs[CMN_PLL_LOCKED_OFF / 4] = CMN_PLL_CLKS_LOCKED_BIT;
+    s->regs[CMN_PLL_REFCLK_CONFIG_OFF / 4] = 2u << 4;   /* REFCLK_DIV=2 */
+    s->regs[CMN_PLL_DIVIDER_CTRL_OFF / 4] = 1;          /* FACTOR=1 */
+}
+
+static uint64_t mr80x_cmn_pll_read(void *opaque, hwaddr offset,
+                                    unsigned size)
+{
+    MR80XCmnPllState *s = opaque;
+    return s->regs[offset / 4];
+}
+
+static void mr80x_cmn_pll_write(void *opaque, hwaddr offset, uint64_t value,
+                                 unsigned size)
+{
+    MR80XCmnPllState *s = opaque;
+    s->regs[offset / 4] = (uint32_t)value;
+}
+
+static const MemoryRegionOps mr80x_cmn_pll_ops = {
+    .read = mr80x_cmn_pll_read,
+    .write = mr80x_cmn_pll_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 typedef struct MR80XGccState {
     MemoryRegion iomem;
     uint32_t regs[MR80X_GCC_SIZE / 4];
@@ -2975,6 +3044,16 @@ peripherals:
     memory_region_init_io(&gcc->iomem, NULL, &mr80x_gcc_ops, gcc,
                            "mr80x.gcc", MR80X_GCC_SIZE);
     memory_region_add_subregion(sysmem, MR80X_GCC_BASE, &gcc->iomem);
+
+    /* CMN PLL - see the comment block above mr80x_cmn_pll_reset(). */
+    {
+        MR80XCmnPllState *cmn_pll = g_new0(MR80XCmnPllState, 1);
+        qemu_register_reset(mr80x_cmn_pll_reset, cmn_pll);
+        memory_region_init_io(&cmn_pll->iomem, NULL, &mr80x_cmn_pll_ops,
+                               cmn_pll, "mr80x.cmn-pll", MR80X_CMN_PLL_SIZE);
+        memory_region_add_subregion(sysmem, MR80X_CMN_PLL_BASE,
+                                     &cmn_pll->iomem);
+    }
 
     /* Generic timer counter-view registers - see the
      * MR80X_TIME_SCALE_DEFAULT comment above for why this runs slower
