@@ -722,6 +722,19 @@ typedef struct MR80XBamState {
     MR80XNandState *nand;
     MR80XBamPipe pipe[MR80X_BAM_NUM_PIPES];
     uint32_t generic_regs[MR80X_BAM_SIZE / 4];
+    /* Only meaningful to the *kernel*'s interrupt-driven bam-dma-engine
+     * driver (drivers/dma/qcom/bam_dma.c) - appsbl's own hand-rolled
+     * QPIC/BAM driver polls BAM_P_IRQ_STTS directly and never enables
+     * or waits on this at all, so it stayed unwired for this whole
+     * project until the kernel's driver actually needed it (this
+     * emulator had no interrupt controller at all before section 26).
+     * Pulsed (not level-held) whenever any pipe's irq_stts becomes set
+     * from descriptor processing below - the kernel's ISR reads/clears
+     * the real status registers itself once woken, so a real level
+     * hold isn't needed for this driver's completion-notification use;
+     * this DT's SPI 0x92 has irq flags=0 (not the UART's 4=level-high),
+     * consistent with an edge-style notification. */
+    qemu_irq irq;
 } MR80XBamState;
 
 /* BAM_REVISION/BAM_NUM_PIPES (register layout for "qcom,bam-v1.7.0",
@@ -904,6 +917,10 @@ static void mr80x_bam_drain_raw_pipe(MR80XBamState *s, uint32_t pipe)
     if (delta) {
         p->last_evnt_off = p->notified_evnt_off;
         p->irq_stts |= BAM_P_PRCSD_DESC_MASK;
+        if (s->irq) {
+            qemu_set_irq(s->irq, 1);
+            qemu_set_irq(s->irq, 0);
+        }
     }
 }
 
@@ -997,6 +1014,10 @@ static void mr80x_bam_write(void *opaque, hwaddr offset, uint64_t value,
                 }
                 s->pipe[n].last_evnt_off = new_off;
                 s->pipe[n].irq_stts |= BAM_P_PRCSD_DESC_MASK;
+                if (s->irq) {
+                    qemu_set_irq(s->irq, 1);
+                    qemu_set_irq(s->irq, 0);
+                }
 
                 mr80x_bam_drain_raw_pipe(s,
                                          MR80X_BAM_DATA_PRODUCER_PIPE);
@@ -1040,6 +1061,7 @@ static const MemoryRegionOps mr80x_bam_ops = {
 #define MR80X_GIC_CPU_BASE  0x0B002000
 #define MR80X_GIC_NUM_IRQ   256
 #define MR80X_UART_IRQ      0x6b /* SPI number, per the DT's serial@78af000 */
+#define MR80X_BAM_IRQ       0x92 /* SPI number, per the DT's dma@7984000 (QPIC NAND's BAM instance) */
 
 #define MR80X_MDIO_BASE   0x88000
 #define MR80X_MDIO_SIZE   0x1000
@@ -2625,6 +2647,7 @@ static void mr80x_init(MachineState *machine)
     {
         MR80XBamState *bam = g_new0(MR80XBamState, 1);
         bam->nand = nand_state;
+        bam->irq = qdev_get_gpio_in(gic, MR80X_BAM_IRQ);
         qemu_register_reset(mr80x_bam_reset, bam);
         memory_region_init_io(&bam->iomem, NULL, &mr80x_bam_ops, bam,
                                "mr80x.bam", MR80X_BAM_SIZE);
