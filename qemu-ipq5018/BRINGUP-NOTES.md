@@ -2343,9 +2343,21 @@ not just reaching `procd: - init -` and dying moments later.
     a command string with zero crashes/hangs. A separate, still-open
     question (no shell prompt observed even now) was traced one level
     further to `/sbin/askfirst` (procd) blocking in `getchar()` behind
-    a probably-unflushed stdio buffer - understood but not yet fixed,
-    see section 32's tail for the detail and why it sits at the edge
-    of this project's hardware-emulation scope.
+    a probably-unflushed stdio buffer - understood but not fixed.
+31. [done] MILESTONE (section 33): built and verified real-production-
+    rootfs UBI-image tooling (`--openwrt-squashfs-factory`), found and
+    fixed two real bugs in it along the way (shrinking a UBI volume
+    left stale valid-looking LEBs of its old, larger size behind;
+    dynamic-volume VID headers need `used_ebs=0`, not the volume's
+    real LEB count - both confirmed against the real vendored U-Boot
+    UBI source, not guessed). A real, modern kernel+real squashfs
+    rootfs UBI-attaches cleanly for the first time - but still can't
+    mount, conclusively proven to be *entirely* downstream of the
+    already-known, already-deferred `qcom_snand` runtime-NAND-driver
+    gap (section 31), not a new bug and not fixable by any amount of
+    correct UBI-image construction. Confirms the initramfs recovery
+    image (section 32's still-open console mystery) remains the only
+    currently-viable path to a running userspace at all.
 
 ## 31. Two more real probe fixes, and triaging what's left after `procd: - init -`
 
@@ -2529,3 +2541,124 @@ runtime behavior rather than hardware register modeling, right at the
 edge of (arguably past) this project's "emulate the hardware" scope -
 left here as a clearly root-caused, well-understood next step rather
 than re-asserting the earlier wrong "it's just rootfs config" call.
+
+## 33. Testing with a real, complete production rootfs (not just the initramfs recovery image) - two more real UBI-image bugs found and fixed, and a conclusive answer on why it still can't reach userspace
+
+The user asked, reasonably, why the missing-console-prompt investigation
+should be tied to one specific test image at all - "isso tem que
+funcionar pra qualquer imagem que vc usar seja completa ou recovery, o
+importante é emular o hardware da board" (this has to work for any
+image, complete or recovery - what matters is emulating the board's
+hardware). Since section 32 ended in an unresolved procd/musl mystery
+on the *initramfs* image specifically, the natural next step was to
+try `tools/build_full_firmware_openwrt.py` against OpenWrt's own real,
+complete `squashfs-factory.ubi` build (real procd, real opkg-installed
+packages, a real `/etc/inittab` - not the stripped-down initramfs
+recovery/test image) instead, to see whether the very same mystery
+reproduces there too, or whether it's specific to the initramfs image
+after all.
+
+**New `--openwrt-squashfs-factory` mode**: extracts this device's own
+real `kernel` (UBI vol 0, a FIT) and `rootfs` (UBI vol 1, squashfs)
+volumes straight out of OpenWrt's `*-squashfs-factory.ubi` build
+output, repacks the kernel FIT with this project's required config
+name the same way `--openwrt-fit` already did, and writes *both*
+volumes into the output image (vs. the original code path, which only
+ever touched the kernel volume). Needed generalizing
+`patch_kernel_volume()` into a vol-agnostic `patch_volume()` (now
+takes an explicit `vol_type`) and a new `extract_ubi_volume()` helper
+(reassembles a volume from its own LEBs using the *full* LEB_SIZE per
+LEB, not each VID header's own `data_size` field - real *dynamic*
+volumes, confirmed on this device's own "kernel" volume inside
+`squashfs-factory.ubi` and its "ubi_rootfs" volume in a real captured
+`FULL_FIRMWARE.bin`, carry `data_size=0` unconditionally, so there is
+no UBI-level way to know how many trailing bytes of the last LEB are
+"real" without trusting the payload's own self-describing length - a
+FIT header's, or here, squashfs's own superblock `bytes_used`).
+
+**Two real bugs found in `patch_volume()`/`build_vid_hdr()` while
+bringing this up** (both confirmed the hard way against the *real*
+mainline U-Boot UBI source already vendored in this workspace's
+`appsbl/vendor/u-boot-2016/drivers/mtd/ubi/`, not guessed - every
+offline structural re-check this script's own `find_volume_lebs()`
+could do passed cleanly *both* times, and the image still failed a
+real boot with "UBI init error 22" *both* times, meaning the bug was
+in something neither this tool nor its own sanity checks were looking
+at at all):
+
+1. **Shrinking a volume left stale, still-valid LEBs of its own
+   *old*, larger size behind.** The real `FULL_FIRMWARE.bin`'s
+   "ubi_rootfs" volume had 157 real PEBs; the new squashfs data only
+   needed 89. `patch_volume()` only overwrote the first 89 of the
+   existing 157 PEBs, leaving PEBs 89-156 completely untouched - still
+   carrying perfectly valid VID headers claiming to be LEBs 89-156 of
+   volume 1. The real UBI attach scanner
+   (`drivers/mtd/ubi/attach.c`) found all 157 anyway, and
+   `check_av()` (`drivers/mtd/ubi/vtbl.c`) rejects the whole image
+   outright when a volume's scanned `leb_count`/`highest_lnum`
+   disagrees with the volume table's freshly-shrunk `reserved_pebs`.
+   First fix attempt (blanking just the VID header's 4-byte magic)
+   *still* failed identically - `ubi_io_read_vid_hdr()`
+   (`drivers/mtd/ubi/io.c`) only treats a bad-magic PEB as genuinely
+   *empty* if `ubi_check_pattern()` finds the *entire* 64-byte header
+   all-`0xFF`; anything else with a bad magic (i.e. a header with a
+   corrupted magic but otherwise-stale old content, exactly what a
+   4-byte-only blank produces) is instead treated as *corrupted*,
+   silently added to the attach info's corrupted-PEB list. Real fix:
+   blank the *whole* 64-byte VID header region to `0xFF`, not just its
+   magic.
+2. **Dynamic-volume LEBs need `used_ebs=0`, not the volume's real LEB
+   count.** `build_vid_hdr()` already special-cased `data_size`/
+   `data_crc` to 0 for dynamic volumes (matching real dynamic-volume
+   LEBs observed on-flash), but kept writing `used_ebs` unconditionally
+   as the volume's real LEB count either way - a field name that
+   reads like it should just be "how many LEBs this volume uses",
+   reasonable to assume matters for *any* volume type. It doesn't:
+   `validate_vid_hdr()` (`drivers/mtd/ubi/io.c`) explicitly rejects a
+   dynamic-volume LEB with a non-zero `used_ebs` ("bad used_ebs"). This
+   was the fix that actually got a real attach to succeed - confirmed
+   by isolating the two volumes and testing each alone: patching only
+   the kernel (static) volume always worked (matches this tool's
+   entire prior history, never having touched a dynamic volume
+   before); patching only the rootfs (dynamic) volume alone
+   reproduced "UBI init error 22" by itself, and *only* went away
+   after this fix.
+
+**Both fixes verified via isolated single-volume test boots** (kernel-
+only patch: real attach succeeds, boots to "Waiting for root device"
+as expected since the untouched original rootfs volume doesn't match
+this newer kernel; rootfs-only patch against the *original* kernel:
+real attach succeeds, that older kernel panics trying to mount the
+brand new squashfs data as its OWN, incompatible rootfs layout -
+expected, not a bug) **and then together** (both volumes patched at
+once, matching real production use): UBI attach succeeds cleanly, no
+"UBI init error 22" - the real, modern kernel boots as far as its own
+in-kernel NAND driver.
+
+**Conclusive, valuable negative result**: it still can't reach a
+mounted rootfs, but *why* is now fully understood and is not a new
+bug - `UBI error: cannot open mtd rootfs, error -2` /
+`Waiting for root device /dev/ubiblock0_1...` are direct, expected
+consequences of `qcom_snand`'s probe failure (`-110`), already found
+and deliberately deferred in section 31 as needing new BAM/DMA-engine
+protocol work comparable in size to the original NAND modeling effort.
+u-boot/appsbl's own NAND reads (this project's actual, long-since-
+working QPIC/BAM emulation) are a *completely separate* code path from
+the *kernel's* own runtime NAND/UBI access once it's running - fixing
+the UBI *image contents* (this section's two bugs) was necessary but
+was never going to be sufficient on its own, since the modern kernel
+can't read NAND *at all* yet once it's the one doing the reading. This
+rules out "maybe the UBI image itself is wrong" as an explanation for
+good, and pins the *entire* remaining gap on the one already-known,
+already-deferred qcom_snand task - concretely, that task is now a
+prerequisite for *any* real, non-initramfs rootfs to ever boot under
+this emulator, not just a nice-to-have.
+
+**Where this leaves the two open threads**: the initramfs recovery
+image (section 32's still-unsolved askfirst/musl-stdio mystery)
+remains the *only* currently-viable path to a running userspace at
+all, since it needs no runtime NAND access - the full-production-
+rootfs path validated in this section is real, working UBI-image
+tooling now committed for whenever `qcom_snand` gets tackled, but
+can't itself be used to cross-check the console-prompt mystery until
+then.

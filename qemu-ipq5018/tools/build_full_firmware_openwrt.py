@@ -58,6 +58,8 @@ import zlib
 UBI_EC_HDR_MAGIC = 0x55424923
 UBI_VID_HDR_MAGIC = 0x55424921
 UBI_LAYOUT_VOLUME_ID = 0x7FFFFFFF - 4096
+UBI_VID_DYNAMIC = 1
+UBI_VID_STATIC = 2
 
 PEB_SIZE = 0x20000
 VID_OFF = 2048
@@ -155,20 +157,41 @@ def find_free_pebs(img, count):
     return free
 
 
-def build_vid_hdr(vol_id, lnum, data_size, used_ebs, payload):
+def build_vid_hdr(vol_id, lnum, data_size, used_ebs, payload,
+                   vol_type=UBI_VID_STATIC):
     hdr = bytearray(64)
     struct.pack_into(">I", hdr, 0, UBI_VID_HDR_MAGIC)
     hdr[4] = 1  # version
-    hdr[5] = 2  # vol_type = UBI_VID_STATIC
+    hdr[5] = vol_type
     hdr[6] = 0  # copy_flag
     hdr[7] = 0  # compat
     struct.pack_into(">I", hdr, 8, vol_id)
     struct.pack_into(">I", hdr, 12, lnum)
     struct.pack_into(">I", hdr, 16, 0)  # leb_ver, obsolete/reserved
-    struct.pack_into(">I", hdr, 20, data_size)
-    struct.pack_into(">I", hdr, 24, used_ebs)
+    # data_size/data_crc/used_ebs are only meaningful (and only checked
+    # by readers) for *static* volumes - the real U-Boot UBI reader's
+    # own VID header sanity check (drivers/mtd/ubi/io.c's
+    # validate_vid_hdr()) outright *rejects* a dynamic-volume LEB
+    # ("bad used_ebs") unless used_ebs is exactly 0, and likewise
+    # rejects a non-zero data_size/data_crc there ("non-zero
+    # data_size"/"non-zero data CRC") - confirmed the hard way: writing
+    # every dynamic-volume LEB's used_ebs as this volume's real LEB
+    # count (matching the *static*-volume convention, and matching
+    # what this field is *named*) looked reasonable and passed every
+    # offline structural check, but made a real boot fail attach with
+    # "UBI init error 22" on the very first LEB - real dynamic volumes
+    # (confirmed by reading this exact device's own real "ubi_rootfs"
+    # volume) carry data_size=0 *and* used_ebs=0 unconditionally, since
+    # a dynamic volume has no UBI-level notion of "how many bytes/LEBs
+    # of this volume are meaningful" at all - that's entirely up to
+    # whatever filesystem is stored inside it (squashfs's own
+    # superblock, in this case).
+    is_static = (vol_type == UBI_VID_STATIC)
+    struct.pack_into(">I", hdr, 20, data_size if is_static else 0)
+    struct.pack_into(">I", hdr, 24, used_ebs if is_static else 0)
     struct.pack_into(">I", hdr, 28, 0)  # data_pad
-    struct.pack_into(">I", hdr, 32, ubicrc(payload) if data_size else 0)
+    struct.pack_into(">I", hdr, 32,
+                      ubicrc(payload) if (is_static and data_size) else 0)
     struct.pack_into(">Q", hdr, 40, 0)  # sqnum, not tracked by this reader
     crc = ubicrc(bytes(hdr[0:60]))
     struct.pack_into(">I", hdr, 60, crc)
@@ -212,12 +235,31 @@ def patch_vtbl_reserved_pebs(img, vol_id, new_reserved_pebs):
         img[base:base + VTBL_RECORD_SIZE] = rec
 
 
-def patch_kernel_volume(rootfs_ubi, fit_bytes, vol_id=0):
+def extract_ubi_volume(img, vol_id):
+    """Reassembles a volume's raw content from its own LEBs. Full
+    LEB_SIZE per LEB, not each VID header's own data_size field - real
+    *dynamic* volumes (confirmed on this device's own "kernel" volume
+    inside squashfs-factory.ubi, and its "ubi_rootfs" volume in a real
+    captured FULL_FIRMWARE.bin) carry data_size=0 unconditionally, so
+    there is no UBI-level way to know how many trailing bytes of the
+    last LEB are "real" - trusting the full LEB range and letting the
+    payload's own self-describing length (a FIT header's own size
+    fields, a squashfs superblock's bytes_used) account for any
+    trailing pad is the only generically-correct approach."""
+    lebs = find_volume_lebs(img, vol_id)
+    out = bytearray()
+    for lnum, peb_idx, data_size in lebs:
+        base = peb_idx * PEB_SIZE + DATA_OFF
+        out += img[base:base + LEB_SIZE]
+    return bytes(out)
+
+
+def patch_volume(rootfs_ubi, vol_id, data_bytes, vol_type=UBI_VID_STATIC):
     img = bytearray(rootfs_ubi)
-    nlebs = (len(fit_bytes) + LEB_SIZE - 1) // LEB_SIZE
+    nlebs = (len(data_bytes) + LEB_SIZE - 1) // LEB_SIZE
 
     existing = [peb for (_, peb, _) in find_volume_lebs(img, vol_id)]
-    print(f"  existing kernel-volume PEBs: {len(existing)} "
+    print(f"  existing volume {vol_id} PEBs: {len(existing)} "
           f"(reused for the first {min(len(existing), nlebs)} LEBs)")
     if nlebs > len(existing):
         extra_needed = nlebs - len(existing)
@@ -237,16 +279,52 @@ def patch_kernel_volume(rootfs_ubi, fit_bytes, vol_id=0):
 
     for lnum in range(nlebs):
         peb_idx = peb_plan[lnum]
-        chunk = fit_bytes[lnum * LEB_SIZE:(lnum + 1) * LEB_SIZE]
+        chunk = data_bytes[lnum * LEB_SIZE:(lnum + 1) * LEB_SIZE]
         data_size = len(chunk)
         payload = chunk + b"\x00" * (LEB_SIZE - data_size)
 
-        vid_hdr = build_vid_hdr(vol_id, lnum, data_size, nlebs, chunk)
+        vid_hdr = build_vid_hdr(vol_id, lnum, data_size, nlebs, chunk,
+                                 vol_type=vol_type)
 
         base = peb_idx * PEB_SIZE
         img[base:base + 64] = template_ec_hdr
         img[base + VID_OFF:base + VID_OFF + 64] = vid_hdr
         img[base + DATA_OFF:base + DATA_OFF + LEB_SIZE] = payload
+
+    if len(existing) > nlebs:
+        # Shrinking: the trailing existing PEBs (indices nlebs..end)
+        # still carry a valid VID header for this volume's *old*, now
+        # too-high lnum range - if left alone, the real UBI attach
+        # scanner (drivers/mtd/ubi/attach.c) finds them anyway and
+        # reports a leb_count/highest_lnum that no longer matches the
+        # new, smaller reserved_pebs just written to the volume table,
+        # which check_av() (drivers/mtd/ubi/vtbl.c) rejects outright
+        # ("UBI init error 22") - confirmed the hard way on a real
+        # boot, not guessed: shrinking "ubi_rootfs" from a real
+        # device's 157 PEBs down to 89 needed for a fresh squashfs
+        # left 68 stale PEBs still claiming lnums 89-156. Blanking
+        # just the VID header's magic (matching how an erased/unused
+        # PEB looks to find_volume_lebs()/find_free_pebs() alike) is
+        # enough - no need to touch the EC header or data area.
+        orphaned = existing[nlebs:]
+        print(f"  blanking {len(orphaned)} now-orphaned PEB(s) from the "
+              f"volume's previous, larger size: {orphaned}")
+        for peb_idx in orphaned:
+            base = peb_idx * PEB_SIZE
+            # The *whole* 64-byte VID header must read back as 0xFF, not
+            # just its magic - confirmed the hard way: blanking only the
+            # 4-byte magic still left this volume's *old* lnum/used_ebs/
+            # data_crc/hdr_crc bytes in place, and ubi_io_read_vid_hdr()
+            # (drivers/mtd/ubi/io.c) only treats a bad-magic PEB as
+            # genuinely "empty" (UBI_IO_FF) if ubi_check_pattern() finds
+            # the *entire* header all-0xFF; anything else with a bad
+            # magic is treated as a *corrupted* header (UBI_IO_BAD_HDR)
+            # instead, silently added to the attach info's corrupted-PEB
+            # list - which was the real cause of a mystifying "UBI init
+            # error 22" on a real boot, immediately after this exact
+            # 4-byte-only version of this fix looked structurally
+            # correct in every offline check.
+            img[base + VID_OFF:base + VID_OFF + 64] = b"\xff" * 64
 
     print(f"  updating volume table: reserved_pebs -> {nlebs} "
           f"(appsbl's mini-UBI reader rejects the whole image if this "
@@ -258,6 +336,52 @@ def patch_kernel_volume(rootfs_ubi, fit_bytes, vol_id=0):
 
 def run(cmd):
     subprocess.run(cmd, check=True)
+
+
+def repack_fit(tmp, kernel_bin, fdt_bin, extra_bootargs, fit_description):
+    """Patches fdt_bin's chosen/bootargs-append (if extra_bootargs is
+    given) and repacks kernel_bin+fdt_bin into a fresh FIT using this
+    project's own required config name (FIT_CONFIG_NAME) - shared by
+    both the initramfs-FIT path and the squashfs-factory path below,
+    since both need the exact same treatment before appsbl's
+    fit_conf_get_node() (a plain name match) will accept them."""
+    if extra_bootargs:
+        print("Patching DTB chosen/bootargs-append: +", repr(extra_bootargs))
+        dts_path = os.path.join(tmp, "fdt.dts")
+        run(["dtc", "-I", "dtb", "-O", "dts", "-o", dts_path, fdt_bin])
+        with open(dts_path) as f:
+            dts_text = f.read()
+        # Insert right before the closing quote of the property's
+        # *value* (not right after the opening quote): appsbl's
+        # set_fs_bootargs() concatenates its own base cmdline
+        # directly onto this property's value with no separator of
+        # its own, relying entirely on the value's own leading
+        # space - inserting before the opening quote instead (an
+        # earlier version of this script did that) glues onto the
+        # base cmdline's last word with no space at all
+        # ("rootwaitmodule_blacklist=vxlan", confirmed on a real
+        # boot). A leading space of our own here is added
+        # defensively regardless of what follows.
+        marker = 'bootargs-append = "'
+        start = dts_text.index(marker) + len(marker)
+        end = dts_text.index('"', start)
+        dts_text = (dts_text[:end] + " " + extra_bootargs + dts_text[end:])
+        with open(dts_path, "w") as f:
+            f.write(dts_text)
+        run(["dtc", "-I", "dts", "-O", "dtb", "-o", fdt_bin, dts_path])
+
+    its_path = os.path.join(tmp, "mr80x-openwrt.its")
+    itb_path = os.path.join(tmp, "mr80x-openwrt.itb")
+    with open(its_path, "w") as f:
+        f.write(ITS_TEMPLATE.format(
+            kernel_gz=kernel_bin, fdt_bin=fdt_bin,
+            config_name=FIT_CONFIG_NAME))
+    print("Building repacked FIT with config name", FIT_CONFIG_NAME)
+    run(["mkimage", "-f", its_path, itb_path])
+    with open(itb_path, "rb") as f:
+        new_fit = f.read()
+    print(f"  new FIT: {len(new_fit)} bytes")
+    return new_fit
 
 
 def main():
@@ -274,7 +398,24 @@ def main():
                              "initramfs-uImage.itb",
                      help="OpenWrt's own built initramfs FIT for this "
                           "target (a plain .itb file, embedded rootfs - "
-                          "NOT squashfs-factory.ubi's kernel volume).")
+                          "NOT squashfs-factory.ubi's kernel volume). "
+                          "Ignored if --openwrt-squashfs-factory is given.")
+    ap.add_argument("--openwrt-squashfs-factory",
+                     default=None,
+                     help="OpenWrt's own built "
+                          "*-squashfs-factory.ubi for this target. When "
+                          "given, patches BOTH the 'kernel' (vol 0) AND "
+                          "'ubi_rootfs' (vol 1) UBI volumes in the "
+                          "output image using this file's own real "
+                          "'kernel'/'rootfs' volumes (repacking the "
+                          "kernel FIT the same way as --openwrt-fit, "
+                          "copying the rootfs squashfs volume as-is) - "
+                          "a full, real production rootfs (procd, "
+                          "opkg-installed packages, /etc/inittab, real "
+                          "login) instead of the initramfs recovery/test "
+                          "image's stripped-down one. Mutually exclusive "
+                          "with --openwrt-fit in effect: this takes "
+                          "priority when set.")
     ap.add_argument("--output",
                      default=os.path.join(repo, "images",
                                            "full_firmware_openwrt.bin"))
@@ -293,58 +434,17 @@ def main():
                           "'' to disable.")
     args = ap.parse_args()
 
-    for path, label in [(args.full_firmware, "--full-firmware"),
-                         (args.openwrt_fit, "--openwrt-fit")]:
+    required = [(args.full_firmware, "--full-firmware")]
+    if args.openwrt_squashfs_factory:
+        required.append((args.openwrt_squashfs_factory,
+                          "--openwrt-squashfs-factory"))
+    else:
+        required.append((args.openwrt_fit, "--openwrt-fit"))
+    for path, label in required:
         if not os.path.isfile(path):
             raise SystemExit(f"{label} not found: {path}")
 
     with tempfile.TemporaryDirectory() as tmp:
-        print("Extracting kernel-1/fdt-1 from OpenWrt's own initramfs FIT",
-              args.openwrt_fit)
-        kernel_gz = os.path.join(tmp, "kernel.gz")
-        fdt_bin = os.path.join(tmp, "fdt.bin")
-        run(["dumpimage", "-T", "flat_dt", "-p", "0", "-o", kernel_gz, args.openwrt_fit])
-        run(["dumpimage", "-T", "flat_dt", "-p", "1", "-o", fdt_bin, args.openwrt_fit])
-
-        if args.extra_bootargs:
-            print("Patching DTB chosen/bootargs-append: +",
-                  repr(args.extra_bootargs))
-            dts_path = os.path.join(tmp, "fdt.dts")
-            run(["dtc", "-I", "dtb", "-O", "dts", "-o", dts_path, fdt_bin])
-            with open(dts_path) as f:
-                dts_text = f.read()
-            # Insert right before the closing quote of the property's
-            # *value* (not right after the opening quote): appsbl's
-            # set_fs_bootargs() concatenates its own base cmdline
-            # directly onto this property's value with no separator of
-            # its own, relying entirely on the value's own leading
-            # space - inserting before the opening quote instead (an
-            # earlier version of this script did that) glues onto the
-            # base cmdline's last word with no space at all
-            # ("rootwaitmodule_blacklist=vxlan", confirmed on a real
-            # boot). A leading space of our own here is added
-            # defensively regardless of what follows.
-            marker = 'bootargs-append = "'
-            start = dts_text.index(marker) + len(marker)
-            end = dts_text.index('"', start)
-            dts_text = (dts_text[:end] + " " + args.extra_bootargs +
-                        dts_text[end:])
-            with open(dts_path, "w") as f:
-                f.write(dts_text)
-            run(["dtc", "-I", "dts", "-O", "dtb", "-o", fdt_bin, dts_path])
-
-        its_path = os.path.join(tmp, "mr80x-openwrt.its")
-        itb_path = os.path.join(tmp, "mr80x-openwrt.itb")
-        with open(its_path, "w") as f:
-            f.write(ITS_TEMPLATE.format(
-                kernel_gz=kernel_gz, fdt_bin=fdt_bin,
-                config_name=FIT_CONFIG_NAME))
-        print("Building repacked FIT with config name", FIT_CONFIG_NAME)
-        run(["mkimage", "-f", its_path, itb_path])
-        with open(itb_path, "rb") as f:
-            new_fit = f.read()
-        print(f"  new FIT: {len(new_fit)} bytes")
-
         print("Reading real firmware's rootfs partition "
               f"(0x{ROOTFS_PART_OFFSET:x}, 0x{ROOTFS_PART_SIZE:x} bytes)")
         with open(args.full_firmware, "rb") as f:
@@ -352,10 +452,65 @@ def main():
         rootfs_ubi = bytes(full[ROOTFS_PART_OFFSET:
                                  ROOTFS_PART_OFFSET + ROOTFS_PART_SIZE])
 
-        print("Patching the 'kernel' UBI volume in place "
-              "(the 'ubi_rootfs' volume and everything else is untouched)")
-        new_rootfs_ubi, nlebs = patch_kernel_volume(rootfs_ubi, new_fit)
-        print(f"  wrote {nlebs} LEBs for the new kernel volume")
+        if args.openwrt_squashfs_factory:
+            print("Reading OpenWrt's own squashfs-factory.ubi",
+                  args.openwrt_squashfs_factory)
+            with open(args.openwrt_squashfs_factory, "rb") as f:
+                factory_img = bytearray(f.read())
+
+            print("Extracting real 'kernel' (vol 0) and 'rootfs' (vol 1) "
+                  "volumes from it")
+            kernel_raw = extract_ubi_volume(factory_img, 0)
+            rootfs_raw = extract_ubi_volume(factory_img, 1)
+            print(f"  kernel volume: {len(kernel_raw)} bytes, "
+                  f"rootfs volume: {len(rootfs_raw)} bytes")
+
+            kernel_raw_path = os.path.join(tmp, "kernel_raw.itb")
+            with open(kernel_raw_path, "wb") as f:
+                f.write(kernel_raw)
+            kernel_gz = os.path.join(tmp, "kernel.gz")
+            fdt_bin = os.path.join(tmp, "fdt.bin")
+            run(["dumpimage", "-T", "flat_dt", "-p", "0", "-o", kernel_gz,
+                 kernel_raw_path])
+            run(["dumpimage", "-T", "flat_dt", "-p", "1", "-o", fdt_bin,
+                 kernel_raw_path])
+
+            new_fit = repack_fit(tmp, kernel_gz, fdt_bin,
+                                  args.extra_bootargs,
+                                  "ARM64 OpenWrt FIT (repacked from "
+                                  "squashfs-factory.ubi)")
+
+            print("Patching the 'kernel' (static) and 'ubi_rootfs' "
+                  "(dynamic) UBI volumes in place - everything else "
+                  "(env, appsbl itself, rootfs_data/overlay) untouched")
+            rootfs_ubi_bytes, nlebs_k = patch_volume(
+                rootfs_ubi, 0, new_fit, vol_type=UBI_VID_STATIC)
+            print(f"  wrote {nlebs_k} LEBs for the new kernel volume")
+            rootfs_ubi_bytes, nlebs_r = patch_volume(
+                rootfs_ubi_bytes, 1, rootfs_raw, vol_type=UBI_VID_DYNAMIC)
+            print(f"  wrote {nlebs_r} LEBs for the new ubi_rootfs volume")
+            new_rootfs_ubi = rootfs_ubi_bytes
+        else:
+            print("Extracting kernel-1/fdt-1 from OpenWrt's own "
+                  "initramfs FIT", args.openwrt_fit)
+            kernel_gz = os.path.join(tmp, "kernel.gz")
+            fdt_bin = os.path.join(tmp, "fdt.bin")
+            run(["dumpimage", "-T", "flat_dt", "-p", "0", "-o", kernel_gz,
+                 args.openwrt_fit])
+            run(["dumpimage", "-T", "flat_dt", "-p", "1", "-o", fdt_bin,
+                 args.openwrt_fit])
+
+            new_fit = repack_fit(tmp, kernel_gz, fdt_bin,
+                                  args.extra_bootargs,
+                                  "ARM64 OpenWrt FIT (repacked for "
+                                  "mr80x-appsbl)")
+
+            print("Patching the 'kernel' UBI volume in place "
+                  "(the 'ubi_rootfs' volume and everything else is "
+                  "untouched)")
+            new_rootfs_ubi, nlebs = patch_volume(rootfs_ubi, 0, new_fit,
+                                                  vol_type=UBI_VID_STATIC)
+            print(f"  wrote {nlebs} LEBs for the new kernel volume")
 
         full[ROOTFS_PART_OFFSET:ROOTFS_PART_OFFSET + ROOTFS_PART_SIZE] = \
             new_rootfs_ubi
