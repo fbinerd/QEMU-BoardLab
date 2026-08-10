@@ -724,12 +724,31 @@ typedef struct MR80XBamState {
     uint32_t generic_regs[MR80X_BAM_SIZE / 4];
 } MR80XBamState;
 
+/* BAM_REVISION/BAM_NUM_PIPES (register layout for "qcom,bam-v1.7.0",
+ * matching this exact DT node - drivers/dma/qcom/bam_dma.c's
+ * bam_v1_7_reg_info table) - not needed by appsbl's own hand-rolled
+ * QPIC/BAM driver (which never reads either), but the *kernel*'s
+ * generic bam-dma-engine driver's probe()/bam_init() unconditionally
+ * does, computing num_ees from BAM_REVISION bits [11:8] and
+ * requiring the DT's "qcom,ee" value (0 for this SoC) be strictly
+ * less than it - with these left at their all-zero reset default
+ * (falling through to the generic unimplemented-register handling
+ * every other unmodeled BAM offset gets), num_ees reads as 0, so
+ * `bdev->ee (0) >= num_ees (0)` was unconditionally true and the
+ * whole driver failed to probe with -EINVAL, which cascaded into
+ * qcom-nandc never getting a DMA channel and the kernel never being
+ * able to mount its UBI rootfs at all (BRINGUP-NOTES.md section 28). */
+#define BAM_REVISION_OFF 0x01000
+#define BAM_NUM_PIPES_OFF 0x01008
+
 static void mr80x_bam_reset(void *opaque)
 {
     MR80XBamState *s = opaque;
 
     memset(s->pipe, 0, sizeof(s->pipe));
     memset(s->generic_regs, 0, sizeof(s->generic_regs));
+    s->generic_regs[BAM_REVISION_OFF / 4] = 1u << 8;   /* num_ees = 1 */
+    s->generic_regs[BAM_NUM_PIPES_OFF / 4] = MR80X_BAM_NUM_PIPES;
     /* s->nand is the device link, not volatile controller state. */
 }
 
