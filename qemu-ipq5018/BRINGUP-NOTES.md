@@ -2327,10 +2327,25 @@ not just reaching `procd: - init -` and dying moments later.
     triaged - all confirmed either non-fatal/cosmetic or out of this
     project's scope (real clock-tree Hz modeling, a new DMA-engine
     protocol, or WiFi-coprocessor firmware loading), not quick fixes.
-    Also checked: no interactive shell prompt appears on this
-    initramfs test image even after 150s+ stable idle and sending
-    keystrokes - traced to the image's own `/etc/inittab` (a rootfs/
-    userspace configuration detail, not a board-emulation gap).
+    Initially (wrongly) chalked up the missing shell prompt to rootfs
+    config - see #30/section 32, that call was wrong.
+30. [done] MILESTONE (section 32): found and fixed a real UART RX bug -
+    the receive-FIFO register only ever returned 1 byte per 32-bit
+    read instead of the up-to-4-bytes-packed the kernel's
+    `msm_serial.c` actually expects (the exact mirror of a TX-side bug
+    section 26 already fixed), which desynced the driver's own byte
+    count the moment 2+ bytes arrived in one burst - orphaning a byte,
+    keeping the level-triggered RX IRQ stuck asserted, and wedging the
+    guest kernel in an infinite reentrant interrupt-handler loop
+    (100% CPU, everything starved). This is the real mechanism behind
+    "no keypress, not even Enter, ever reaches the console" - fixed
+    and verified via a 260+ second boot sending 21 Enter presses plus
+    a command string with zero crashes/hangs. A separate, still-open
+    question (no shell prompt observed even now) was traced one level
+    further to `/sbin/askfirst` (procd) blocking in `getchar()` behind
+    a probably-unflushed stdio buffer - understood but not yet fixed,
+    see section 32's tail for the detail and why it sits at the edge
+    of this project's hardware-emulation scope.
 
 ## 31. Two more real probe fixes, and triaging what's left after `procd: - init -`
 
@@ -2401,17 +2416,116 @@ graceful `-EPROBE_DEFER`-style failures):
   flag layout. Purely cosmetic - doesn't block or slow boot. Lowest
   priority of everything found, left alone.
 
-**Checked - no interactive shell prompt appears**: ran two more real
-boots after all the above fixes, one idle for 150s and one sending
-newlines + a test command over the serial console after the last log
-line, neither producing any `ash`/BusyBox prompt or command echo. This
-is *not* a new regression from this session's changes - system reaches
-and stays at a stable, fully-booted userspace (`procd: - init -`,
-`kmodloader` completes, `zram0` swap active) with zero crashes both
-times; the missing prompt is consistent with this specific initramfs
-image being a stripped-down recovery/test build whose `/etc/inittab`
-likely doesn't `askfirst`-respawn a shell on the console device - a
-rootfs/userspace configuration detail belonging to the OpenWrt image
-itself, not a board-emulation gap (and out of scope to change, since
-that would mean editing OpenWrt build output content rather than this
-project's own QEMU/appsbl code).
+**Checked - no interactive shell prompt appears, initial pass**: ran
+two more real boots after all the above fixes, one idle for 150s and
+one sending newlines + a test command over the serial console after
+the last log line, neither producing any `ash`/BusyBox prompt or
+command echo. At the time, this looked consistent with this specific
+initramfs image being a stripped-down recovery/test build whose
+`/etc/inittab` doesn't spawn a shell on the console - **this
+assessment turned out to be wrong, see section 32**: it wasn't a
+rootfs configuration detail, it was a real, previously-undiscovered
+UART hardware-emulation bug that this same "no prompt" symptom was
+actually hiding.
+
+## 32. MILESTONE: fixed a real UART RX bug that made keyboard input hang the kernel outright - "not even Enter works" was a genuine hardware-emulation gap, not a rootfs config detail
+
+Section 31 signed off on the missing shell prompt as an inittab/rootfs
+characteristic. The user then reported empirically that **no key at
+all** - not even Enter - ever reached the console, which doesn't match
+"no getty configured" (that would still show *something*, like an
+unresponsive but stable prompt) - it matches something actively
+broken. Investigated properly this time instead of re-asserting the
+earlier (wrong) call.
+
+**Root cause, confirmed via temporary instrumentation on a live boot,
+not guessed**: the UART model's RF (receive FIFO) register read
+handler (`mr80x_uart_read()`, offsets `UART_TF0`/`+4`/`+8`/`+12`,
+aliasing the same address as TF - see the file's own register-map
+comment) only ever popped **one** byte per 32-bit-wide read, zero-
+padding the rest. Section 26 (`BRINGUP-NOTES.md`) already documents
+the exact symmetric bug on the *transmit* side and fixed it there
+(the kernel's `msm_serial.c` packs up to 4 characters per 32-bit `TF`
+write) - but the fix was never mirrored onto the *receive* side,
+because until now nothing had ever driven multi-byte RX through this
+model (u-boot's own `qca_uart.c` RX path is a simple one-byte-at-a-
+time poll loop, so section 20's interactive u-boot console never
+exercised this).
+
+The kernel's real RX consumer, `msm_handle_rx_dm()`
+(`drivers/tty/serial/msm_serial.c`), reads `UARTDM_RX_TOTAL_SNAP`
+*once* for the total pending byte count, then loops reading 32-bit
+`RF` words, unconditionally treating **each** word as carrying up to 4
+real bytes (`r_count = min(count, 4)`) - there is no separate signal
+for "how many bytes did this specific read actually return". Give it
+back only 1 real byte per word (as this model did) and its own count
+bookkeeping goes out of sync the moment 2+ bytes arrive in a single
+burst: it thinks it drained 4 bytes when it only got 1, silently
+orphaning the rest inside `rx_buf`. Confirmed via temporary
+`info_report()` tracing on a real boot: sending a single byte (one
+`\n`) worked fine, but the very next multi-byte burst (`"x\n"`, 2
+bytes in one chardev callback - exactly what a real terminal sends for
+an ordinary keystroke plus Enter) left the model's RX buffer
+non-empty after the kernel's ISR returned. Since this model's IRQ line
+is level-triggered on "`rx_buf` non-empty" (by design, matching real
+UARTDM RXSTALE semantics), the still-pending byte kept the line
+asserted, which made the GIC redeliver the same interrupt immediately
+on ISR exit - an infinite reentrant `msm_uart_irq()` loop, confirmed
+in the trace as `MSM_UART_IMR` being rewritten hundreds of times a
+second, forever, pinning the (single active) CPU at 100% and starving
+every other kernel/userspace task, including whatever was supposed to
+print a login prompt. This fully explains "not even Enter works" from
+the user's side: their *first* keystroke likely landed fine, but
+ordinary terminal behavior (Enter sending `\r\n`, key-repeat, or
+simply typing a second character before the first was drained) was
+near-guaranteed to deliver 2+ bytes in at least one callback shortly
+after, wedging the guest solid with no further visible output at all -
+indistinguishable, from a plain "did characters appear" check, from
+"no console listener at all".
+
+**Fixed**: `mr80x_uart_read()`'s RF case now pops up to 4 bytes per
+32-bit read (low byte first, matching the write side's existing
+packing/comment), keeping `UARTDM_RX_TOTAL_SNAP`'s reported count and
+the number of bytes actually retrievable via `RF` in sync - no more
+orphaned bytes, no more stuck-asserted IRQ line.
+
+**Verified via live boots, with temporary tracing then removed
+again**: (1) a trace on the RF read path showed `rx_count` draining
+cleanly in one pass for a multi-byte burst (`11 -> 7 -> 3 -> 0` for an
+11-byte test string) with the IRQ line deasserting immediately after,
+no reentrant storm; (2) a 260+ second boot sending 21 separate Enter
+presses plus a full command string produced zero crashes, zero CPU-
+pinning storms, and normal continued kernel activity throughout
+(`urngd` at ~150-160s, background thermal-zone timeout/disable
+messages past 220s) - the hard hang is gone.
+
+**Still open, and now properly root-caused rather than dismissed**:
+even with the RX bug fixed, no shell prompt or command echo has yet
+been observed. Traced one level further (read-only, `procd`'s own
+source in the OpenWrt build tree, not modified): `STATE_INIT`
+(`procd`'s `state.c`, the exact `"- init -"` log line already seen in
+every boot) does unconditionally run `procd_inittab_run("askconsole")`
+at that point, which - per `/etc/inittab`'s
+`::askconsole:/usr/libexec/login.sh` - forks `/sbin/askfirst
+/usr/libexec/login.sh` (`inittab.c`'s `askconsole()` always redirects
+through the `askfirst` binary, by design). `askfirst`'s own source
+(`utils/askfirst.c`) is trivial: `printf("Please press Enter to
+activate this console.\n")`, then block in a `getchar()` loop until it
+sees a `0xA` byte, then `execvp()` into the real login shell. That
+banner text has never once appeared in any captured boot log,
+including the long post-fix runs with plenty of real `0xA` bytes sent
+- which (since this model's TX path is independently confirmed
+solid, carrying thousands of lines of kernel dmesg with zero loss)
+points at C stdio buffering: `printf()` is fully-buffered rather than
+line-buffered unless connected to something `isatty()` recognizes as
+a terminal at startup, and a full buffer that's never explicitly
+`fflush()`-ed and never reached by a normal `return`/`exit` (this
+program blocks forever in `getchar()`) never actually reaches the
+underlying fd. Whether that's a genuine emulation gap (something about
+this UART model `isatty()` needs and doesn't get - unconfirmed) or
+purely userspace/musl stdio behavior unrelated to hardware is not yet
+determined; investigating further means tracing into `procd`/musl
+runtime behavior rather than hardware register modeling, right at the
+edge of (arguably past) this project's "emulate the hardware" scope -
+left here as a clearly root-caused, well-understood next step rather
+than re-asserting the earlier wrong "it's just rootfs config" call.

@@ -1414,16 +1414,38 @@ static uint64_t mr80x_uart_read(void *opaque, hwaddr offset, unsigned size)
     case UART_TF0:
     case UART_TF0 + 4:
     case UART_TF0 + 8:
-    case UART_TF0 + 12:
+    case UART_TF0 + 12: {
         /* RF (receive fifo) aliases the same offsets as TF in this
-         * variant per uart.h; pull one byte per word-sized read. */
-        if (!mr80x_uart_rx_empty(s)) {
-            uint8_t c = s->rx_buf[s->rx_tail];
+         * variant per uart.h. Real hardware packs up to 4 bytes per
+         * 32-bit FIFO pop, low byte first - the kernel's
+         * msm_handle_rx_dm() (drivers/tty/serial/msm_serial.c) relies
+         * on exactly this, symmetric to how msm_handle_tx() relies on
+         * TF's up-to-4-byte packing (see the UART_NCHAR write-side
+         * comment below): it reads UARTDM_RX_TOTAL_SNAP once for the
+         * total pending byte count, then loops reading 32-bit RF
+         * words and treating *each* as up to 4 real bytes
+         * (`r_count = min(count, 4)`), with no separate "how many did
+         * this one read actually return" signal. Returning only 1
+         * real byte per word (as this used to) desyncs that count
+         * bookkeeping the moment 2+ bytes arrive in one chardev
+         * callback (e.g. typing/pasting more than a single
+         * character): one byte is silently orphaned in `rx_buf`,
+         * which keeps this model's level-triggered IRQ asserted
+         * forever - confirmed via a live boot to wedge the guest
+         * kernel in an infinite reentrant ISR loop (IMR written over
+         * and over, CPU pinned at 100%, console dead - the real
+         * mechanism behind "no keypress, not even Enter, ever reaches
+         * the console"). */
+        uint32_t word = 0;
+        unsigned n = 0;
+        while (n < 4 && !mr80x_uart_rx_empty(s)) {
+            word |= (uint32_t)s->rx_buf[s->rx_tail] << (n * 8);
             s->rx_tail = (s->rx_tail + 1) % UART_RX_BUF_SIZE;
-            mr80x_uart_update_irq(s);
-            return c;
+            n++;
         }
-        return 0;
+        mr80x_uart_update_irq(s);
+        return word;
+    }
     default:
         return 0;
     }
