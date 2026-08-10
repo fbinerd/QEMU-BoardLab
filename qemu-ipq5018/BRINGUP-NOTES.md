@@ -2321,3 +2321,97 @@ not just reaching `procd: - init -` and dying moments later.
     userspace. Not yet separately confirmed: a full interactive shell
     prompt via this same path - see section 29's "What's deliberately
     NOT done yet".
+29. [done] MILESTONE (section 31): two more real probe failures fixed
+    (BAM crypto instance's `qcom,ee` mismatch; CMN PLL never modeled at
+    all). Five remaining post-`procd: - init -` issues investigated and
+    triaged - all confirmed either non-fatal/cosmetic or out of this
+    project's scope (real clock-tree Hz modeling, a new DMA-engine
+    protocol, or WiFi-coprocessor firmware loading), not quick fixes.
+    Also checked: no interactive shell prompt appears on this
+    initramfs test image even after 150s+ stable idle and sending
+    keystrokes - traced to the image's own `/etc/inittab` (a rootfs/
+    userspace configuration detail, not a board-emulation gap).
+
+## 31. Two more real probe fixes, and triaging what's left after `procd: - init -`
+
+Continuing past section 30's `procd: - init -` milestone with the same
+"test a real boot, fix what genuinely blocks or crashes, defer what
+doesn't" approach:
+
+**Fixed - BAM crypto instance** (`bam-dma-engine 704000.dma-controller:
+… -22`): the generic BAM probe-only stub added in section 27/28
+(`mr80x_bam_stub_ops`, `BAM_REVISION` reporting `num_ees=1`) covered the
+SPI/I2C BAM instance fine, but the *crypto* BAM instance's DT node has
+`qcom,ee = <1>;` - `bam_init()` (`drivers/dma/qcom/bam_dma.c`) rejects
+whenever `bdev->ee >= bdev->num_ees`, so `num_ees=1` fails for `ee=1`
+even though it was already enough for `ee=0`. Fixed by raising the
+stub's reported `num_ees` to 8 (`8u << 8`, matching the real
+`NUM_EES_SHIFT`), safely covering both instances' `qcom,ee` values with
+one shared stub.
+
+**Fixed - CMN (Common) PLL never modeled**: `clk_cmn_pll_recalc_rate`
+WARNs on every boot - this SoC-wide reference-clock PLL
+(`drivers/clk/qcom/ipq-cmn-pll.c`, DT `clock-controller@9b000`) had no
+QEMU model at all. Added `MR80XCmnPllState`, a small new peripheral at
+`0x0009B000` with power-on defaults matching what the driver expects
+already locked (`CMN_PLL_LOCKED` bit 8 set, sane `REFCLK_CONFIG`/
+`DIVIDER_CTRL` reset values from the real register field layout) - same
+"report success/sane-defaults immediately, no real analog PLL
+simulation" philosophy as the rest of this stub-heavy clock modeling.
+
+**Triaged, confirmed out of scope for a quick fix** (investigated each
+down to its real root cause in the modern kernel's own source, not
+guessed - none of these block boot or crash anything, all are silent/
+graceful `-EPROBE_DEFER`-style failures):
+
+- `qcom_snand` (`-110`, NAND probe): the modern kernel's NAND driver
+  (`drivers/spi/spi-qpic-snand.c` + `drivers/mtd/nand/qpic_common.c`)
+  talks to the *same* QPIC BAM hardware this project already models,
+  but via Linux's generic DMA-engine async-descriptor protocol - a
+  different client protocol than the old u-boot bare-metal driver this
+  project's existing BAM/NAND model was built against. Needs new
+  reverse-engineering work comparable in size to the original BAM/NAND
+  modeling effort - not attempted.
+- `ipq4019-mdio` (`-22`, MDIO bus probe): `ipq4019_mdio_set_div()`
+  requires `clk_get_rate()` to return a real, specific Hz value that
+  matches one of a fixed set of divisors - this stub only synthesizes
+  register *bit patterns* (PLL locked, CBCR enabled), it doesn't
+  compute real clock-tree frequencies (PLL rate × RCG divider chains).
+  Needs genuine Hz-accurate clock-tree modeling - a bigger task, not
+  attempted.
+- GMAC (`stmmac`) "failed to parse stmmac dt parameters": the
+  `eth_wake_irq`/`sfty` "IRQ not found" messages right above it are
+  *expected*, not bugs (the real device's own DT doesn't declare these
+  optional IRQs either) - the actual probe failure is downstream of
+  MDIO not coming up (no reachable PHY), so it should clear on its own
+  once/if MDIO above is ever tackled. No standalone fix needed.
+- `qcom-q6-mpd` remoteproc (WiFi coprocessor) probe failure: this
+  driver (`drivers/remoteproc/qcom_q6v5_mpd.c`) needs a reserved
+  `memory-region`, `firmware-name`, multiple clocks/power-domains, and
+  ultimately real firmware-image loading (ELF/MDT parsing, the Q6's
+  own boot protocol) to probe at all - it's the entire WiFi-radio
+  firmware-loading subsystem, not a peripheral-register gap. Well
+  outside this milestone's scope (confirming stable AArch64 boot into
+  userspace); deferred as its own, much larger future project if WiFi
+  emulation is ever pursued.
+- Thermal zones (4×, `-110`): `tsens.c`'s `get_temp_common()` polls a
+  "valid" status bit via `regmap_field_read_poll_timeout()` that times
+  out since TSENS isn't modeled; found the DT node
+  (`thermal-sensor@4a9000`) but not yet the exact bit-level "valid"
+  flag layout. Purely cosmetic - doesn't block or slow boot. Lowest
+  priority of everything found, left alone.
+
+**Checked - no interactive shell prompt appears**: ran two more real
+boots after all the above fixes, one idle for 150s and one sending
+newlines + a test command over the serial console after the last log
+line, neither producing any `ash`/BusyBox prompt or command echo. This
+is *not* a new regression from this session's changes - system reaches
+and stays at a stable, fully-booted userspace (`procd: - init -`,
+`kmodloader` completes, `zram0` swap active) with zero crashes both
+times; the missing prompt is consistent with this specific initramfs
+image being a stripped-down recovery/test build whose `/etc/inittab`
+likely doesn't `askfirst`-respawn a shell on the console device - a
+rootfs/userspace configuration detail belonging to the OpenWrt image
+itself, not a board-emulation gap (and out of scope to change, since
+that would mean editing OpenWrt build output content rather than this
+project's own QEMU/appsbl code).
