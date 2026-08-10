@@ -12,11 +12,18 @@ section for how this was discovered).
 Requires:
   - images/FULL_FIRMWARE.bin (real flash dump, gitignored, not included)
   - OpenWrt's own build output for this target, specifically the
-    "squashfs-factory.ubi" image (already contains a correctly-built FIT:
-    gzip-compressed Linux 6.12.94 Image + real device DTB, load/entry
-    0x41000000, crc32+sha1 hashes) - default path below assumes a sibling
+    "initramfs-uImage.itb" FIT (already a correctly-built FIT: gzip
+    Linux 6.12.94 Image with an *embedded initramfs* + real device DTB,
+    load/entry 0x41000000, crc32+sha1 hashes) - NOT "squashfs-factory.ubi"'s
+    own kernel volume, which expects a separate "ubi_rootfs" UBI volume
+    this script does not populate; the kernel would just hang forever at
+    "Waiting for root device /dev/ubiblock0_1..." (confirmed the hard way -
+    see BRINGUP-NOTES.md section 29's "first attempt" note). The
+    initramfs build needs nothing else: userspace is embedded in the
+    kernel Image itself, same as the isolated --aarch64-openwrt test path
+    (section 28) already relies on. Default path below assumes a sibling
     openwrt checkout at the location this project's other sessions used;
-    override with --openwrt-ubi if yours lives elsewhere.
+    override with --openwrt-fit if yours lives elsewhere.
   - `mkimage`/`dumpimage` (apt install u-boot-tools, or use OpenWrt's own
     staging_dir/host/bin copies) on PATH.
 
@@ -168,6 +175,43 @@ def build_vid_hdr(vol_id, lnum, data_size, used_ebs, payload):
     return bytes(hdr)
 
 
+VTBL_RECORD_SIZE = 172
+
+
+def find_layout_volume_pebs(img):
+    npebs = len(img) // PEB_SIZE
+    pebs = []
+    for i in range(npebs):
+        peb = img[i * PEB_SIZE:(i + 1) * PEB_SIZE]
+        if be32(peb, 0) != UBI_EC_HDR_MAGIC:
+            continue
+        vhdr_off = be32(peb, 16)
+        if be32(peb, vhdr_off) != UBI_VID_HDR_MAGIC:
+            continue
+        if be32(peb, vhdr_off + 8) != UBI_LAYOUT_VOLUME_ID:
+            continue
+        doff = be32(peb, 20)
+        pebs.append((i, doff))
+    return pebs
+
+
+def patch_vtbl_reserved_pebs(img, vol_id, new_reserved_pebs):
+    """appsbl's own mini-UBI reader cross-checks each volume's VID headers
+    (used_ebs) against the volume table's reserved_pebs and refuses the
+    whole UBI image ("UBI init error 22") if they disagree - so growing a
+    volume beyond its original reserved_pebs (as this script does for the
+    "kernel" volume whenever the new FIT needs more LEBs than the original
+    one used) requires patching *both* copies of the volume table's record
+    for that volume, not just writing the extra LEBs themselves."""
+    for peb_idx, doff in find_layout_volume_pebs(img):
+        base = peb_idx * PEB_SIZE + doff + vol_id * VTBL_RECORD_SIZE
+        rec = bytearray(img[base:base + VTBL_RECORD_SIZE])
+        struct.pack_into(">I", rec, 0, new_reserved_pebs)
+        crc = ubicrc(bytes(rec[0:VTBL_RECORD_SIZE - 4]))
+        struct.pack_into(">I", rec, VTBL_RECORD_SIZE - 4, crc)
+        img[base:base + VTBL_RECORD_SIZE] = rec
+
+
 def patch_kernel_volume(rootfs_ubi, fit_bytes, vol_id=0):
     img = bytearray(rootfs_ubi)
     nlebs = (len(fit_bytes) + LEB_SIZE - 1) // LEB_SIZE
@@ -204,6 +248,11 @@ def patch_kernel_volume(rootfs_ubi, fit_bytes, vol_id=0):
         img[base + VID_OFF:base + VID_OFF + 64] = vid_hdr
         img[base + DATA_OFF:base + DATA_OFF + LEB_SIZE] = payload
 
+    print(f"  updating volume table: reserved_pebs -> {nlebs} "
+          f"(appsbl's mini-UBI reader rejects the whole image if this "
+          f"doesn't match each LEB's own used_ebs field)")
+    patch_vtbl_reserved_pebs(img, vol_id, nlebs)
+
     return bytes(img), nlebs
 
 
@@ -218,40 +267,31 @@ def main():
     repo = os.path.dirname(here)
     ap.add_argument("--full-firmware",
                      default=os.path.join(repo, "images", "FULL_FIRMWARE.bin"))
-    ap.add_argument("--openwrt-ubi",
+    ap.add_argument("--openwrt-fit",
                      default="/media/dados_2tb/opw/openwrt/bin/targets/"
                              "qualcommax/ipq50xx/"
                              "openwrt-qualcommax-ipq50xx-mercusys_mr80x-v5-"
-                             "squashfs-factory.ubi",
-                     help="OpenWrt's own built factory.ubi for this target "
-                          "(already contains a correctly-built FIT).")
+                             "initramfs-uImage.itb",
+                     help="OpenWrt's own built initramfs FIT for this "
+                          "target (a plain .itb file, embedded rootfs - "
+                          "NOT squashfs-factory.ubi's kernel volume).")
     ap.add_argument("--output",
                      default=os.path.join(repo, "images",
                                            "full_firmware_openwrt.bin"))
     args = ap.parse_args()
 
     for path, label in [(args.full_firmware, "--full-firmware"),
-                         (args.openwrt_ubi, "--openwrt-ubi")]:
+                         (args.openwrt_fit, "--openwrt-fit")]:
         if not os.path.isfile(path):
             raise SystemExit(f"{label} not found: {path}")
 
     with tempfile.TemporaryDirectory() as tmp:
-        print("Extracting OpenWrt's kernel FIT (volume 0) from", args.openwrt_ubi)
-        with open(args.openwrt_ubi, "rb") as f:
-            ow_ubi = f.read()
-        ow_lebs = find_volume_lebs(ow_ubi, 0)
-        ow_kernel_fit = bytearray()
-        for lnum, peb, _ in ow_lebs:
-            ow_kernel_fit += ow_ubi[peb * PEB_SIZE + DATA_OFF:
-                                     peb * PEB_SIZE + DATA_OFF + LEB_SIZE]
-        ow_fit_path = os.path.join(tmp, "openwrt_kernel_vol.itb")
-        with open(ow_fit_path, "wb") as f:
-            f.write(ow_kernel_fit)
-
+        print("Extracting kernel-1/fdt-1 from OpenWrt's own initramfs FIT",
+              args.openwrt_fit)
         kernel_gz = os.path.join(tmp, "kernel.gz")
         fdt_bin = os.path.join(tmp, "fdt.bin")
-        run(["dumpimage", "-T", "flat_dt", "-p", "0", "-o", kernel_gz, ow_fit_path])
-        run(["dumpimage", "-T", "flat_dt", "-p", "1", "-o", fdt_bin, ow_fit_path])
+        run(["dumpimage", "-T", "flat_dt", "-p", "0", "-o", kernel_gz, args.openwrt_fit])
+        run(["dumpimage", "-T", "flat_dt", "-p", "1", "-o", fdt_bin, args.openwrt_fit])
 
         its_path = os.path.join(tmp, "mr80x-openwrt.its")
         itb_path = os.path.join(tmp, "mr80x-openwrt.itb")

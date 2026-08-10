@@ -1753,7 +1753,7 @@ own AArch32->AArch64 handoff so the *real* (non-bypassed) boot chain
 works end to end - this section's test path is deliberately a shortcut
 around that, not a replacement for it.
 
-## 29. MILESTONE: the real appsbl `jump_kernel64()` SMC handoff works end to end - a genuine, modern AArch64 kernel now boots via the real, non-bypassed boot chain
+## 29. MILESTONE: the real appsbl `jump_kernel64()` SMC handoff works end to end - a genuine, modern AArch64 OpenWrt boots via the real, non-bypassed boot chain, all the way to `procd: - init -`
 
 Implements the real (non-bypassed) AArch32->AArch64 handoff section 28
 deferred: appsbl's own `arch/arm/lib/bootm.c` calls
@@ -1774,6 +1774,15 @@ mr80x: appsbl jump_kernel64() SMC intercepted (params at 0x4a8224f0) - kernel_en
 mr80x: entering AArch64 kernel at 0x41000000, x0(fdt)=0x4a3f6000
 [    0.000000] Booting Linux on physical CPU 0x0000000000 [0x410fd034]
 [    0.000000] Machine model: Mercusys MR80X v5
+[    ...]
+Run /init as init process
+init: Console is alive
+init: - watchdog -
+init: - preinit -
+[   11.910000] procd: - early -
+[   12.560000] procd: - ubus -
+[   12.770000] procd: - init -
+[   14.670000] kmodloader: loading kernel modules from /etc/modules.d/*
 ```
 
 - `0x410fd034` is the genuine Cortex-A53 MIDR (confirmed section 28) -
@@ -1785,14 +1794,18 @@ mr80x: entering AArch64 kernel at 0x41000000, x0(fdt)=0x4a3f6000
   `rootfs` MTD partition, via appsbl's own real FIT loading/hash
   verification (`crc32+ sha1+ OK`) - not a `-kernel` override, not the
   isolated `--aarch64-openwrt` test path.
-- Real dmesg follows immediately after (real DTB parse, `clk:
-  Disabling unused clocks`, real driver probing) - this is a live,
-  correctly-configured kernel, not a crash landing.
-- `UBI error: cannot open mtd rootfs` and a `wait_for_pll` clock
-  warning both follow shortly after - expected and *not* handoff bugs,
-  see "What's deliberately NOT done yet" below.
+- `procd: - init -` is the exact same milestone section 28's isolated
+  bypass test path reached - now reached via the genuine, non-bypassed
+  boot chain instead.
+- Real dmesg follows throughout (real DTB parse, real driver probing,
+  `kmodloader`, `init:`/`procd:` stages) - a live, correctly-configured
+  system, not a crash landing. The many `deferred probe pending`/
+  `Unknown symbol`/clock-related WARNs along the way are expected
+  peripheral-modeling gaps (this board's models were tuned for the old
+  kernel/isolated test path), not handoff bugs - see "What's
+  deliberately NOT done yet" below.
 
-### `images/full_firmware_openwrt.bin`: why a new flash image was needed
+### `images/full_firmware_openwrt.bin`: why a new flash image was needed, and two more mistakes made building it
 
 The real `FULL_FIRMWARE.bin`'s actual shipped kernel turned out to be
 **32-bit ARM Linux-4.4.60** (confirmed by decoding its FIT image with
@@ -1804,19 +1817,13 @@ logged in an earlier draft of this section were downstream of chasing a
 handoff that could never fire against the real shipped kernel - not a
 bug in the trampoline logic itself.
 
-Fix (the user's suggestion): build a new flash image,
-`tools/build_full_firmware_openwrt.py`, that starts from the real
-`FULL_FIRMWARE.bin` and surgically replaces only the **`kernel` UBI
-volume** (inside the `rootfs` MTD partition, `0x640000`/`0x2A00000`)
-with a FIT image wrapping OpenWrt's own real, already-built AArch64
-kernel+DTB for this device - reusing
-`openwrt-qualcommax-ipq50xx-mercusys_mr80x-v5-squashfs-factory.ubi`'s
-own `kernel` volume content directly (already a correctly-built FIT:
-gzip Linux 6.12.94 Image, real device DTB, load/entry `0x41000000`,
-crc32+sha1 hashes - OpenWrt's own build already produces exactly the
-image real appsbl expects). Everything else in the flash image -
-env, appsbl itself, the `ubi_rootfs` volume, all other partitions - is
-left completely untouched.
+Fix (the user's suggestion): `tools/build_full_firmware_openwrt.py`
+starts from the real `FULL_FIRMWARE.bin` and surgically replaces only
+the **`kernel` UBI volume** (inside the `rootfs` MTD partition,
+`0x640000`/`0x2A00000`) with a FIT image wrapping OpenWrt's own real,
+already-built AArch64 kernel+DTB for this device. Everything else in
+the flash image - env, appsbl itself, the `ubi_rootfs` volume, all
+other partitions - is left completely untouched.
 
 Mechanics (see the script's own docstring and comments for the full
 detail, this is the summary):
@@ -1835,15 +1842,47 @@ detail, this is the summary):
   algorithm - `crc = zlib.crc32(data) ^ 0xFFFFFFFF`, confirmed against
   real on-flash CRCs before trusting it) - no `ubireader`/`mtd-utils`
   reading tools were available, only `ubinize`/`mkfs.ubifs` (building
-  tools). The real vendor kernel volume's 30 already-used LEBs are
-  reused directly; OpenWrt's kernel is larger (44 LEBs needed), so the
-  extra LEBs are taken from confirmed-free PEBs elsewhere in the same
-  partition (real UBI doesn't require a volume's LEBs to be physically
-  contiguous - each LEB's own VID header carries its `lnum`, scanned
-  independently at attach time) - the `ubi_rootfs` volume's own PEBs
-  are never touched.
+  tools). The real vendor kernel volume's already-used LEBs are reused
+  directly; extra LEBs (OpenWrt's kernel needs many more - see below)
+  are taken from confirmed-free PEBs elsewhere in the same partition
+  (real UBI doesn't require a volume's LEBs to be physically contiguous
+  - each LEB's own VID header carries its `lnum`, scanned independently
+  at attach time) - the `ubi_rootfs` volume's own PEBs are never
+  touched.
 - `mkimage`/`dumpimage` (`apt install u-boot-tools`, or OpenWrt's own
   `staging_dir/host/bin` copies) build/inspect the FIT itself.
+
+Two more real mistakes were made (and fixed) getting from "the handoff
+fires" to "a real system actually boots", both caught by just running
+the result and reading what it did instead of assuming success from
+"it verified and jumped":
+
+1. **Wrong source kernel.** The first version pulled the `kernel-1`
+   image out of OpenWrt's `...-squashfs-factory.ubi`'s own `kernel`
+   volume - a real, correctly-built FIT, but built to be paired with a
+   *separate* `ubi_rootfs` UBI volume this script never populates. That
+   boots and hands off fine, but then hangs forever at `Waiting for
+   root device /dev/ubiblock0_1...` - not a handoff bug, just the wrong
+   artifact for a "does the handoff work" test. Fixed by using OpenWrt's
+   own `...-initramfs-uImage.itb` instead - a complete FIT (not
+   extracted from a UBI volume, used directly) with the **rootfs
+   embedded in the kernel Image itself**, needing nothing else - the
+   same self-contained property the isolated `--aarch64-openwrt` test
+   path (section 28) already relies on.
+2. **Volume table left stale.** The initramfs kernel is ~16.6MB
+   (gzip) vs. the original 3.7MB kernel, needing ~132 LEBs instead of
+   the original 30 - comfortably fits in the partition's ~147 free
+   PEBs, but the volume table's `reserved_pebs` field for the `kernel`
+   volume was left at its old value (`50`) after only writing the
+   extra LEBs' EC/VID headers. appsbl's own mini-UBI reader
+   cross-checks each volume's VID headers (`used_ebs`) against the
+   volume table's `reserved_pebs` and rejects the *entire* UBI image
+   ("`UBI init error 22`", then "`empty MTD device detected`", "
+   `Volume kernel not found!`", falling back to HTTP recovery mode) if
+   they disagree. Fixed: `patch_vtbl_reserved_pebs()` updates both
+   redundant copies of the volume table record for the `kernel` volume
+   (recomputing that record's own CRC) to match the real new LEB count,
+   every time the script runs.
 
 Regenerate with `python3 tools/build_full_firmware_openwrt.py`, then
 `MR80X_NAND_IMAGE=images/full_firmware_openwrt.bin ./run.sh` (or
@@ -1912,9 +1951,12 @@ Regenerate with `python3 tools/build_full_firmware_openwrt.py`, then
   doesn't drive correctly yet. Cosmetic for now (kernel keeps booting,
   tainted but not crashed) - worth fixing before chasing a full
   console/userspace boot via this path.
-- Reaching a confirmed interactive shell via *this* (non-bypassed) path
-  hasn't been attempted yet - section 28's own "confirm the isolated
-  test path reaches a shell" is still separately open too.
+- Reached `procd: - init -` (matching section 28's own isolated-path
+  milestone) and a second `kmodloader` pass beyond it in the longest
+  test run so far, but a confirmed *interactive shell prompt* via this
+  (non-bypassed) path hasn't been separately verified to complete -
+  section 28's own "confirm the isolated test path reaches a shell" is
+  still separately open too.
 
 ### Implementation (`board/mr80x.c` + `board/mvbar-trampoline.S`, no QEMU core source touched)
 
@@ -2155,11 +2197,10 @@ silently. Prefer this pattern over gdb for any future mixed 32/64
     `jump_kernel64()` handoff, confirmed working end to end - a real,
     modern, fully-sourced AArch64 OpenWrt kernel now boots via the
     genuine, non-bypassed appsbl boot chain (real NAND/UBI/FIT
-    loading, real SMC-mediated AArch32->AArch64 switch), using a new
-    `images/full_firmware_openwrt.bin` (built by
-    `tools/build_full_firmware_openwrt.py`) that swaps only the real
-    flash image's `kernel` UBI volume for one containing OpenWrt's own
-    real AArch64 kernel+DTB. Not yet done: a working rootfs mount /
-    interactive shell via this same path (the kernel used is an
-    initramfs build, sufficient to prove the handoff but not full
-    userspace) - see section 29's "What's deliberately NOT done yet".
+    loading, real SMC-mediated AArch32->AArch64 switch) all the way to
+    `procd: - init -`, using a new `images/full_firmware_openwrt.bin`
+    (built by `tools/build_full_firmware_openwrt.py`) that swaps only
+    the real flash image's `kernel` UBI volume for OpenWrt's own real
+    AArch64 initramfs kernel+DTB. Not yet separately confirmed: a full
+    interactive shell prompt via this same path - see section 29's
+    "What's deliberately NOT done yet".
