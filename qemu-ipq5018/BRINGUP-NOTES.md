@@ -2053,6 +2053,67 @@ after guessing at the value from source reading alone had failed
 silently. Prefer this pattern over gdb for any future mixed 32/64
 `cortex-a53` debugging on this board.
 
+## 30. GCC clock branch/PLL WARN cleanup after section 29's real boot, and a genuine (unrelated) kernel bug found past `procd: - init -`
+
+Section 29's real boot reached `procd: - init -` but with a wall of
+`WARN` traces along the way (`clk_branch_toggle`: `"<clock> status
+stuck at 'on'"`, `wait_for_pll`: `"gpll0_main failed to enable!"`) -
+the old GCC clock stub (`mr80x_gcc_ops`, originally scoped to "only what
+`uart1_clock_config()` touches", back when the old 4.4.60 kernel never
+probed real clock branches/PLLs at all) doesn't synthesize the two
+extra register conventions the modern kernel's real `clk-alpha-pll.c`/
+`clk-branch.c` drivers actually use.
+
+**Fixed** (`mr80x_gcc_read()`/`mr80x_gcc_write()`, see their own block
+comment for the full detail): CBCR branch-clock registers (bit 0
+driver-written CLK_ENABLE, bit 31 hardware-status CLK_OFF) and PLL_MODE
+alpha-PLL registers (bits 1-2 driver-written BYPASSNL/RESET_N, bits
+30-31 hardware-status ACTIVE_FLAG/LOCK_DET) now synthesize instant
+success, matching this stub's existing "no real clock tree, report done
+immediately" philosophy already used for CMD_RCGR's UPDATE bit.
+Deliberately scoped to the *specific* register offsets a real boot's
+WARN traces named (5 CBCRs: `gcc_cmn_blk_ahb_clk`/`_sys_clk`,
+`gcc_qpic_clk`/`_ahb_clk`/`_io_macro_clk`; 4 PLL_MODEs: `gpll0_main`/
+`gpll2_main`/`gpll4_main`/`ubi32_pll_main` - offsets from
+`gcc-ipq5018.c`), not a blanket rule over the whole 1MiB block - a
+blanket first attempt corrupted something else in the block, silently
+breaking the AArch64 handoff entirely (appsbl reset-looped forever,
+`Booting Linux on physical CPU` never printed once), caught by a clean
+revert/retest A-B comparison. **Also had to narrow the pre-existing
+"always clear bit 0 on read" rule** (originally meant only for
+CMD_RCGR's UPDATE bit, applied blanket before this section since it was
+"harmless" for the old kernel's much narrower register usage) to
+exclude these new CBCR/PLL_MODE offsets - bit 0 there is real,
+driver-meaningful state (CLK_ENABLE) that must read back as written;
+blanket-clearing it corrupted Linux's regmap caching (a disable's
+read-modify-write believed the bit was already clear and never
+re-issued the actual write, so the bit-31 synthesis never got a chance
+to run) - found via temporary read/write MMIO tracing on these exact
+offsets, not guessed.
+
+Verified via a real boot: zero clock-related WARNs, `procd: - init -`
+reached consistently (multiple back-to-back runs).
+
+**A separate, genuine problem found past that point - not a board
+emulation gap**: `kmodloader`'s normal boot-time module autoload
+crashes loading `vxlan.ko` - `Unable to handle kernel access to user
+memory ... vxlan_init_net+0x20`, a NULL-pointer deref (`net_generic()`
+returning NULL for `vxlan_net_id` immediately after
+`net_assign_generic()` should have just stored it) inside vanilla
+kernel/module code that never touches any of this board's emulated
+peripherals at all - reproduced identically (same PC, same fault
+address `0x40`) across every boot. Not investigated further this
+session; plausibly related to this machine's second CPU core failing
+PSCI `CPU_ON` (`psci: failed to boot CPU1 (-22)`, logged every boot -
+this board's PSCI model doesn't support bringing up a real second vCPU
+yet, unlike real hardware) changing scheduling/timing enough to expose
+a race that's otherwise masked, but that's a guess, not confirmed.
+Options for whoever continues: debug the kernel-internal race directly,
+implement real dual-CPU PSCI `CPU_ON` support and see if that alone
+changes the outcome, or rebuild the OpenWrt initramfs image without
+`vxlan.ko` (touches the OpenWrt build tree, not this project's own
+code, but ask first - out of scope for a quick fix either way).
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.

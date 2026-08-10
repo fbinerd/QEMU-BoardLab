@@ -307,13 +307,43 @@ static const MemoryRegionOps mr80x_tlmm_ops = {
 };
 
 /* ============================================================
- * GCC clock controller: only what uart1_clock_config() touches.
- * Every register just latches whatever is written; CMD_RCGR additionally
- * always reads back with UART1_CMD_RCGR_UPDATE_BIT already clear, so
- * uart1_trigger_update()'s poll loop exits immediately - on real
- * hardware this bit is cleared by the clock hardware once the mux
- * switch completes; we have no clock tree to simulate, so "instantly
- * done" is the correct-enough behavior here.
+ * GCC clock controller: originally only what uart1_clock_config() touched
+ * (the old 4.4.60 kernel never enabled interrupts, let alone probed clock
+ * branches/PLLs itself). The modern kernel's real clk-alpha-pll.c/
+ * clk-branch.c drivers do far more - two more register conventions
+ * synthesized below, found via real boot WARN traces (section 29):
+ *
+ * - CMD_RCGR (clock mux/divider "commit" registers, ~18 of them - UART,
+ *   GMAC x4, SDCC1, QPIC_IO_MACRO, USB x4, PCIe x4, same convention
+ *   throughout, not worth enumerating each by address): bit 0 (UPDATE) is
+ *   a busy/in-progress flag. Always reporting it clear on read means every
+ *   driver's "trigger update, wait for hardware to finish" loop exits on
+ *   its first read instead of spinning - fine since we have no real clock
+ *   tree to actually finish switching. Applied unconditionally to every
+ *   register in the block; harmless for non-CMD_RCGR ones too.
+ * - CBCR (branch clock control registers - clk-branch2.c's
+ *   clk_branch2_check_halt()): bit 0 (CLK_ENABLE) is driver-written; bit 31
+ *   (CLK_OFF) is a read-only hardware status bit meaning "confirmed
+ *   stopped/running" that real hardware sets shortly after bit 0 changes.
+ *   Without it, clk_branch_toggle()'s 200-iteration poll always times out
+ *   ("<clock> status stuck at 'on'" WARN, seen for four specific clocks
+ *   with a real modern-kernel boot - see mr80x_gcc_is_known_cbcr() for
+ *   which ones and why this is a short, explicit list rather than a
+ *   blanket rule over the whole block: a blanket version of this exact
+ *   fix corrupted some unrelated register's data bits and silently broke
+ *   the AArch64 handoff (appsbl reset-looped forever, kernel never printed
+ *   anything). Synthesized as the logical complement of bit 0 on write, for
+ *   those specific offsets only.
+ * - PLL_MODE (clk-alpha-pll.c's wait_for_pll(), one per alpha PLL - only
+ *   four exist in this whole SoC's gcc-ipq5018.c: gpll0_main/gpll2_main/
+ *   gpll4_main/ubi32_pll_main, at fixed offsets 0x0 within each PLL's own
+ *   block): the enable sequence sets PLL_BYPASSNL (bit 1) and PLL_RESET_N
+ *   (bit 2) together; hardware is expected to then report PLL_ACTIVE_FLAG
+ *   (bit 30) and PLL_LOCK_DET (bit 31) set ("<pll> failed to enable!" WARN
+ *   otherwise, seen for gpll0_main with a real modern-kernel boot).
+ *   Handled at these four specific offsets *instead of* the generic CBCR
+ *   rule above, since bit 31 means the opposite thing here (1 = locked/
+ *   running, not 1 = stopped).
  * ============================================================ */
 
 typedef struct MR80XGccState {
@@ -321,24 +351,68 @@ typedef struct MR80XGccState {
     uint32_t regs[MR80X_GCC_SIZE / 4];
 } MR80XGccState;
 
+#define MR80X_GCC_PLL_MODE_GPLL0  0x21000
+#define MR80X_GCC_PLL_MODE_GPLL4  0x24000
+#define MR80X_GCC_PLL_MODE_UBI32  0x25000
+#define MR80X_GCC_PLL_MODE_GPLL2  0x4a000
+#define MR80X_GCC_PLL_BYPASSNL   (1u << 1)
+#define MR80X_GCC_PLL_RESET_N    (1u << 2)
+#define MR80X_GCC_PLL_ACTIVE_FLAG (1u << 30)
+#define MR80X_GCC_PLL_LOCK_DET    (1u << 31)
+#define MR80X_GCC_CBCR_CLK_ENABLE (1u << 0)
+#define MR80X_GCC_CBCR_CLK_OFF    (1u << 31)
+
+static bool mr80x_gcc_is_pll_mode(hwaddr offset)
+{
+    return offset == MR80X_GCC_PLL_MODE_GPLL0 ||
+           offset == MR80X_GCC_PLL_MODE_GPLL4 ||
+           offset == MR80X_GCC_PLL_MODE_UBI32 ||
+           offset == MR80X_GCC_PLL_MODE_GPLL2;
+}
+
+/* Only these four CBCR registers are handled - the exact ones a real boot
+ * empirically hit "<clock> status stuck at 'on'" WARNs for (see the block
+ * comment above). Deliberately *not* a blanket rule over every register in
+ * this 1MiB, semantically-heterogeneous block: an earlier version of this
+ * fix applied the bit0->bit31 synthesis to every non-PLL_MODE write
+ * unconditionally, which corrupted some *other* register appsbl or the
+ * kernel depends on for actual data (not a CBCR enable bit at all) and
+ * broke the AArch64 handoff - the kernel stopped printing anything at all
+ * before its first console output, and appsbl's watchdog kept resetting
+ * back to the U-Boot banner in a loop. Confirmed via a clean revert/retest
+ * that this blanket version was the cause. Extend this list empirically
+ * (another real boot's WARN trace) if more CBCRs need it, same as
+ * MR80X_GCC_PLL_MODE_* above - don't go back to a blanket rule. */
+static bool mr80x_gcc_is_known_cbcr(hwaddr offset)
+{
+    return offset == 0x56308 || /* gcc_cmn_blk_ahb_clk */
+           offset == 0x5630c || /* gcc_cmn_blk_sys_clk */
+           offset == 0x57020 || /* gcc_qpic_clk */
+           offset == 0x57024 || /* gcc_qpic_ahb_clk */
+           offset == 0x5701c;   /* gcc_qpic_io_macro_clk */
+}
+
 static uint64_t mr80x_gcc_read(void *opaque, hwaddr offset, unsigned size)
 {
     MR80XGccState *s = opaque;
     uint32_t val = s->regs[offset / 4];
 
-    /* Bit 0 (UPDATE) is the busy/in-progress flag every *_CMD_RCGR
-     * register in this whole GCC block uses (ipq5018.h has ~18 of
-     * them - UART, GMAC x4, SDCC1, QPIC_IO_MACRO, USB x4, PCIe x4 -
-     * same convention throughout, not worth enumerating each one by
-     * address). Always reporting it clear means every driver's
-     * "trigger update, wait for hardware to finish" loop (e.g.
-     * uart1_trigger_update(), the GMAC clock equivalent) exits on its
-     * first read instead of spinning - fine since we have no real
-     * clock tree to actually finish switching. Registers that aren't
-     * a CMD_RCGR don't have driver code that depends on their bit 0
-     * meaning "busy", so clearing it unconditionally is harmless for
-     * them too. */
-    val &= ~UART1_CMD_RCGR_UPDATE_BIT;
+    /* Only for genuine CMD_RCGR registers (bit 0 = UPDATE, a busy flag) -
+     * NOT for the known CBCR/PLL_MODE registers handled specially in
+     * mr80x_gcc_write(), where bit 0 is real, driver-meaningful state
+     * (CLK_ENABLE) that must read back as written. Blanket-clearing it
+     * there broke Linux's regmap caching: since the read-back "enable"
+     * bit always looked already-clear, a later disable's read-modify-
+     * write saw no change needed and never re-issued the actual write -
+     * so the bit31 (CLK_OFF) synthesis in mr80x_gcc_write() never got a
+     * chance to run for the disable transition, and clk_branch_wait()'s
+     * poll timed out every time ("<clock> status stuck at 'on'" WARN,
+     * confirmed via read/write MMIO tracing on a real boot - see
+     * BRINGUP-NOTES.md section 29). */
+    if (!mr80x_gcc_is_pll_mode(offset) && !mr80x_gcc_is_known_cbcr(offset)) {
+        val &= ~UART1_CMD_RCGR_UPDATE_BIT;
+    }
+
     return val;
 }
 
@@ -346,7 +420,24 @@ static void mr80x_gcc_write(void *opaque, hwaddr offset, uint64_t value,
                              unsigned size)
 {
     MR80XGccState *s = opaque;
-    s->regs[offset / 4] = (uint32_t)value;
+    uint32_t v = (uint32_t)value;
+
+    if (mr80x_gcc_is_pll_mode(offset)) {
+        if ((v & (MR80X_GCC_PLL_BYPASSNL | MR80X_GCC_PLL_RESET_N)) ==
+            (MR80X_GCC_PLL_BYPASSNL | MR80X_GCC_PLL_RESET_N)) {
+            v |= MR80X_GCC_PLL_ACTIVE_FLAG | MR80X_GCC_PLL_LOCK_DET;
+        } else if (!(v & MR80X_GCC_PLL_RESET_N)) {
+            v &= ~(MR80X_GCC_PLL_ACTIVE_FLAG | MR80X_GCC_PLL_LOCK_DET);
+        }
+    } else if (mr80x_gcc_is_known_cbcr(offset)) {
+        if (v & MR80X_GCC_CBCR_CLK_ENABLE) {
+            v &= ~MR80X_GCC_CBCR_CLK_OFF;
+        } else {
+            v |= MR80X_GCC_CBCR_CLK_OFF;
+        }
+    }
+
+    s->regs[offset / 4] = v;
 }
 
 static const MemoryRegionOps mr80x_gcc_ops = {
