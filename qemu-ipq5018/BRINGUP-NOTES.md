@@ -2358,15 +2358,25 @@ not just reaching `procd: - init -` and dying moments later.
     correct UBI-image construction. Confirms the initramfs recovery
     image (section 32's still-open console mystery) remains the only
     currently-viable path to a running userspace at all.
-32. **Still open** (section 34): the missing console prompt. GDB
-    struct introspection is confirmed permanently unavailable for this
-    exact kernel build (`CONFIG_DEBUG_INFO_REDUCED=y`, not a tooling
-    mistake). Bypassing all of OpenWrt's own init logic
-    (`rdinit=/bin/sh`, bare BusyBox `ash` as PID 1) still shows zero
-    interactivity and zero command output, ruling out `askfirst`/
-    `procd`/musl-stdio-buffering specifically as the cause and pointing
-    further upstream - genuinely unresolved, needs a custom minimal
-    test-init binary to narrow further (not attempted).
+32. [done] MILESTONE (section 35): missing console prompt fixed. The
+    section 34 `rdinit=/bin/sh` dead end had already proven RX bytes
+    were suspect; UART tracing then showed the opposite: the kernel was
+    receiving and draining RX perfectly. The missing piece was the
+    *TX* side used by normal TTY/userspace output: `printk`/console
+    polling wrote directly, but shell echo/banner/output waits for the
+    `msm_serial` driver's interrupt-driven TX path, which needs
+    `TXLEV` in `MISR` when `IMR.TXLEV` is enabled. Modeling IMR/MISR
+    plus `TXLEV`, and fixing `NCF_TX` reads so they no longer alias to
+    RX FIFO, makes both `rdinit=/bin/sh` and the normal OpenWrt
+    initramfs image fully interactive. Verified with `echo TXLEV_OK
+    && uname -a` under rdinit and with the normal image opening
+    `root@OpenWrt:~#`.
+33. **Next, still open**: the remaining major hardware gaps are now
+    the already-triaged runtime peripherals, especially Linux
+    `qcom_snand`'s DMA-engine protocol (needed for any non-initramfs
+    rootfs), MDIO/GMAC clocking/PHY details, and WiFi remoteproc/ath11k
+    firmware loading. The real APPSBL -> UBI FIT -> AArch64 OpenWrt
+    initramfs path is interactive.
 
 ## 31. Two more real probe fixes, and triaging what's left after `procd: - init -`
 
@@ -2724,11 +2734,110 @@ independently verified correct via direct register-level tracing), or
 `ash` is blocked before ever reaching its read loop for a reason
 unrelated to procd/`askfirst` entirely.
 
-**Not yet done, and the natural next step if this gets picked back
-up**: this last test still can't fully distinguish "kernel tty layer
-problem" from "this one busybox binary's own startup path" without a
-custom, deliberately trivial init binary (e.g. a tiny statically-
-linked program that does nothing but `write()` a fixed banner and
-`read()`+echo bytes in a loop, no libc stdio, no termios/session-
-leader setup at all) spliced into the initramfs - meaningfully more
-engineering than a quick test, not attempted yet.
+**Superseded by section 35**: this "need a custom minimal init binary"
+conclusion was too pessimistic. Direct UART tracing later proved RX was
+already fine all the way through the kernel handler; the missing
+piece was TXLEV interrupt modeling for userspace/TTY output.
+
+## 35. MILESTONE: userspace console fixed - RX was fine, TXLEV was the missing half of the UARTDM interrupt model
+
+Claude's section 34 left a precise but still confusing data point:
+`rdinit=/bin/sh` definitely executed (`Run /bin/sh as init process`),
+but no prompt, no echo, and no command output ever appeared. The first
+important retest reproduced that exactly with:
+
+```sh
+cd /media/dados_2tb/opw/arm-selfmod-lab/qemu-ipq5018
+./run.sh --no-net --nand-image images/full_firmware_openwrt_rdinitsh.bin
+```
+
+Sending `echo HELLO_RDINIT` produced no output before this section's
+fix.
+
+The useful breakthrough came from a temporary opt-in UART trace
+(`MR80X_TRACE_UART=1`): input sent after `Run /bin/sh as init process`
+arrived at the QEMU chardev callback, raised the UART IRQ, made the
+Linux `msm_serial` interrupt handler read `MISR=RXSTALE`, read
+`RX_TOTAL_SNAP`, and drain every byte from `UARTDM_RF` in packed
+32-bit words. In other words, section 32's RX packing fix was correct:
+userspace silence was **not** because bytes failed to enter the
+kernel.
+
+The actual missing half was TX interrupt modeling. Kernel `printk`
+and the serial console's polling path can write directly to TF, so
+dmesg looked healthy even without it. Normal TTY/userspace output is
+different: line discipline echo, shell banners, prompts, and command
+output are drained by `msm_serial`'s interrupt-driven TX path. That
+path sets `IMR.TXLEV` and expects a UART interrupt whose `MISR`
+contains `TXLEV`; without it the output stays queued forever. This is
+why the emulator could show kernel logs while a real shell appeared
+mute.
+
+Fix implemented in `board/mr80x.c`:
+
+- track the UART interrupt mask register (`IMR`) instead of ignoring
+  writes to `0x14`;
+- return masked RXSTALE/RXLEV/TXLEV bits from `MISR` (`0x10`);
+- raise/lower the QEMU GIC line from the same masked pending condition
+  the Linux driver expects;
+- return `ISR_TX_READY` for read-side `ISR` (`0x14`);
+- stop treating `UARTDM_NCF_TX` reads (`0x40`) as receive-FIFO reads
+  - Linux reads NCF_TX back as an ordering barrier in
+  `msm_reset_dm_count()`, and the old alias produced confusing
+  zero-byte RF pops during TX setup;
+- keep `MR80X_TRACE_UART=1` as an opt-in diagnostic for future UART
+  regressions.
+
+Verified after rebuilding `mr80x-qemu:9.1.0`:
+
+1. `rdinit=/bin/sh` now opens a real shell:
+
+   ```text
+   Run /bin/sh as init process
+   BusyBox v1.38.0 (...) built-in shell (ash)
+   /bin/sh: can't access tty; job control turned off
+   ~ #
+   ```
+
+   Command round-trip:
+
+   ```text
+   echo TXLEV_OK && uname -a
+   TXLEV_OK
+   Linux (none) 6.12.94 #0 SMP Fri Aug  7 20:47:44 2026 aarch64 GNU/Linux
+   ```
+
+2. The normal initramfs image now reaches the OpenWrt shell over the
+   real APPSBL -> NAND/UBI/FIT -> AArch64 handoff path:
+
+   ```sh
+   ./run.sh --no-net --nand-image images/full_firmware_openwrt.bin
+   ```
+
+   Relevant console proof:
+
+   ```text
+   init: Console is alive
+   Press the [f] key and hit [enter] to enter failsafe mode
+   ...
+   BusyBox v1.38.0 (...) built-in shell (ash)
+   OpenWrt SNAPSHOT, r35461-10f736806d
+   root@OpenWrt:~#
+   ```
+
+   Command round-trip:
+
+   ```text
+   uname -a; cat /proc/cmdline
+   Linux OpenWrt 6.12.94 #0 SMP Fri Aug  7 20:47:44 2026 aarch64 GNU/Linux
+   ubi.mtd=rootfs root=mtd:ubi_rootfs rootfstype=squashfs rootwait root=/dev/ubiblock0_1 coherent_pool=2M module_blacklist=vxlan,x_tables,nfnetlink,nf_nat,nf_tables,nf_conntrack,ppp_generic
+   ```
+
+Remaining noisy boot errors after this point are no longer console
+blockers. The important ones are the previously-triaged runtime
+hardware gaps: Linux `qcom_snand` still fails (`-110`) and blocks any
+non-initramfs rootfs; MDIO/GMAC still needs better clock/PHY modeling;
+WiFi remoteproc/ath11k still needs major firmware/coprocessor work;
+and the current OpenWrt build tree still has stale/incompatible module
+artifacts producing many `Unknown symbol` messages. The milestone here
+is narrower but important: the real boot chain is now interactive.

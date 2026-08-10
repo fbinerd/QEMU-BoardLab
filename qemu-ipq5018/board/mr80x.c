@@ -45,6 +45,7 @@
 #include "net/net.h"
 #include "hw/qdev-properties.h"
 #include "hw/intc/arm_gic.h"
+#include "hw/irq.h"
 #include "target/arm/gtimer.h"
 
 /* ---- memory map (appsbl/CLEAN_ROOM_STATUS.md, ipq5018.h) ---- */
@@ -198,7 +199,10 @@
 #define UART_SR_RXRDY  (1 << 0)
 #define UART_SR_TXRDY  (1 << 2)
 #define UART_SR_TXEMT  (1 << 3)
+#define UART_MISR_TXLEV   (1 << 0)
 #define UART_MISR_RXSTALE (1 << 3)
+#define UART_MISR_RXLEV   (1 << 4)
+#define UART_ISR_TX_READY (1 << 7)
 
 /* qca_uart.c's ipq_serial_pending() (what tstc()/getc() actually call,
  * not a simple UART_SR/RXRDY check as originally assumed here) goes
@@ -1354,17 +1358,15 @@ typedef struct MR80XUartState {
     uint8_t rx_buf[UART_RX_BUF_SIZE];
     unsigned rx_head, rx_tail;
     bool tx_eol_pending;
+    uint32_t imr;
     uint32_t nchar_remaining;
-    /* Only used by the *kernel*'s msm_serial driver (section 25) -
-     * u-boot's own qca_uart.c never enables interrupts, it's a pure
-     * polling loop, so this stayed NULL/unused for this whole
-     * project until the GIC existed at all. Best-effort: raised
-     * whenever RX data is pending, matching the same "is there a
-     * byte waiting" condition UART_MISR/RXSTALE already reports for
-     * u-boot's tstc() (see that comment) - the exact IMR-masking/ack
-     * semantics msm_serial.c expects aren't independently confirmed
-     * (no kernel source here to grep, unlike appsbl), so this covers
-     * the RX-has-data case specifically, not a full interrupt model. */
+    bool trace;
+    /*
+     * Only used by the *kernel*'s msm_serial driver. U-Boot's own
+     * qca_uart.c is a pure polling loop and never enables IRQs. Linux
+     * needs the masked UARTDM interrupt behavior: RXSTALE/RXLEV for
+     * input and TXLEV for normal TTY/userspace output (section 35).
+     */
     qemu_irq irq;
 } MR80XUartState;
 
@@ -1380,8 +1382,20 @@ static unsigned mr80x_uart_rx_count(MR80XUartState *s)
 
 static void mr80x_uart_update_irq(MR80XUartState *s)
 {
+    bool pending = false;
+    uint32_t rx_pending = mr80x_uart_rx_empty(s) ? 0 :
+        (UART_MISR_RXSTALE | UART_MISR_RXLEV);
+
+    if ((s->imr & rx_pending) || (s->imr & UART_MISR_TXLEV)) {
+        pending = true;
+    }
+
+    if (s->trace) {
+        fprintf(stderr, "mr80x-uart: irq=%d rx_count=%u\n",
+                pending, mr80x_uart_rx_count(s));
+    }
     if (s->irq) {
-        qemu_set_irq(s->irq, !mr80x_uart_rx_empty(s));
+        qemu_set_irq(s->irq, pending);
     }
 }
 
@@ -1395,22 +1409,51 @@ static uint64_t mr80x_uart_read(void *opaque, hwaddr offset, unsigned size)
         if (!mr80x_uart_rx_empty(s)) {
             sr |= UART_SR_RXRDY;
         }
+        if (s->trace) {
+            fprintf(stderr, "mr80x-uart: read SR -> 0x%08x\n", sr);
+        }
         return sr;
     }
     case UART_ISR:
-        /* IMR/ISR alias; report nothing pending beyond what SR covers -
-         * qca_uart.c only polls specific bits it needs (TX_READY on the
-         * TX path via a different helper not wired yet, stale-RX events
-         * for RX) - revisit if boot gets stuck polling this. */
-        return 0;
+        /*
+         * The register at +0x14 is write-side IMR and read-side ISR in
+         * Qualcomm's UARTDM block. Linux mostly reads MISR below, but
+         * msm_wait_for_xmitr() can look at ISR_TX_READY if TX_EMPTY were
+         * not set. TX is always immediately ready in this model.
+         */
+        return UART_ISR_TX_READY;
     case UART_MISR:
         /* See the RX-detection comment above UART_MISR_RXSTALE's
          * #define - this, not UART_SR/RXRDY, is what tstc()/getc()
          * actually poll to decide "is there a byte waiting". */
-        return mr80x_uart_rx_empty(s) ? 0 : UART_MISR_RXSTALE;
+    {
+        uint32_t misr = 0;
+        if (!mr80x_uart_rx_empty(s)) {
+            misr |= UART_MISR_RXSTALE | UART_MISR_RXLEV;
+        }
+        if (s->imr & UART_MISR_TXLEV) {
+            misr |= UART_MISR_TXLEV;
+        }
+        misr &= s->imr;
+        if (s->trace) {
+            fprintf(stderr, "mr80x-uart: read MISR -> 0x%08x\n", misr);
+        }
+        return misr;
+    }
     case UART_RX_TOTAL_SNAP:
+        if (s->trace) {
+            fprintf(stderr, "mr80x-uart: read RX_TOTAL_SNAP -> %u\n",
+                    mr80x_uart_rx_count(s));
+        }
         return mr80x_uart_rx_count(s);
-    case UART_NCHAR + 0x00:
+    case UART_NCHAR:
+        /*
+         * Linux's msm_reset_dm_count() writes NCF_TX and immediately
+         * reads it back as an ordering barrier. This register is not the
+         * receive FIFO; treating the read as RF used to create confusing
+         * zero-byte FIFO pops during normal TX setup.
+         */
+        return s->nchar_remaining;
     case UART_TF0:
     case UART_TF0 + 4:
     case UART_TF0 + 8:
@@ -1442,6 +1485,10 @@ static uint64_t mr80x_uart_read(void *opaque, hwaddr offset, unsigned size)
             word |= (uint32_t)s->rx_buf[s->rx_tail] << (n * 8);
             s->rx_tail = (s->rx_tail + 1) % UART_RX_BUF_SIZE;
             n++;
+        }
+        if (s->trace) {
+            fprintf(stderr, "mr80x-uart: read RF word=0x%08x bytes=%u remain=%u\n",
+                    word, n, mr80x_uart_rx_count(s));
         }
         mr80x_uart_update_irq(s);
         return word;
@@ -1778,6 +1825,23 @@ static void mr80x_uart_write(void *opaque, hwaddr offset, uint64_t value,
     MR80XUartState *s = opaque;
 
     switch (offset) {
+    case UART_CR:
+        if (s->trace) {
+            fprintf(stderr, "mr80x-uart: write CR=0x%08" PRIx64 "\n", value);
+        }
+        return;
+    case UART_IMR:
+        s->imr = (uint32_t)value;
+        if (s->trace) {
+            fprintf(stderr, "mr80x-uart: write IMR=0x%08" PRIx64 "\n", value);
+        }
+        mr80x_uart_update_irq(s);
+        return;
+    case UART_DMRX:
+        if (s->trace) {
+            fprintf(stderr, "mr80x-uart: write DMRX=0x%08" PRIx64 "\n", value);
+        }
+        return;
     case UART_NCHAR:
         /* NO_CHARS_FOR_TX - real hardware requires this written before
          * each TF push, giving the byte count that write (or run of
@@ -1793,6 +1857,10 @@ static void mr80x_uart_write(void *opaque, hwaddr offset, uint64_t value,
          * dmesg output that still *looked* superficially like output
          * was happening, which is what actually surfaced the bug. */
         s->nchar_remaining = (uint32_t)value;
+        if (s->trace) {
+            fprintf(stderr, "mr80x-uart: write NCHAR=%u\n",
+                    s->nchar_remaining);
+        }
         return;
     case UART_TF0:
     case UART_TF0 + 4:
@@ -1809,9 +1877,14 @@ static void mr80x_uart_write(void *opaque, hwaddr offset, uint64_t value,
         for (unsigned i = 0; i < n; i++) {
             mr80x_uart_putc(s, (uint8_t)(value >> (i * 8)));
         }
+        if (s->trace) {
+            fprintf(stderr, "mr80x-uart: write TF=0x%08" PRIx64 " bytes=%u\n",
+                    value, n);
+        }
         if (s->nchar_remaining) {
             s->nchar_remaining -= n;
         }
+        mr80x_uart_update_irq(s);
         return;
     }
     case UART_SR:
@@ -1833,6 +1906,13 @@ static const MemoryRegionOps mr80x_uart_ops = {
 static void mr80x_uart_rx(void *opaque, const uint8_t *buf, int size)
 {
     MR80XUartState *s = opaque;
+    if (s->trace) {
+        fprintf(stderr, "mr80x-uart: chardev rx size=%d", size);
+        for (int i = 0; i < size; i++) {
+            fprintf(stderr, " %02x", buf[i]);
+        }
+        fprintf(stderr, "\n");
+    }
     for (int i = 0; i < size; i++) {
         unsigned next = (s->rx_head + 1) % UART_RX_BUF_SIZE;
         if (next == s->rx_tail) {
@@ -3122,6 +3202,7 @@ peripherals:
 
     /* UART */
     MR80XUartState *uart = g_new0(MR80XUartState, 1);
+    uart->trace = getenv("MR80X_TRACE_UART") != NULL;
     memory_region_init_io(&uart->iomem, NULL, &mr80x_uart_ops, uart,
                            "mr80x.uart", MR80X_UART_SIZE);
     memory_region_add_subregion(sysmem, MR80X_UART_BASE, &uart->iomem);
