@@ -1128,6 +1128,50 @@ static const MemoryRegionOps mr80x_bam_ops = {
 };
 
 /* ============================================================
+ * Generic "probe-only" BAM stub - for the modern kernel's other BAM
+ * instances (crypto@704000, spi/i2c@7884000) that the old 4.4.60
+ * kernel never touched, so this board never needed to model them at
+ * all. Just enough for drivers/dma/qcom/bam_dma.c's own probe() to
+ * succeed (same BAM_REVISION/NUM_PIPES trick as the real QPIC BAM
+ * above, see mr80x_bam_reset()) - no cmd/descriptor pipe processing,
+ * so crypto/spi/i2c DMA transfers themselves won't actually work, but
+ * at least their driver probes stop failing outright
+ * ("bam-dma-engine ...: probe with driver bam-dma-engine failed with
+ * error -22", seen with a real modern-kernel boot - BRINGUP-NOTES.md
+ * section 30). Extend this into a real MR80XBamState (like the QPIC
+ * one) if actual crypto/spi/i2c DMA is ever needed. */
+static uint64_t mr80x_bam_stub_read(void *opaque, hwaddr offset,
+                                     unsigned size)
+{
+    if (offset == BAM_REVISION_OFF) {
+        /* num_ees (bits [11:8], NUM_EES_SHIFT/MASK in bam_dma.c) needs
+         * to exceed every instance's own DT "qcom,ee" index -
+         * bam_init() hard-fails (-EINVAL) otherwise. The crypto
+         * instance's DT node has "qcom,ee = <1>;" - 1 (matching the
+         * real QPIC BAM's fake num_ees=1 above) isn't enough here;
+         * 8 comfortably covers every instance sharing this stub. */
+        return 8u << 8;
+    }
+    if (offset == BAM_NUM_PIPES_OFF) {
+        return MR80X_BAM_NUM_PIPES;
+    }
+    return 0;
+}
+
+static void mr80x_bam_stub_write(void *opaque, hwaddr offset, uint64_t value,
+                                  unsigned size)
+{
+}
+
+static const MemoryRegionOps mr80x_bam_stub_ops = {
+    .read = mr80x_bam_stub_read,
+    .write = mr80x_bam_stub_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 8 },
+};
+
+/* ============================================================
  * IPQ5018 MDIO controller (drivers/net/ipq5018/ipq5018_mdio.c/.h) -
  * base 0x88000 (this is what the boot log's "Invalid read/write at
  * addr 0x88040/0x88044/0x88050" was: MDIO_CTRL_0/1/4_REG unmapped).
@@ -3069,6 +3113,20 @@ peripherals:
         memory_region_init_io(&bam->iomem, NULL, &mr80x_bam_ops, bam,
                                "mr80x.bam", MR80X_BAM_SIZE);
         memory_region_add_subregion(sysmem, MR80X_BAM_BASE, &bam->iomem);
+    }
+    /* Generic probe-only BAM stubs - see the comment above
+     * mr80x_bam_stub_ops. Sizes match each instance's real DT reg
+     * size (crypto@704000: 0x20000, spi/i2c@7884000: 0x1d000). */
+    {
+        MemoryRegion *bam_crypto = g_new0(MemoryRegion, 1);
+        memory_region_init_io(bam_crypto, NULL, &mr80x_bam_stub_ops, NULL,
+                               "mr80x.bam-stub-crypto", 0x20000);
+        memory_region_add_subregion(sysmem, 0x00704000, bam_crypto);
+
+        MemoryRegion *bam_spi = g_new0(MemoryRegion, 1);
+        memory_region_init_io(bam_spi, NULL, &mr80x_bam_stub_ops, NULL,
+                               "mr80x.bam-stub-spi", 0x1d000);
+        memory_region_add_subregion(sysmem, 0x07884000, bam_spi);
     }
     mr80x_add_unimp_region(sysmem, "mr80x.unimp-gmac2-0x39D00000",
                             0x39D00000, 1 * MiB);
