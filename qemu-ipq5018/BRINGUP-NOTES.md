@@ -2861,6 +2861,8 @@ Status values used below:
 
 - **open**: still visible in this log and needs work;
 - **triaged**: understood, but not the next emulation blocker;
+- **partial**: one layer of the logged failure is fixed, but the same
+  subsystem still has a later blocker;
 - **data/build**: likely caused by the firmware/rootfs contents or
   OpenWrt build artifacts rather than by the emulated SoC itself;
 - **fixed**: corrected in this branch and should disappear from later
@@ -2876,7 +2878,7 @@ Status values used below:
 | E36-06 | open | `psci: failed to boot CPU1 (-22)`; `CPU1: failed to boot: -22` | Emulator boots single-core even though the DT/kernel expects SMP. | Implement enough PSCI CPU_ON handling / secondary CPU release for IPQ5018 AArch64 SMP, or patch DT to one CPU until SMP is modeled. |
 | E36-07 | open | `qcom-smem 4ab00000.smem: SMEM is not initialized by SBL`; probe `error -22` | Linux cannot consume Qualcomm SMEM metadata. | U-Boot tolerated our current minimal handoff, but Linux wants a valid SMEM table/header. Build a Linux-compatible fake SMEM region from vendor/OpenWrt expectations. |
 | E36-08 | triaged | `qcom_scm firmware:scm: failed to set download mode: -1` | Usually non-fatal, but the SCM emulation is incomplete. | Implement/accept the specific SCM call used for download-mode disable so Linux stops warning. Lower priority than NAND/MDIO. |
-| E36-09 | open | `qcom_snand 79b0000.spi: failure in submitting spi init descriptor`; `bam-dma-engine ... Cannot free busy channel`; probe `error -110` | Biggest runtime storage blocker: Linux cannot attach the serial NAND, so a non-initramfs rootfs will not mount from real flash. | U-Boot NAND works, but Linux `qcom_snand` uses the DMA-engine/BAM path differently. Need model the Linux BAM descriptor flow, not only the U-Boot transaction path. |
+| E36-09 | partial | original log: `qcom_snand 79b0000.spi: failure in submitting spi init descriptor`; `bam-dma-engine ... Cannot free busy channel`; probe `error -110`; after section 37: `spi-nand spi0.0: unknown raw ID 0000000000` on Linux 6.12, and `nand: second ID read did not match 00,00 against c8,c1` on vendor Linux 4.4.60 | Biggest runtime storage blocker: Linux still cannot attach the serial NAND, so a non-initramfs rootfs will not mount from real flash. | The DMA completion/timeout layer is fixed by section 37. The next blocker is emulating the Linux driver's repeated JEDEC/ID-read command sequence correctly; ID data currently turns into zeroes after the controller transaction completes. |
 | E36-10 | open | `ipq4019-mdio 88000.mdio ... error -22`; `ipq4019-mdio 90000.mdio ... error -22` | Ethernet PHY discovery in Linux cannot start. | Likely clock/reset/MDIO register model gap. Audit OpenWrt DTS clock/reset requirements and QEMU MDIO/GMAC implementation. |
 | E36-11 | open | `ipq5018-gmac-dwmac ... IRQ eth_wake_irq not found`; `IRQ sfty not found`; deferred probe: `failed to parse stmmac dt parameters` | Linux GMAC does not probe. | Some IRQ names and/or stmmac DT parameters are missing in the effective DT, plus MDIO is already failing. Fix DT + clock/reset + MDIO together. |
 | E36-12 | open | `genirq: Setting trigger mode 1 for irq 24 failed`; `qcom-q6-mpd ... failed to acquire wdog IRQ`; remoteproc probe `error -22` | WiFi remoteproc cannot start. | Need valid WCSS/Q6 watchdog IRQ wiring and a broader remoteproc/firmware-loading model. Not required for NAND/rootfs, but required for "100%" hardware emulation. |
@@ -2906,3 +2908,79 @@ Priority order from this log:
    hardware fidelity.
 5. **E36-15 / E36-20 / E36-21: OpenWrt module ABI cleanup** - useful
    for a clean log, but separate from QEMU hardware modeling.
+
+## 37. Partial fix for E36-09: Linux BAM DMA descriptors now complete; next NAND blocker is ID-read data
+
+The first pass at E36-09 found a concrete mismatch between the QEMU BAM
+model and Linux's `drivers/dma/qcom/bam_dma.c`. The existing model was
+good enough for APPSBL/U-Boot's polling-style BAM use, but Linux's
+interrupt-driven DMA engine does one extra accounting step:
+
+1. software appends hardware descriptors to the BAM FIFO;
+2. software writes the new FIFO tail to `BAM_P_EVNT_REG`;
+3. the BAM IRQ fires;
+4. `process_channel_irqs()` reads `BAM_P_SW_OFSTS`, divides it by
+   `sizeof(struct bam_desc_hw)`, and uses that as the hardware-consumed
+   descriptor offset.
+
+Before this section, the emulated BAM raised per-pipe processed-descriptor
+status but left `BAM_P_SW_OFSTS` at zero and pulsed the IRQ line
+immediately high/low. That is enough for U-Boot's direct polling path,
+but it makes the Linux DMA engine see no consumed descriptors, so the
+QPIC transaction never completes. The symptom in the OpenWrt 6.12 log was:
+
+```text
+qcom_snand 79b0000.spi: failure in submitting spi init descriptor
+bam-dma-engine 7984000.dma-controller: Cannot free busy channel
+qcom_snand 79b0000.spi: probe with driver qcom_snand failed with error -110
+```
+
+Fix implemented in `board/mr80x.c`:
+
+- keep the BAM IRQ line level-high while any pipe has pending
+  `irq_stts`, and lower it only when the guest clears `BAM_P_IRQ_CLR`;
+- update the emulated `BAM_P_SW_OFSTS` register to the processed FIFO
+  offset whenever the command, data, or status pipe consumes
+  descriptors.
+
+Verified by rebuilding `mr80x-qemu:9.1.0` and booting:
+
+```sh
+./run.sh --no-net --nand-image images/full_firmware_openwrt.bin
+```
+
+The old Linux 6.12 `qcom_snand ... failure in submitting spi init
+descriptor` / `Cannot free busy channel` / `error -110` sequence no
+longer appears. The driver now gets past the BAM submission layer and
+fails later while identifying the SPI-NAND:
+
+```text
+spi-nand spi0.0: unknown raw ID 0000000000
+spi-nand spi0.0: probe with driver spi-nand failed with error -95
+```
+
+Also tested the unmodified vendor/rootfs path:
+
+```sh
+./run.sh --no-net --nand-image images/FULL_FIRMWARE.bin
+```
+
+That path also advances beyond the old BAM timeout and reaches the
+vendor kernel's QPIC NAND identification code, which currently fails
+at a comparable next layer:
+
+```text
+QPIC controller support serial nand.
+nand: second ID read did not match 00,00 against c8,c1
+nand: No NAND device found
+...
+UBI error: cannot open mtd rootfs, error -2
+VFS: Cannot open root device "mtd:ubi_rootfs" ...
+```
+
+So E36-09 is **partial**, not done. The next concrete task is to trace
+the Linux-side ID-read command sequence (`spi-qpic-snand.c` /
+`qpic_common.c` on 6.12 and the vendor 4.4.60 QPIC NAND path) and make
+the emulated QPIC register/data path return the same `c8 c1` ID bytes
+for every read variant the kernel performs, not just the APPSBL/U-Boot
+variant.

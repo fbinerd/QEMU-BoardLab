@@ -918,6 +918,31 @@ typedef struct MR80XBamState {
 #define BAM_REVISION_OFF 0x01000
 #define BAM_NUM_PIPES_OFF 0x01008
 
+static void mr80x_bam_update_irq(MR80XBamState *s)
+{
+    uint32_t p;
+    bool pending = false;
+
+    for (p = 0; p < MR80X_BAM_NUM_PIPES; p++) {
+        if (s->pipe[p].irq_stts) {
+            pending = true;
+            break;
+        }
+    }
+
+    if (s->irq) {
+        qemu_set_irq(s->irq, pending);
+    }
+}
+
+static void mr80x_bam_set_sw_ofsts(MR80XBamState *s, uint32_t pipe,
+                                    uint32_t offset)
+{
+    hwaddr reg = BAM_P_SW_OFSTSn_BASE + 0x1000 * pipe;
+
+    s->generic_regs[reg / 4] = offset;
+}
+
 static void mr80x_bam_reset(void *opaque)
 {
     MR80XBamState *s = opaque;
@@ -926,6 +951,7 @@ static void mr80x_bam_reset(void *opaque)
     memset(s->generic_regs, 0, sizeof(s->generic_regs));
     s->generic_regs[BAM_REVISION_OFF / 4] = 1u << 8;   /* num_ees = 1 */
     s->generic_regs[BAM_NUM_PIPES_OFF / 4] = MR80X_BAM_NUM_PIPES;
+    mr80x_bam_update_irq(s);
     /* s->nand is the device link, not volatile controller state. */
 }
 
@@ -1081,10 +1107,8 @@ static void mr80x_bam_drain_raw_pipe(MR80XBamState *s, uint32_t pipe)
     if (delta) {
         p->last_evnt_off = p->notified_evnt_off;
         p->irq_stts |= BAM_P_PRCSD_DESC_MASK;
-        if (s->irq) {
-            qemu_set_irq(s->irq, 1);
-            qemu_set_irq(s->irq, 0);
-        }
+        mr80x_bam_set_sw_ofsts(s, pipe, p->last_evnt_off);
+        mr80x_bam_update_irq(s);
     }
 }
 
@@ -1146,6 +1170,7 @@ static void mr80x_bam_write(void *opaque, hwaddr offset, uint64_t value,
         (offset - BAM_P_IRQ_CLRn_BASE) % 0x1000 == 0) {
         uint32_t n = (offset - BAM_P_IRQ_CLRn_BASE) / 0x1000;
         s->pipe[n].irq_stts &= ~(uint32_t)value;
+        mr80x_bam_update_irq(s);
         return;
     }
 
@@ -1178,10 +1203,8 @@ static void mr80x_bam_write(void *opaque, hwaddr offset, uint64_t value,
                 }
                 s->pipe[n].last_evnt_off = new_off;
                 s->pipe[n].irq_stts |= BAM_P_PRCSD_DESC_MASK;
-                if (s->irq) {
-                    qemu_set_irq(s->irq, 1);
-                    qemu_set_irq(s->irq, 0);
-                }
+                mr80x_bam_set_sw_ofsts(s, n, s->pipe[n].last_evnt_off);
+                mr80x_bam_update_irq(s);
 
                 mr80x_bam_drain_raw_pipe(s,
                                          MR80X_BAM_DATA_PRODUCER_PIPE);
