@@ -1975,7 +1975,7 @@ static void mr80x_smem_fake_u32_entry(unsigned type, hwaddr data_off,
  * zeroed) at the is_scm_armv8() breakpoint, unlike both earlier
  * locations. */
 #define MR80X_MVBAR_BASE (MR80X_APPSBL_ENTRY + 0xD9000)
-#define MR80X_MVBAR_SIZE 0x40
+#define MR80X_MVBAR_SIZE 0x60
 #define MR80X_MVBAR_SMC_OFF 0x08
 
 /* ============================================================
@@ -2169,7 +2169,11 @@ static void mr80x_populate_ram(MachineState *machine)
          * appsbl build already uses
          * (mr80x-appsbl-builder:openwrt-gcc5.2-binutils2.24), not
          * hand-derived, to avoid exactly the class of bit-level
-         * encoding mistakes hand-assembly invites:
+         * encoding mistakes hand-assembly invites. Full source and
+         * rationale (including *why* the two SMC calling conventions
+         * below need different default return values - the actual
+         * bug that blocked Option A the first time around) is in
+         * board/mvbar-trampoline.S:
          *
          *   movw    ip, #0x0601      ; is_scm_armv8() probe:
          *   movt    ip, #0x8200      ; fn_id 0x82000601 ->
@@ -2177,31 +2181,31 @@ static void mr80x_populate_ram(MachineState *machine)
          *   bne     1f               ; "yes" (r0=0, r1=1) so appsbl's
          *   mov     r0, #0           ; jump_kernel64() doesn't just
          *   mov     r1, #1           ; hang() before ever trying the
-         *   movs    pc, lr           ; real SMC below - see scm.c's
-         *                            ; is_scm_armv8(): a nonzero/EIO
-         *                            ; SMC32 return caches
-         *                            ; scm_version=SCM_LEGACY for the
-         *                            ; rest of the boot otherwise.
+         *   movs    pc, lr           ; real SMC below.
          * 1:
          *   movw    ip, #0x010f      ; jump_kernel64()'s own SMC:
-         *   movt    ip, #0x0210      ; fn_id 0x0210010f (QCA_SCM_FNID(
-         *   cmp     r0, ip           ; SCM_ARCH64_SWITCH_ID=1,
-         *   bne     2f               ; SCM_EL1SWITCH_CMD_ID=0xf,
-         *                            ; SCM_OWNR_SIP=2)) - r2 holds the
-         *                            ; physical address of scm.c's
-         *                            ; on-stack `kernel_params` struct.
+         *   movt    ip, #0x0200      ; fn_id 0x0200010f - r2 holds the
+         *   cmp     r0, ip           ; physical address of scm.c's
+         *   bne     2f               ; on-stack `kernel_params` struct.
          *   movw    ip, #(MR80X_HANDOFF_TRIGGER_BASE & 0xffff)
          *   movt    ip, #(MR80X_HANDOFF_TRIGGER_BASE >> 16)
          *   str     r2, [ip]        ; hand r2 to mr80x_handoff_trigger_write()
+         *   b       3f
          * 2:
-         *   mvn     r0, #3          ; shared default fallback (falls
-         *   movs    pc, lr          ; through here after the trigger
-         *                           ; too - matches jump_kernel64()'s
-         *                           ; own "SMC never returns on real
-         *                           ; hardware" expectation: appsbl
-         *                           ; just spins in hang() until our
-         *                           ; MMIO write's qemu_system_reset_
-         *                           ; request() actually lands.
+         *   cmp     r0, #1          ; r0==1 is the *legacy* SCM calling
+         *   beq     4f              ; convention's fixed trap value
+         *                           ; (smc.c's smc()) - never a real
+         *                           ; armv8 QCA_SCM_FNID value.
+         * 3:
+         *   mvn     r0, #94         ; armv8 convention default: -95
+         *   movs    pc, lr          ; (-EOPNOTSUPP, pre-remapped -
+         *                           ; __scm_call_64() doesn't call
+         *                           ; scm_remap_error() itself, unlike
+         *                           ; the legacy path below).
+         * 4:
+         *   mvn     r0, #3          ; legacy convention default: raw
+         *   movs    pc, lr          ; SCM_EOPNOTSUPP (-4) -
+         *                           ; __scm_call() remaps this itself.
          *
          * The two movw/movt pairs above encode MR80X_HANDOFF_TRIGGER_
          * BASE (0x0A000000) directly - this array must be
@@ -2213,10 +2217,13 @@ static void mr80x_populate_ram(MachineState *machine)
             0x0c, 0x00, 0x50, 0xe1, 0x02, 0x00, 0x00, 0x1a,
             0x00, 0x00, 0xa0, 0xe3, 0x01, 0x10, 0xa0, 0xe3,
             0x0e, 0xf0, 0xb0, 0xe1, 0x0f, 0xc1, 0x00, 0xe3,
-            0x10, 0xc2, 0x40, 0xe3, 0x0c, 0x00, 0x50, 0xe1,
-            0x02, 0x00, 0x00, 0x1a, 0x00, 0xc0, 0x00, 0xe3,
+            0x00, 0xc2, 0x40, 0xe3, 0x0c, 0x00, 0x50, 0xe1,
+            0x03, 0x00, 0x00, 0x1a, 0x00, 0xc0, 0x00, 0xe3,
             0x00, 0xca, 0x40, 0xe3, 0x00, 0x20, 0x8c, 0xe5,
-            0x03, 0x00, 0xe0, 0xe3, 0x0e, 0xf0, 0xb0, 0xe1,
+            0x01, 0x00, 0x00, 0xea, 0x01, 0x00, 0x50, 0xe3,
+            0x01, 0x00, 0x00, 0x0a, 0x5e, 0x00, 0xe0, 0xe3,
+            0x0e, 0xf0, 0xb0, 0xe1, 0x03, 0x00, 0xe0, 0xe3,
+            0x0e, 0xf0, 0xb0, 0xe1,
         };
         QEMU_BUILD_BUG_ON(sizeof(trampoline) > MR80X_MVBAR_SIZE);
         cpu_physical_memory_write(MR80X_MVBAR_BASE + MR80X_MVBAR_SMC_OFF,
@@ -2247,7 +2254,7 @@ static void mr80x_populate_ram(MachineState *machine)
  * no ERET back to the AArch32 caller at all.
  *
  * The MVBAR trampoline above (board/mvbar-trampoline.S) recognizes
- * this specific SMC (fn_id 0x0210010f) and STRs r2 - the physical
+ * this specific SMC (fn_id 0x0200010f) and STRs r2 - the physical
  * address of scm.c's on-stack `kernel_params` struct - to this
  * dedicated MMIO register instead of just returning SCM_EOPNOTSUPP.
  * The write handler below reads reg_x0 (fdt address, struct offset 0)
@@ -2392,37 +2399,6 @@ static void mr80x_psci_watch_tick(void *opaque)
 {
     MR80XResetState *rs = opaque;
     target_ulong pc = rs->cpu->env.regs[15];
-
-    /* Option A diagnostic tracing - one-shot PC-range markers so a
-     * boot log shows how far appsbl got even without a full kernel
-     * console. Not yet confirmed to reach jump_kernel64() end to end;
-     * keep until that's verified, then remove. */
-    {
-        static bool seen_bootipq, seen_unsignedimg, seen_signedimg,
-                    seen_jump64;
-        if (!seen_bootipq && pc >= 0x4a922d68 && pc < 0x4a922d68 + 0x300) {
-            seen_bootipq = true;
-            info_report("mr80x-debug: entered do_bootipq (pc=0x%lx)",
-                        (unsigned long)pc);
-        }
-        if (!seen_unsignedimg && pc >= 0x4a922980 && pc < 0x4a922980 + 0x318) {
-            seen_unsignedimg = true;
-            info_report("mr80x-debug: entered do_boot_unsignedimg (pc=0x%lx)",
-                        (unsigned long)pc);
-        }
-        if (!seen_signedimg && pc >= 0x4a922c98 && pc < 0x4a922c98 + 0x300) {
-            seen_signedimg = true;
-            info_report("mr80x-debug: entered do_boot_signedimg (pc=0x%lx)",
-                        (unsigned long)pc);
-        }
-        if (!seen_jump64 && pc >= 0x4a921a08 && pc < 0x4a921a08 + 0x100) {
-            seen_jump64 = true;
-            info_report("mr80x-debug: entered jump_kernel64 (pc=0x%lx r0=0x%lx r1=0x%lx r2=0x%lx)",
-                        (unsigned long)pc, (unsigned long)rs->cpu->env.regs[0],
-                        (unsigned long)rs->cpu->env.regs[1],
-                        (unsigned long)rs->cpu->env.regs[2]);
-        }
-    }
 
     if (pc < MR80X_APPSBL_ENTRY || pc >= MR80X_APPSBL_ENTRY + MiB) {
         rs->cpu->psci_conduit = QEMU_PSCI_CONDUIT_SMC;

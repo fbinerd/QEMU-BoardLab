@@ -1753,7 +1753,7 @@ own AArch32->AArch64 handoff so the *real* (non-bypassed) boot chain
 works end to end - this section's test path is deliberately a shortcut
 around that, not a replacement for it.
 
-## 29. Option A implementation: real appsbl `jump_kernel64()` SMC handoff - mechanism built, end-to-end firing not yet confirmed
+## 29. MILESTONE: the real appsbl `jump_kernel64()` SMC handoff works end to end - a genuine, modern AArch64 kernel now boots via the real, non-bypassed boot chain
 
 Implements the real (non-bypassed) AArch32->AArch64 handoff section 28
 deferred: appsbl's own `arch/arm/lib/bootm.c` calls
@@ -1762,24 +1762,181 @@ deferred: appsbl's own `arch/arm/lib/bootm.c` calls
 handles the SMC by dropping straight into AArch64, never returning to
 the AArch32 caller.
 
+**Confirmed working**, verified via a real boot test
+(`MR80X_NAND_IMAGE=images/full_firmware_openwrt.bin`, no `-kernel`
+override - the exact same "boot APPSBL from the real flash partition"
+path every other milestone in this file uses):
+
+```
+Starting kernel ...
+Jumping to AARCH64 kernel via monitor
+mr80x: appsbl jump_kernel64() SMC intercepted (params at 0x4a8224f0) - kernel_entry=0x41000000 fdt=0x4a3f6000 - requesting AArch64 handoff reset
+mr80x: entering AArch64 kernel at 0x41000000, x0(fdt)=0x4a3f6000
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x410fd034]
+[    0.000000] Machine model: Mercusys MR80X v5
+```
+
+- `0x410fd034` is the genuine Cortex-A53 MIDR (confirmed section 28) -
+  appsbl handed off from real AArch32 execution to a real AArch64
+  kernel, through the *actual* `jump_kernel64()` SMC path, not the
+  isolated bypass test path.
+- The kernel is real, modern, fully-sourced OpenWrt 6.12.94 for this
+  exact device, loaded from a real UBI `kernel` volume inside the
+  `rootfs` MTD partition, via appsbl's own real FIT loading/hash
+  verification (`crc32+ sha1+ OK`) - not a `-kernel` override, not the
+  isolated `--aarch64-openwrt` test path.
+- Real dmesg follows immediately after (real DTB parse, `clk:
+  Disabling unused clocks`, real driver probing) - this is a live,
+  correctly-configured kernel, not a crash landing.
+- `UBI error: cannot open mtd rootfs` and a `wait_for_pll` clock
+  warning both follow shortly after - expected and *not* handoff bugs,
+  see "What's deliberately NOT done yet" below.
+
+### `images/full_firmware_openwrt.bin`: why a new flash image was needed
+
+The real `FULL_FIRMWARE.bin`'s actual shipped kernel turned out to be
+**32-bit ARM Linux-4.4.60** (confirmed by decoding its FIT image with
+`mkimage -l`: `Architecture: ARM`, `Load Address: 0x41208000`) - i.e.
+`jump_kernel64()` is dead code for this device's real, as-shipped
+firmware; a 32-bit kernel never triggers the AArch32->AArch64 switch at
+all. All of the earlier "confusing, contradictory" empirical results
+logged in an earlier draft of this section were downstream of chasing a
+handoff that could never fire against the real shipped kernel - not a
+bug in the trampoline logic itself.
+
+Fix (the user's suggestion): build a new flash image,
+`tools/build_full_firmware_openwrt.py`, that starts from the real
+`FULL_FIRMWARE.bin` and surgically replaces only the **`kernel` UBI
+volume** (inside the `rootfs` MTD partition, `0x640000`/`0x2A00000`)
+with a FIT image wrapping OpenWrt's own real, already-built AArch64
+kernel+DTB for this device - reusing
+`openwrt-qualcommax-ipq50xx-mercusys_mr80x-v5-squashfs-factory.ubi`'s
+own `kernel` volume content directly (already a correctly-built FIT:
+gzip Linux 6.12.94 Image, real device DTB, load/entry `0x41000000`,
+crc32+sha1 hashes - OpenWrt's own build already produces exactly the
+image real appsbl expects). Everything else in the flash image -
+env, appsbl itself, the `ubi_rootfs` volume, all other partitions - is
+left completely untouched.
+
+Mechanics (see the script's own docstring and comments for the full
+detail, this is the summary):
+- appsbl's `config_select()` (`board/qca/arm/common/cmd_bootqca.c`)
+  picks a FIT config by **plain name lookup**
+  (`fit_conf_get_node(fit, name)` - `CONFIG_FIT_BEST_MATCH` is *not*
+  enabled in this build, so there's no device-tree compatible-string
+  matching involved at all), reading the candidate name from a
+  `config_name` property baked into appsbl's own compiled-in control
+  DTB (`arch/arm/dts/ipq5018-emulation.dts`: `config_name =
+  "config@emulation-c2";`). So the new FIT just needs a config node
+  named exactly `config@emulation-c2` - confirmed via `mkimage -l` on
+  the real vendor FIT that this is genuinely the config name real
+  boots on this emulated board already select.
+- UBI volumes are parsed/rebuilt by hand (EC header, VID header, CRC32
+  algorithm - `crc = zlib.crc32(data) ^ 0xFFFFFFFF`, confirmed against
+  real on-flash CRCs before trusting it) - no `ubireader`/`mtd-utils`
+  reading tools were available, only `ubinize`/`mkfs.ubifs` (building
+  tools). The real vendor kernel volume's 30 already-used LEBs are
+  reused directly; OpenWrt's kernel is larger (44 LEBs needed), so the
+  extra LEBs are taken from confirmed-free PEBs elsewhere in the same
+  partition (real UBI doesn't require a volume's LEBs to be physically
+  contiguous - each LEB's own VID header carries its `lnum`, scanned
+  independently at attach time) - the `ubi_rootfs` volume's own PEBs
+  are never touched.
+- `mkimage`/`dumpimage` (`apt install u-boot-tools`, or OpenWrt's own
+  `staging_dir/host/bin` copies) build/inspect the FIT itself.
+
+Regenerate with `python3 tools/build_full_firmware_openwrt.py`, then
+`MR80X_NAND_IMAGE=images/full_firmware_openwrt.bin ./run.sh` (or
+`./run.sh --nand-image images/full_firmware_openwrt.bin`).
+
+### Two real bugs found and fixed in the trampoline while chasing this
+
+1. **A hex-digit transcription error**: `jump_kernel64()`'s SMC
+   function ID was computed (during this session's earlier planning,
+   well before any code was written) as `0x0210010f`, but
+   `QCA_SCM_FNID(SCM_ARCH64_SWITCH_ID=1, SCM_EL1SWITCH_CMD_ID=0xf,
+   SCM_OWNR_SIP=2)` = `((1<<8)|0xf) | (2<<24)` = `0x10f | 0x02000000` =
+   **`0x0200010f`**, not `0x0210010f` - a `1`/`0` digit swap that
+   propagated into the trampoline unnoticed. Found via a temporary
+   debug trampoline variant that logs the real `r0` for any
+   unmatched armv8-convention SMC to a scratch MMIO register
+   (`mr80x_debug_fnid_write()`, since removed) - immediately showed
+   `fn_id=0x200010f` on a real boot, confirming the fix.
+2. **The two SMC calling conventions in this codebase's `scm.c` handle
+   error-code remapping differently, and the trampoline's original
+   single shared default return value broke one of them.** Legacy
+   convention (`scm_call()` -> `__scm_call()` -> `smc()`) always has
+   `r0=1` on entry (a fixed trap value, not a function ID - the real
+   command lives in a memory-pointed `cmd_addr`), and `__scm_call()`
+   itself calls `scm_remap_error()` on the trampoline's returned value,
+   converting the raw SCM code `SCM_EOPNOTSUPP` (`-4`) into the C errno
+   `-EOPNOTSUPP` (`-95`, since `EOPNOTSUPP` is `95` in this codebase's
+   `errno.h` - *not* `4`). The armv8 convention (`scm_call_64()` ->
+   `__scm_call_64()` -> `__qca_scm_call_armv8_32()`) does **not** call
+   `scm_remap_error()` - whatever the trampoline returns in `r0` is
+   used raw. The original single-default trampoline always returned
+   raw `-4` for anything unrecognized; under the legacy convention
+   that's correct (its caller remaps `-4` to `-95` itself), but under
+   the armv8 convention (needed for `is_scm_armv8()` to ever answer
+   "yes", itself required for `jump_kernel64()` to not immediately
+   `hang()`) the caller compares the *raw*, unremapped `-4` against
+   `-EOPNOTSUPP` (`-95`) and gets no match - so `do_bootipq()`'s
+   `ret == 0 || ret == -EOPNOTSUPP` check silently failed for *every*
+   SMC-based decision, including its very first one
+   (`qca_scm_call(SCM_SVC_FUSE, QFPROM_IS_AUTHENTICATE_CMD, ...)`),
+   leaving its `do_boot` function pointer `NULL` and skipping straight
+   back to the `IPQ5018#` prompt with **zero error output** - this
+   was the "silent stop, no crash, no explanation" symptom chased at
+   length in an earlier draft of this section. Fixed: the trampoline
+   now distinguishes the two conventions by checking `r0==1` first
+   (legacy convention's fixed trap value, never a real armv8 fn_id)
+   and returns the *already-remapped* `-95` for any unrecognized
+   armv8-convention call, `-4` (unchanged) for the legacy default.
+   `board/mvbar-trampoline.S` has the full annotated source.
+
+### What's deliberately NOT done yet
+
+- **The `ubi_rootfs` UBI volume is untouched** (still the old vendor
+  32-bit rootfs) - harmless for this milestone because OpenWrt's
+  kernel Image is itself an **initramfs** build (embedded rootfs, no
+  separate mount needed) - matching how the isolated `--aarch64-openwrt`
+  test path (section 28) already works. The kernel's own
+  `UBI error: cannot open mtd rootfs, error -2` in dmesg is expected
+  and harmless for that reason; it doesn't block init. A *real*
+  working userspace via this path (not just confirming the handoff)
+  would need a matching `ubi_rootfs` volume too - not attempted here.
+- **`gpll0_main failed to enable!` / `wait_for_pll` WARN** - this
+  board's GCC clock-controller stub (section on `mr80x_gcc_ops`) was
+  built against the old kernel's clock request patterns; the modern
+  kernel's `msm_serial`/clock driver polls a PLL-lock bit this stub
+  doesn't drive correctly yet. Cosmetic for now (kernel keeps booting,
+  tainted but not crashed) - worth fixing before chasing a full
+  console/userspace boot via this path.
+- Reaching a confirmed interactive shell via *this* (non-bypassed) path
+  hasn't been attempted yet - section 28's own "confirm the isolated
+  test path reaches a shell" is still separately open too.
+
+### Implementation (`board/mr80x.c` + `board/mvbar-trampoline.S`, no QEMU core source touched)
+
 **What's implemented** (all in `board/mr80x.c` + a new
 `board/mvbar-trampoline.S`, no QEMU core source touched - see below):
 
-- The MVBAR/SMC trampoline (section 14) is extended from 2 to 16
+- The MVBAR/SMC trampoline (section 14) is extended from 2 to ~20
   instructions, assembled via the real ARM cross-toolchain already
   used to build appsbl itself
   (`mr80x-appsbl-builder:openwrt-gcc5.2-binutils2.24`,
   `arm-openwrt-linux-muslgnueabi-as`), not hand-derived - source in
   `board/mvbar-trampoline.S`. It recognizes two specific SMC function
-  IDs by `r0` and falls through to the existing default (`mvn r0,#3`)
-  for everything else, preserving every prior SMC-related fix:
+  IDs by `r0` and falls through to a (calling-convention-aware, see
+  "Two real bugs" below) default for everything else, preserving every
+  prior SMC-related fix:
   - `is_scm_armv8()`'s own probe (fn_id `0x82000601`) - answered
     "yes, real armv8 TZ" (`r0=0`, `r1=1`) so `jump_kernel64()` doesn't
     just `hang()` before ever trying its own SMC (`scm.c`'s
     `is_scm_armv8()` caches this as `scm_version` forever after the
     first call, so this has to be true from the very first probe of
     the whole boot, not just right before `jump_kernel64()`).
-  - `jump_kernel64()`'s own SMC (fn_id `0x0210010f` = `QCA_SCM_FNID(
+  - `jump_kernel64()`'s own SMC (fn_id `0x0200010f` = `QCA_SCM_FNID(
     SCM_ARCH64_SWITCH_ID=1, SCM_EL1SWITCH_CMD_ID=0xf,
     SCM_OWNR_SIP=2)`) - `r2` holds the physical address of `scm.c`'s
     on-stack `kernel_params` struct (`reg_x0`=fdt address at offset 0,
@@ -1831,70 +1988,28 @@ own two dependencies (`aarch32_cpsr_valid_mask()` - `static inline` in
 `target/arm/cpu.h`) are all already reachable from board code with no
 core-source patching, for what it's worth.
 
-**Confirmed working**: builds cleanly; the normal AArch32 appsbl boot
-(NAND ID, env, network, reaching the `IPQ5018#` console) shows no
-regression from the `cortex-a7` -> `cortex-a53` switch, verified via a
-real boot test and `-d int` exception tracing (zero unexpected
-aborts).
+**Confirmed working end to end** - see the log excerpt and
+`images/full_firmware_openwrt.bin` explanation at the top of this
+section. Builds cleanly; the normal AArch32 appsbl boot (NAND ID, env,
+network) shows no regression from the `cortex-a7` -> `cortex-a53`
+switch, and the real `jump_kernel64()` handoff, real UBI/FIT loading,
+and real AArch64 kernel execution have all been directly observed in
+one boot.
 
-**Not yet confirmed**: the handoff itself actually firing - no test
-run has yet logged `mr80x: appsbl jump_kernel64() SMC intercepted` or
-reached AArch64 kernel execution. Empirical testing surfaced a
-confusing, not-yet-resolved discrepancy worth recording rather than
-re-deriving from scratch next time:
-
-- A single, non-interactive autoboot pass (`bootcmd=bootipq` runs
-  automatically after the 1-second delay - a `check_fw_gpio()` GPIO
-  read this emulator doesn't model always logs as "pressed" but
-  `do_bootipq()`'s own active-low check correctly treats it as *not*
-  pressed, so this doesn't force recovery mode) with the full
-  `is_scm_armv8()`-spoofing trampoline reaches the `IPQ5018#` prompt
-  and stops - confirmed via `-d int` that this is a clean return (only
-  2 SMC exceptions total, no aborts, no hang), not a crash.
-- The *same* single autoboot pass with the `is_scm_armv8()` spoof
-  temporarily removed (jump_kernel64 special-case only) proceeds much
-  further - UBI attach, FIT image load, `Starting kernel ...` - but
-  then loops repeatedly (re-hits `do_bootipq`, reprints the U-Boot
-  banner-less "Starting kernel" cycle), consistent with the *old*,
-  already-known-problematic 4.4.60 kernel path (section 23) rather
-  than the AArch64 one - i.e. removing the spoof may just be routing
-  around `jump_kernel64()` entirely via a different FIT config, not
-  actually proving the spoof itself is the problem.
-- Manually typing `bootipq` a *second* time at the console (after
-  autoboot's own first, automatic invocation already ran it) reliably
-  hits U-Boot's hush shell `"exit not allowed from main input shell."`
-  message, immediately after `check_fw_gpio()`'s own debug print and
-  before any other output - reproduced identically across a raw pipe,
-  a kept-open pipe, `\r` vs `\n` line endings, and a real pseudo-tty
-  (`python3 -c` `pty.fork()`), so this is a genuine hush/appsbl
-  behavior on a second interactive invocation, not a test-harness
-  artifact - but it's very likely *orthogonal* to the actual handoff
-  question, since autoboot's own first pass already runs
-  `do_bootipq()` once without needing this at all.
-- gdb-multiarch could not be gotten to attach usefully to this
-  specific target - the `aarch64-softmmu` build's gdbstub reports an
-  AArch64-shaped register file (`g` packet) even while the guest CPU
-  is actually executing AArch32 code, and setting `set architecture
-  aarch64` connects but then reports `pc=0` immediately (before any
-  `continue`), and inserted breakpoints at known-good addresses
-  (`do_bootipq`/`jump_kernel64`, from
-  `build/u-boot-2016/System.map`) never fire correctly. `-d int` /
-  `-d in_asm` (QEMU-side, not gdb) were far more reliable diagnostics
-  for this board going forward than gdb for as long as the CPU model
-  is a mixed 32/64 `cortex-a53`.
-
-**Next step for whoever continues this**: don't re-run the same
-experiments - instead, get a clean read on exactly what `do_bootipq()`
-decides (signed vs. unsigned image, i.e. the `qca_scm_call(SCM_SVC_FUSE,
-QFPROM_IS_AUTHENTICATE_CMD, ...)` result) on the *spoofed* single
-autoboot pass specifically, ideally by adding a targeted `info_report()`
-UART-text watcher (the reliable mechanism already used for the
-"Starting kernel" trigger and CoreSight patching, in
-`mr80x_watch_for_kernel_handoff()`) for `do_boot_signedimg`/
-`do_boot_unsignedimg`'s own printfs, rather than the PC-range polling
-markers currently in `mr80x_psci_watch_tick()` (kept in place, gated
-one-shot, but 5ms-granularity polling can miss short-lived functions
-entirely - not proven reliable this session).
+**Tooling note for next time**: gdb-multiarch could not be gotten to
+attach usefully to this target while chasing the two bugs above - the
+`aarch64-softmmu` build's gdbstub reports an AArch64-shaped register
+file (`g` packet) even while the guest CPU is actually executing
+AArch32 code, and `set architecture aarch64` connects but then reports
+`pc=0` immediately and inserted breakpoints don't fire correctly. What
+actually worked: QEMU-side `-d int` (exception tracing - confirmed
+exactly how many SMCs fire and that returns are clean, not aborts) and
+a throwaway debug trampoline variant that STRs the real `r0` of any
+unmatched SMC to a scratch MMIO register logged via `info_report()` -
+this is what found the `0x0200010f` vs `0x0210010f` bug directly,
+after guessing at the value from source reading alone had failed
+silently. Prefer this pattern over gdb for any future mixed 32/64
+`cortex-a53` debugging on this board.
 
 ## Status / next steps (in order)
 
@@ -2036,8 +2151,15 @@ entirely - not proven reliable this session).
     (accepts either the original vendor key or the swapped-in custom
     one) and a full-size real firmware image, not just a small test
     payload.
-28. **In progress, not yet working end to end** (section 29): Option A,
-    the real appsbl `jump_kernel64()` handoff. Mechanism is implemented
-    and builds cleanly, with no regression to the normal AArch32 boot
-    path; the actual AArch32->AArch64 handoff has not yet been observed
-    to fire.
+28. [done] MILESTONE (section 29): Option A, the real appsbl
+    `jump_kernel64()` handoff, confirmed working end to end - a real,
+    modern, fully-sourced AArch64 OpenWrt kernel now boots via the
+    genuine, non-bypassed appsbl boot chain (real NAND/UBI/FIT
+    loading, real SMC-mediated AArch32->AArch64 switch), using a new
+    `images/full_firmware_openwrt.bin` (built by
+    `tools/build_full_firmware_openwrt.py`) that swaps only the real
+    flash image's `kernel` UBI volume for one containing OpenWrt's own
+    real AArch64 kernel+DTB. Not yet done: a working rootfs mount /
+    interactive shell via this same path (the kernel used is an
+    initramfs build, sufficient to prove the handoff but not full
+    userspace) - see section 29's "What's deliberately NOT done yet".
