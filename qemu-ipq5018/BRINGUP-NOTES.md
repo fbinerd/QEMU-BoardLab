@@ -2841,3 +2841,68 @@ WiFi remoteproc/ath11k still needs major firmware/coprocessor work;
 and the current OpenWrt build tree still has stale/incompatible module
 artifacts producing many `Unknown symbol` messages. The milestone here
 is narrower but important: the real boot chain is now interactive.
+
+## 36. Error tracker from the 2026-08-10 full OpenWrt interactive boot log
+
+Source log: `/home/fabiano/.codex/attachments/6749c306-7d63-4cc6-b777-a73b637bb85b/pasted-text.txt`.
+
+This log is important because it proves the current emulator can boot
+the real chain far enough to reach an interactive OpenWrt shell:
+
+```text
+login[1023]: root login on 'console'
+BusyBox v1.38.0 (...) built-in shell (ash)
+OpenWrt SNAPSHOT, r35461-10f736806d
+root@OpenWrt:~#
+```
+
+The remaining work is now a hardware-fidelity/error-cleanup tracker.
+Status values used below:
+
+- **open**: still visible in this log and needs work;
+- **triaged**: understood, but not the next emulation blocker;
+- **data/build**: likely caused by the firmware/rootfs contents or
+  OpenWrt build artifacts rather than by the emulated SoC itself;
+- **fixed**: corrected in this branch and should disappear from later
+  comparable logs.
+
+| ID | Status | Log evidence | Impact | Current interpretation / next action |
+| --- | --- | --- | --- | --- |
+| E36-01 | triaged | `ipq_spi: SPI Flash not found (bus/cs/speed/mode) = (0/0/48000000/0)` | U-Boot probes SPI and prints a failure, but continues from serial NAND. | Current OpenWrt/MR80X path is serial NAND/QPIC. Keep this tracked until we confirm from the vendor DTS/board files whether this model needs a dummy SPI NOR device or whether the warning is harmless on real hardware too. |
+| E36-02 | data/build | `*** Warning - bad CRC, using default environment` | U-Boot falls back to compiled defaults instead of persisted environment. | The NAND-backed image either lacks a valid env partition/checksum at the probed location, or our env partition mapping still differs from real flash. Later fix: map/persist the real APPSBL/U-Boot env area and validate with `printenv`/`saveenv`. |
+| E36-03 | open | `fdt_fixup_qpic: QPIC: unable to find node '/soc/qpic-nand@79b0000'` | U-Boot cannot patch the NAND node it expects in the Linux DT. | DT node naming/address mismatch. Audit the DTB passed inside the FIT versus U-Boot's hardcoded fixup path; either preserve/add the expected alias/node or adjust FDT patching so QPIC NAND fixups land. |
+| E36-04 | open | `GIC CPU mask not found - kernel will fail to boot.` and `GICv2m: Invalid MSI base SPI (base:0)` | GIC DT is incomplete/odd; kernel survives but IRQ/MSI topology is not faithful. | Fix generated/patched interrupt-controller DT properties. MSI matters later for PCIe/WiFi/other peripherals. |
+| E36-05 | open | `arch_timer: Unable to find a suitable frame in timer @ 0x...0b120000`; `Failed to initialize '/soc@0/timer@b120000': -22` | Generic timer frame node is invalid for Linux. | Either model the expected frame registers or patch/disable the bad frame node while keeping architected timer support correct. |
+| E36-06 | open | `psci: failed to boot CPU1 (-22)`; `CPU1: failed to boot: -22` | Emulator boots single-core even though the DT/kernel expects SMP. | Implement enough PSCI CPU_ON handling / secondary CPU release for IPQ5018 AArch64 SMP, or patch DT to one CPU until SMP is modeled. |
+| E36-07 | open | `qcom-smem 4ab00000.smem: SMEM is not initialized by SBL`; probe `error -22` | Linux cannot consume Qualcomm SMEM metadata. | U-Boot tolerated our current minimal handoff, but Linux wants a valid SMEM table/header. Build a Linux-compatible fake SMEM region from vendor/OpenWrt expectations. |
+| E36-08 | triaged | `qcom_scm firmware:scm: failed to set download mode: -1` | Usually non-fatal, but the SCM emulation is incomplete. | Implement/accept the specific SCM call used for download-mode disable so Linux stops warning. Lower priority than NAND/MDIO. |
+| E36-09 | open | `qcom_snand 79b0000.spi: failure in submitting spi init descriptor`; `bam-dma-engine ... Cannot free busy channel`; probe `error -110` | Biggest runtime storage blocker: Linux cannot attach the serial NAND, so a non-initramfs rootfs will not mount from real flash. | U-Boot NAND works, but Linux `qcom_snand` uses the DMA-engine/BAM path differently. Need model the Linux BAM descriptor flow, not only the U-Boot transaction path. |
+| E36-10 | open | `ipq4019-mdio 88000.mdio ... error -22`; `ipq4019-mdio 90000.mdio ... error -22` | Ethernet PHY discovery in Linux cannot start. | Likely clock/reset/MDIO register model gap. Audit OpenWrt DTS clock/reset requirements and QEMU MDIO/GMAC implementation. |
+| E36-11 | open | `ipq5018-gmac-dwmac ... IRQ eth_wake_irq not found`; `IRQ sfty not found`; deferred probe: `failed to parse stmmac dt parameters` | Linux GMAC does not probe. | Some IRQ names and/or stmmac DT parameters are missing in the effective DT, plus MDIO is already failing. Fix DT + clock/reset + MDIO together. |
+| E36-12 | open | `genirq: Setting trigger mode 1 for irq 24 failed`; `qcom-q6-mpd ... failed to acquire wdog IRQ`; remoteproc probe `error -22` | WiFi remoteproc cannot start. | Need valid WCSS/Q6 watchdog IRQ wiring and a broader remoteproc/firmware-loading model. Not required for NAND/rootfs, but required for "100%" hardware emulation. |
+| E36-13 | open | `thermal thermal_zone0..3: Temperature check failed (-110)` | Thermal zones time out. | Implement TSENS/thermal register responses or patch DT to defer thermal zones until the model exists. |
+| E36-14 | open | `UBI error: cannot open mtd rootfs, error -2` | Kernel cannot find runtime MTD `rootfs`; real flash rootfs boot is blocked. | Downstream of E36-09: Linux serial NAND probe fails, so no MTD partition table appears. Fix NAND DMA-engine path first. |
+| E36-15 | data/build | repeated `jbd2: Unknown symbol ...`; `xhci_hcd: Unknown symbol ...`; later `kmodloader: 5 modules could not be probed` | Module noise during early boot. | Looks like OpenWrt module/kernel ABI mismatch or intentionally incomplete initramfs module set. Track separately from SoC emulation unless reproduced with a clean matching OpenWrt build. |
+| E36-16 | open | `ipq5018-tlmm ... unable to lock HW IRQ 14/16`; `gpio-keys ... failed to request irq` | Reset/WPS key IRQs do not work. | Improve TLMM GPIO direction/IRQ locking semantics so `gpio-keys` can claim button lines. |
+| E36-17 | data/build | `Cannot parse config file '/etc/fw_env.config': No such file or directory` | OpenWrt cannot read U-Boot env from userspace. | Rootfs config/package issue unless we decide to ship an emulator-specific `/etc/fw_env.config` in the test image. Related to E36-02 but not an SoC blocker. |
+| E36-18 | data/build | `Failed to find NVMEM device` | Board scripts cannot fetch calibration/MAC data through Linux NVMEM. | Could be downstream of NAND/ART/NVMEM DT wiring. Re-evaluate after E36-09 and ART partition exposure are fixed. |
+| E36-19 | triaged | `platform cpufreq-dt`, `qcom,apss-ipq6018-clk`, `smp2p-wcss` deferred probes | Several late probes stay pending. | Expected while clock/SMEM/SMP2P/remoteproc are incomplete. Track as umbrella symptoms of E36-07/E36-12 and clock-tree work. |
+| E36-20 | data/build | many networking modules: `ovpn`, `tun`, `ip_tunnel`, `nf_*`, `wireguard`, `batman_adv` `Unknown symbol`; `Module ... is blacklisted`; `kmodloader: 71 modules could not be probed` | Firewall/VPN/overlay modules do not load in this image. | Mostly OpenWrt build/package ABI hygiene, made noisier by the existing `module_blacklist=` bootargs. Not the reason the board boots or fails to mount NAND. |
+| E36-21 | data/build | `refcount_t: underflow; use-after-free` in `qrtr` while loading modules | Kernel warning during QRTR module init. | Likely triggered by module/rootfs mismatch or QRTR running without the expected remoteproc/QRTR peers. Recheck after E36-12 and module ABI cleanup. |
+| E36-22 | open | `ath11k c000000.wifi: failed to get rproc: -517`; `ath11k b00a040.wifi: failed to get rproc: -517` | WiFi cannot start. | Downstream of remoteproc/SMEM/SMP2P model gaps. Required for full router emulation, but behind NAND + Ethernet in priority. |
+| E36-23 | fixed | No missing userspace prompt in this log; shell reaches `root@OpenWrt:~#`. | Confirms the previous UART userspace-console blocker is gone. | Fixed by section 35 (`TXLEV`/`MISR`/`IMR` UARTDM interrupt modeling). Keep as a regression check in future logs. |
+
+Priority order from this log:
+
+1. **E36-09 / E36-14: Linux serial NAND through BAM DMA** - this is
+   the reason a normal non-initramfs rootfs still cannot come from the
+   full flash image at runtime.
+2. **E36-10 / E36-11: MDIO + GMAC** - next required piece for a useful
+   router boot after storage.
+3. **E36-03 / E36-04 / E36-05 / E36-07: effective DT and Qualcomm
+   handoff data** - these are early correctness problems that will
+   affect multiple drivers.
+4. **E36-12 / E36-22: remoteproc + WiFi** - large follow-up for full
+   hardware fidelity.
+5. **E36-15 / E36-20 / E36-21: OpenWrt module ABI cleanup** - useful
+   for a clean log, but separate from QEMU hardware modeling.
