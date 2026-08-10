@@ -1975,7 +1975,7 @@ static void mr80x_smem_fake_u32_entry(unsigned type, hwaddr data_off,
  * zeroed) at the is_scm_armv8() breakpoint, unlike both earlier
  * locations. */
 #define MR80X_MVBAR_BASE (MR80X_APPSBL_ENTRY + 0xD9000)
-#define MR80X_MVBAR_SIZE 0x20
+#define MR80X_MVBAR_SIZE 0x40
 #define MR80X_MVBAR_SMC_OFF 0x08
 
 /* ============================================================
@@ -2163,10 +2163,62 @@ static void mr80x_populate_ram(MachineState *machine)
      * looked like exotic ARM/QEMU Monitor-mode semantics but were
      * really just this. */
     {
+        /* Extended trampoline (see the Option A comment block below
+         * mr80x_reset() for the full rationale) - assembled from real
+         * source via the same ARM cross-toolchain this project's own
+         * appsbl build already uses
+         * (mr80x-appsbl-builder:openwrt-gcc5.2-binutils2.24), not
+         * hand-derived, to avoid exactly the class of bit-level
+         * encoding mistakes hand-assembly invites:
+         *
+         *   movw    ip, #0x0601      ; is_scm_armv8() probe:
+         *   movt    ip, #0x8200      ; fn_id 0x82000601 ->
+         *   cmp     r0, ip           ; pretend an armv8 TZ answered
+         *   bne     1f               ; "yes" (r0=0, r1=1) so appsbl's
+         *   mov     r0, #0           ; jump_kernel64() doesn't just
+         *   mov     r1, #1           ; hang() before ever trying the
+         *   movs    pc, lr           ; real SMC below - see scm.c's
+         *                            ; is_scm_armv8(): a nonzero/EIO
+         *                            ; SMC32 return caches
+         *                            ; scm_version=SCM_LEGACY for the
+         *                            ; rest of the boot otherwise.
+         * 1:
+         *   movw    ip, #0x010f      ; jump_kernel64()'s own SMC:
+         *   movt    ip, #0x0210      ; fn_id 0x0210010f (QCA_SCM_FNID(
+         *   cmp     r0, ip           ; SCM_ARCH64_SWITCH_ID=1,
+         *   bne     2f               ; SCM_EL1SWITCH_CMD_ID=0xf,
+         *                            ; SCM_OWNR_SIP=2)) - r2 holds the
+         *                            ; physical address of scm.c's
+         *                            ; on-stack `kernel_params` struct.
+         *   movw    ip, #(MR80X_HANDOFF_TRIGGER_BASE & 0xffff)
+         *   movt    ip, #(MR80X_HANDOFF_TRIGGER_BASE >> 16)
+         *   str     r2, [ip]        ; hand r2 to mr80x_handoff_trigger_write()
+         * 2:
+         *   mvn     r0, #3          ; shared default fallback (falls
+         *   movs    pc, lr          ; through here after the trigger
+         *                           ; too - matches jump_kernel64()'s
+         *                           ; own "SMC never returns on real
+         *                           ; hardware" expectation: appsbl
+         *                           ; just spins in hang() until our
+         *                           ; MMIO write's qemu_system_reset_
+         *                           ; request() actually lands.
+         *
+         * The two movw/movt pairs above encode MR80X_HANDOFF_TRIGGER_
+         * BASE (0x0A000000) directly - this array must be
+         * re-assembled from board/mvbar-trampoline.S (see that file's
+         * header for the exact command) if that address ever
+         * changes. */
         static const uint8_t trampoline[] = {
-            0x03, 0x00, 0xE0, 0xE3, /* mvn  r0, #3   (little-endian) */
-            0x0E, 0xF0, 0xB0, 0xE1, /* movs pc, lr                  */
+            0x01, 0xc6, 0x00, 0xe3, 0x00, 0xc2, 0x48, 0xe3,
+            0x0c, 0x00, 0x50, 0xe1, 0x02, 0x00, 0x00, 0x1a,
+            0x00, 0x00, 0xa0, 0xe3, 0x01, 0x10, 0xa0, 0xe3,
+            0x0e, 0xf0, 0xb0, 0xe1, 0x0f, 0xc1, 0x00, 0xe3,
+            0x10, 0xc2, 0x40, 0xe3, 0x0c, 0x00, 0x50, 0xe1,
+            0x02, 0x00, 0x00, 0x1a, 0x00, 0xc0, 0x00, 0xe3,
+            0x00, 0xca, 0x40, 0xe3, 0x00, 0x20, 0x8c, 0xe5,
+            0x03, 0x00, 0xe0, 0xe3, 0x0e, 0xf0, 0xb0, 0xe1,
         };
+        QEMU_BUILD_BUG_ON(sizeof(trampoline) > MR80X_MVBAR_SIZE);
         cpu_physical_memory_write(MR80X_MVBAR_BASE + MR80X_MVBAR_SMC_OFF,
                                    trampoline, sizeof(trampoline));
     }
@@ -2182,6 +2234,105 @@ static void mr80x_populate_ram(MachineState *machine)
      * function's memset() above only needs to leave a clean slate for
      * that automatic restore to land on. */
 }
+
+/* ============================================================
+ * Option A: the real appsbl AArch32->AArch64 handoff. appsbl's own
+ * arch/arm/lib/bootm.c calls jump_kernel64(kernel_entry, ft_addr) as
+ * the very last thing it does for a 64-bit kernel (matching real
+ * hardware - IPQ5018 is a genuine Cortex-A53, see the AArch64 test
+ * path comment above mr80x_aarch64_reset() and BRINGUP-NOTES.md
+ * section 28) - jump_kernel64() is declared noreturn and, on real
+ * hardware, never actually returns: TrustZone firmware handles the
+ * SMC by dropping straight into AArch64 at kernel_entry with x0=fdt,
+ * no ERET back to the AArch32 caller at all.
+ *
+ * The MVBAR trampoline above (board/mvbar-trampoline.S) recognizes
+ * this specific SMC (fn_id 0x0210010f) and STRs r2 - the physical
+ * address of scm.c's on-stack `kernel_params` struct - to this
+ * dedicated MMIO register instead of just returning SCM_EOPNOTSUPP.
+ * The write handler below reads reg_x0 (fdt address, struct offset 0)
+ * and kernel_start (struct offset 72, see the `kernel_params` typedef
+ * in arch-qca-common/scm.h) out of guest RAM, saves them, and
+ * requests a machine reset - mirroring real hardware's own "this SMC
+ * never returns to its caller" behavior instead of trying to emulate
+ * a live in-flight AArch32->AArch64 ERET transition. (That
+ * alternative was researched in depth: QEMU's own
+ * target/arm/tcg/helper-a64.c HELPER(exception_return) has the
+ * reference sequence, but it's for a CPU that keeps running through
+ * the transition - appsbl doesn't need that, it's already handing
+ * off for good.)
+ *
+ * mr80x_reset()'s pending-handoff branch (below) then does exactly
+ * what mr80x_aarch64_reset() already does successfully for the
+ * isolated AArch64 test path: cpu_reset() + cpu_set_pc() + x0=fdt,
+ * *without* re-running mr80x_populate_ram() - the kernel Image and
+ * FDT appsbl's own (already-working) FIT-loading logic placed in RAM
+ * survive the reset untouched, only the CPU state resets to point at
+ * them in AArch64.
+ *
+ * The one new wrinkle reset() alone doesn't solve: QEMU's
+ * arm_cpu_reset_hold() unconditionally sets env->aarch64=true on
+ * *every* reset for any CPU with the AARCH64 feature bit - fine for
+ * the isolated test path (which never runs AArch32 code at all), but
+ * appsbl itself must reset into AArch32 on its own (first, and every
+ * plain `reset`) boot. Fixed by *dynamically* toggling the
+ * ARM_FEATURE_AARCH64 (and, only for the handoff reset itself,
+ * ARM_FEATURE_EL3 - matching the isolated path's has_el3=off, needed
+ * per BRINGUP-NOTES.md section 28 to avoid an EL3->EL0 reset
+ * fallback) feature bits via QEMU's own set_feature()/unset_feature()
+ * (target/arm/cpu.h, already public, no core QEMU source touched) at
+ * the start of mr80x_reset() - both bits are checked dynamically by
+ * the emulator throughout a CPU's life, not just at realize, so this
+ * is safe to flip per-reset. This machine's CPU model itself also had
+ * to move from cortex-a7 to cortex-a53 (run.sh's normal invocation
+ * now always passes `-cpu cortex-a53,aarch64=on`) so the AArch64
+ * register/cp_regs set actually exists to switch into - real hardware
+ * is the same single Cortex-A53 core throughout appsbl and the
+ * kernel, never an A7, so this is more accurate anyway, not a
+ * divergence.
+ * ============================================================ */
+#define MR80X_HANDOFF_TRIGGER_BASE 0x0A000000
+#define MR80X_HANDOFF_TRIGGER_SIZE 0x1000
+
+static bool mr80x_aarch32_handoff_pending;
+static hwaddr mr80x_aarch32_handoff_kernel_entry;
+static hwaddr mr80x_aarch32_handoff_fdt_addr;
+
+static uint64_t mr80x_handoff_trigger_read(void *opaque, hwaddr offset,
+                                            unsigned size)
+{
+    return 0;
+}
+
+static void mr80x_handoff_trigger_write(void *opaque, hwaddr offset,
+                                         uint64_t value, unsigned size)
+{
+    hwaddr params_addr = (hwaddr)(uint32_t)value;
+    uint32_t fdt_lo, kernel_lo;
+
+    cpu_physical_memory_read(params_addr + 0, &fdt_lo, 4);
+    cpu_physical_memory_read(params_addr + 72, &kernel_lo, 4);
+
+    mr80x_aarch32_handoff_fdt_addr = le32_to_cpu(fdt_lo);
+    mr80x_aarch32_handoff_kernel_entry = le32_to_cpu(kernel_lo);
+    mr80x_aarch32_handoff_pending = true;
+
+    info_report("mr80x: appsbl jump_kernel64() SMC intercepted (params at "
+                "0x%" PRIx64 ") - kernel_entry=0x%" PRIx64 " fdt=0x%" PRIx64
+                " - requesting AArch64 handoff reset",
+                (uint64_t)params_addr,
+                (uint64_t)mr80x_aarch32_handoff_kernel_entry,
+                (uint64_t)mr80x_aarch32_handoff_fdt_addr);
+
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+static const MemoryRegionOps mr80x_handoff_trigger_ops = {
+    .read = mr80x_handoff_trigger_read,
+    .write = mr80x_handoff_trigger_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
 
 /* ============================================================
  * Linux's own SMC calls (PSCI - CPU_ON to boot the second CPU core the
@@ -2242,6 +2393,37 @@ static void mr80x_psci_watch_tick(void *opaque)
     MR80XResetState *rs = opaque;
     target_ulong pc = rs->cpu->env.regs[15];
 
+    /* Option A diagnostic tracing - one-shot PC-range markers so a
+     * boot log shows how far appsbl got even without a full kernel
+     * console. Not yet confirmed to reach jump_kernel64() end to end;
+     * keep until that's verified, then remove. */
+    {
+        static bool seen_bootipq, seen_unsignedimg, seen_signedimg,
+                    seen_jump64;
+        if (!seen_bootipq && pc >= 0x4a922d68 && pc < 0x4a922d68 + 0x300) {
+            seen_bootipq = true;
+            info_report("mr80x-debug: entered do_bootipq (pc=0x%lx)",
+                        (unsigned long)pc);
+        }
+        if (!seen_unsignedimg && pc >= 0x4a922980 && pc < 0x4a922980 + 0x318) {
+            seen_unsignedimg = true;
+            info_report("mr80x-debug: entered do_boot_unsignedimg (pc=0x%lx)",
+                        (unsigned long)pc);
+        }
+        if (!seen_signedimg && pc >= 0x4a922c98 && pc < 0x4a922c98 + 0x300) {
+            seen_signedimg = true;
+            info_report("mr80x-debug: entered do_boot_signedimg (pc=0x%lx)",
+                        (unsigned long)pc);
+        }
+        if (!seen_jump64 && pc >= 0x4a921a08 && pc < 0x4a921a08 + 0x100) {
+            seen_jump64 = true;
+            info_report("mr80x-debug: entered jump_kernel64 (pc=0x%lx r0=0x%lx r1=0x%lx r2=0x%lx)",
+                        (unsigned long)pc, (unsigned long)rs->cpu->env.regs[0],
+                        (unsigned long)rs->cpu->env.regs[1],
+                        (unsigned long)rs->cpu->env.regs[2]);
+        }
+    }
+
     if (pc < MR80X_APPSBL_ENTRY || pc >= MR80X_APPSBL_ENTRY + MiB) {
         rs->cpu->psci_conduit = QEMU_PSCI_CONDUIT_SMC;
         info_report("mr80x: pc=0x%lx is past appsbl's own code - "
@@ -2261,6 +2443,43 @@ static void mr80x_reset(void *opaque)
 {
     MR80XResetState *rs = opaque;
     CPUState *cs = CPU(rs->cpu);
+
+    if (mr80x_aarch32_handoff_pending) {
+        /* Option A: appsbl's own jump_kernel64() SMC already ran and
+         * handed us the real kernel entry/fdt addresses - see the
+         * comment block above mr80x_handoff_trigger_write(). Enter
+         * AArch64 exactly like the isolated test path's
+         * mr80x_aarch64_reset() does, *without* re-populating RAM: the
+         * kernel Image + FDT appsbl's own FIT-loading logic already
+         * placed there survive this reset untouched. */
+        mr80x_aarch32_handoff_pending = false;
+
+        set_feature(&rs->cpu->env, ARM_FEATURE_AARCH64);
+        unset_feature(&rs->cpu->env, ARM_FEATURE_EL3);
+
+        cpu_reset(cs);
+        cpu_set_pc(cs, mr80x_aarch32_handoff_kernel_entry);
+        rs->cpu->env.xregs[0] = mr80x_aarch32_handoff_fdt_addr;
+        rs->cpu->psci_conduit = QEMU_PSCI_CONDUIT_SMC;
+
+        info_report("mr80x: entering AArch64 kernel at 0x%" PRIx64
+                    ", x0(fdt)=0x%" PRIx64,
+                    (uint64_t)mr80x_aarch32_handoff_kernel_entry,
+                    (uint64_t)mr80x_aarch32_handoff_fdt_addr);
+
+        tb_flush(cs);
+        return;
+    }
+
+    /* Normal appsbl (AArch32) boot - undo the handoff reset's feature
+     * toggles every time so a plain console `reset` after a *previous*
+     * handoff (or a QEMU restart with stale static state - it isn't,
+     * these are per-process, but symmetry costs nothing) still lands
+     * back in AArch32 with EL3 present, matching real cold-boot
+     * behavior. Harmless/idempotent on the very first, implicit reset
+     * too, since both bits already default this way at CPU realize. */
+    unset_feature(&rs->cpu->env, ARM_FEATURE_AARCH64);
+    set_feature(&rs->cpu->env, ARM_FEATURE_EL3);
 
     cpu_reset(cs);
     mr80x_populate_ram(rs->machine);
@@ -2486,7 +2705,26 @@ static void mr80x_init(MachineState *machine)
     mr80x_machine = machine;
 
     object_property_set_bool(cpuobj, "reset-hivecs", false, &error_fatal);
+    /* Register the full AArch64 system-register set at realize time
+     * regardless of the exact -cpu string given, same as run.sh's
+     * isolated AArch64 test path already relies on explicitly - Option
+     * A's handoff reset (mr80x_reset()) only *toggles* the
+     * ARM_FEATURE_AARCH64 feature bit per-reset (has_el3 likewise, but
+     * left at its default true here - see the has_el3 comment above
+     * mr80x_handoff_trigger_write()), it doesn't create these
+     * registers itself. */
+    object_property_set_bool(cpuobj, "aarch64", true, &error_fatal);
     qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
+
+    /* NOT unsetting ARM_FEATURE_AARCH64 back off here: the isolated
+     * AArch64 test path below (mr80x_init_aarch64_test()) shares this
+     * exact same CPU object and needs it to stay AArch64-capable from
+     * its very first, implicit reset - it has no appsbl phase at all
+     * and never runs mr80x_reset(). The normal appsbl path *does* need
+     * to start in AArch32, but mr80x_reset() (its own reset handler,
+     * registered below) already unsets the feature on every reset
+     * including that implicit first one - see the comment block
+     * above it. */
 
     /* ============================================================
      * GICv2 interrupt controller - required for the *kernel* (u-boot
@@ -2650,6 +2888,20 @@ peripherals:
         memory_region_add_subregion(sysmem, MR80X_PSHOLD_BASE, pshold);
     }
 
+    /* Option A AArch32->AArch64 handoff trigger - see the comment
+     * block above mr80x_handoff_trigger_write(). Harmless to register
+     * unconditionally (including for the isolated AArch64 test path,
+     * which never issues appsbl's own SMC traffic and so never writes
+     * here). */
+    {
+        MemoryRegion *handoff = g_new0(MemoryRegion, 1);
+        memory_region_init_io(handoff, NULL, &mr80x_handoff_trigger_ops, NULL,
+                               "mr80x.handoff-trigger",
+                               MR80X_HANDOFF_TRIGGER_SIZE);
+        memory_region_add_subregion(sysmem, MR80X_HANDOFF_TRIGGER_BASE,
+                                     handoff);
+    }
+
     /* MDIO controller - see the MR80X_MDIO_BASE comment block */
     MR80XMdioState *mdio = g_new0(MR80XMdioState, 1);
     memory_region_init_io(&mdio->iomem, NULL, &mr80x_mdio_ops, mdio,
@@ -2789,7 +3041,17 @@ static void mr80x_machine_class_init(ObjectClass *oc, void *data)
     mc->desc = "QCA IPQ5018 / Mercusys MR80X v5 research machine "
                "(minimal - see BRINGUP-NOTES.md)";
     mc->init = mr80x_init;
-    mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a7");
+    /* cortex-a53, not -a7: real IPQ5018 hardware is a genuine Cortex-A53
+     * the whole way through, including while appsbl itself runs in
+     * AArch32 - see the AArch64 test path comment above
+     * mr80x_aarch64_reset() and BRINGUP-NOTES.md section 28. Needed
+     * unconditionally now (not just for the isolated AArch64 test path)
+     * so mr80x_init()'s own "aarch64" property set below has a CPU class
+     * that actually registers AArch64 system registers at realize -
+     * Option A's handoff reset (mr80x_reset()) dynamically toggles the
+     * ARM_FEATURE_AARCH64 feature *bit* per-reset, but that only works
+     * if those registers already exist in cp_regs from realize time. */
+    mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a53");
     mc->default_ram_size = MR80X_RAM_SIZE;
     mc->default_ram_id = "mr80x.ram";
     mc->ignore_memory_transaction_failures = true;

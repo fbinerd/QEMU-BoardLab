@@ -1753,6 +1753,149 @@ own AArch32->AArch64 handoff so the *real* (non-bypassed) boot chain
 works end to end - this section's test path is deliberately a shortcut
 around that, not a replacement for it.
 
+## 29. Option A implementation: real appsbl `jump_kernel64()` SMC handoff - mechanism built, end-to-end firing not yet confirmed
+
+Implements the real (non-bypassed) AArch32->AArch64 handoff section 28
+deferred: appsbl's own `arch/arm/lib/bootm.c` calls
+`jump_kernel64(kernel_entry, ft_addr)` as the last thing it does for a
+64-bit kernel - `noreturn`, and on real hardware TrustZone firmware
+handles the SMC by dropping straight into AArch64, never returning to
+the AArch32 caller.
+
+**What's implemented** (all in `board/mr80x.c` + a new
+`board/mvbar-trampoline.S`, no QEMU core source touched - see below):
+
+- The MVBAR/SMC trampoline (section 14) is extended from 2 to 16
+  instructions, assembled via the real ARM cross-toolchain already
+  used to build appsbl itself
+  (`mr80x-appsbl-builder:openwrt-gcc5.2-binutils2.24`,
+  `arm-openwrt-linux-muslgnueabi-as`), not hand-derived - source in
+  `board/mvbar-trampoline.S`. It recognizes two specific SMC function
+  IDs by `r0` and falls through to the existing default (`mvn r0,#3`)
+  for everything else, preserving every prior SMC-related fix:
+  - `is_scm_armv8()`'s own probe (fn_id `0x82000601`) - answered
+    "yes, real armv8 TZ" (`r0=0`, `r1=1`) so `jump_kernel64()` doesn't
+    just `hang()` before ever trying its own SMC (`scm.c`'s
+    `is_scm_armv8()` caches this as `scm_version` forever after the
+    first call, so this has to be true from the very first probe of
+    the whole boot, not just right before `jump_kernel64()`).
+  - `jump_kernel64()`'s own SMC (fn_id `0x0210010f` = `QCA_SCM_FNID(
+    SCM_ARCH64_SWITCH_ID=1, SCM_EL1SWITCH_CMD_ID=0xf,
+    SCM_OWNR_SIP=2)`) - `r2` holds the physical address of `scm.c`'s
+    on-stack `kernel_params` struct (`reg_x0`=fdt address at offset 0,
+    `kernel_start` at offset 72). The trampoline `str`s `r2` to a new
+    dedicated MMIO register (`MR80X_HANDOFF_TRIGGER_BASE`,
+    `0x0A000000`, previously-unused address space) instead of
+    returning `SCM_EOPNOTSUPP`.
+- `mr80x_handoff_trigger_write()` reads the two fields out of guest
+  RAM, saves them in new board-global state, and calls
+  `qemu_system_reset_request()` - matching `jump_kernel64()`'s own
+  "this SMC never returns to its caller" expectation instead of
+  trying to emulate a live in-flight AArch32->AArch64 `ERET`
+  transition.
+- `mr80x_reset()` checks a new pending-handoff flag first: if set, it
+  does exactly what the already-working isolated AArch64 test path's
+  `mr80x_aarch64_reset()` does (section 28) - `cpu_reset()` +
+  `cpu_set_pc()` to the saved kernel entry + `x0`=saved fdt address -
+  *without* re-running `mr80x_populate_ram()`, since the kernel Image
+  + FDT appsbl's own (already-working) FIT-loading logic placed in RAM
+  survive the reset untouched.
+- The CPU model itself had to move from `cortex-a7` to `cortex-a53`
+  (`mc->default_cpu_type`, plus `object_property_set_bool(cpuobj,
+  "aarch64", true, ...)` in `mr80x_init()`) so the AArch64 register set
+  actually exists in `cp_regs` to switch into - real hardware is the
+  same single Cortex-A53 core throughout appsbl and the kernel, never
+  an A7, so this is more accurate, not a divergence. Since
+  `arm_cpu_reset_hold()` unconditionally sets `env->aarch64=true` on
+  reset for *any* CPU with the AARCH64 feature bit (not gated by any
+  property under TCG), appsbl's own AArch32 boot needs that feature
+  bit *off* at every normal reset and *on* only for the handoff reset -
+  done by calling QEMU's own `set_feature()`/`unset_feature()`
+  (`target/arm/cpu.h`, already public) at the top of `mr80x_reset()`,
+  dynamically, per reset. `ARM_FEATURE_EL3` is toggled the same way
+  (on for appsbl, off only for the handoff reset, matching the
+  isolated test path's `has_el3=off`).
+
+**Why no QEMU core source was touched**: the original plan considered
+emulating a live in-flight AArch64 `ERET`-style state transition
+(QEMU's own reference sequence is in
+`target/arm/tcg/helper-a64.c`'s `HELPER(exception_return)`), which
+needs `cpsr_write_from_spsr_elx()` - `static`, not exported. That
+turned out to be unnecessary: `jump_kernel64()` is the last thing
+appsbl ever does, so nothing needs preserving across the transition,
+and the reset-based approach above (already proven by the isolated
+AArch64 test path) sidesteps the whole question. `set_feature()`/
+`unset_feature()`/`arm_feature()` and `cpsr_write_from_spsr_elx()`'s
+own two dependencies (`aarch32_cpsr_valid_mask()` - `static inline` in
+`target/arm/internals.h` - and `cpsr_write()` - public in
+`target/arm/cpu.h`) are all already reachable from board code with no
+core-source patching, for what it's worth.
+
+**Confirmed working**: builds cleanly; the normal AArch32 appsbl boot
+(NAND ID, env, network, reaching the `IPQ5018#` console) shows no
+regression from the `cortex-a7` -> `cortex-a53` switch, verified via a
+real boot test and `-d int` exception tracing (zero unexpected
+aborts).
+
+**Not yet confirmed**: the handoff itself actually firing - no test
+run has yet logged `mr80x: appsbl jump_kernel64() SMC intercepted` or
+reached AArch64 kernel execution. Empirical testing surfaced a
+confusing, not-yet-resolved discrepancy worth recording rather than
+re-deriving from scratch next time:
+
+- A single, non-interactive autoboot pass (`bootcmd=bootipq` runs
+  automatically after the 1-second delay - a `check_fw_gpio()` GPIO
+  read this emulator doesn't model always logs as "pressed" but
+  `do_bootipq()`'s own active-low check correctly treats it as *not*
+  pressed, so this doesn't force recovery mode) with the full
+  `is_scm_armv8()`-spoofing trampoline reaches the `IPQ5018#` prompt
+  and stops - confirmed via `-d int` that this is a clean return (only
+  2 SMC exceptions total, no aborts, no hang), not a crash.
+- The *same* single autoboot pass with the `is_scm_armv8()` spoof
+  temporarily removed (jump_kernel64 special-case only) proceeds much
+  further - UBI attach, FIT image load, `Starting kernel ...` - but
+  then loops repeatedly (re-hits `do_bootipq`, reprints the U-Boot
+  banner-less "Starting kernel" cycle), consistent with the *old*,
+  already-known-problematic 4.4.60 kernel path (section 23) rather
+  than the AArch64 one - i.e. removing the spoof may just be routing
+  around `jump_kernel64()` entirely via a different FIT config, not
+  actually proving the spoof itself is the problem.
+- Manually typing `bootipq` a *second* time at the console (after
+  autoboot's own first, automatic invocation already ran it) reliably
+  hits U-Boot's hush shell `"exit not allowed from main input shell."`
+  message, immediately after `check_fw_gpio()`'s own debug print and
+  before any other output - reproduced identically across a raw pipe,
+  a kept-open pipe, `\r` vs `\n` line endings, and a real pseudo-tty
+  (`python3 -c` `pty.fork()`), so this is a genuine hush/appsbl
+  behavior on a second interactive invocation, not a test-harness
+  artifact - but it's very likely *orthogonal* to the actual handoff
+  question, since autoboot's own first pass already runs
+  `do_bootipq()` once without needing this at all.
+- gdb-multiarch could not be gotten to attach usefully to this
+  specific target - the `aarch64-softmmu` build's gdbstub reports an
+  AArch64-shaped register file (`g` packet) even while the guest CPU
+  is actually executing AArch32 code, and setting `set architecture
+  aarch64` connects but then reports `pc=0` immediately (before any
+  `continue`), and inserted breakpoints at known-good addresses
+  (`do_bootipq`/`jump_kernel64`, from
+  `build/u-boot-2016/System.map`) never fire correctly. `-d int` /
+  `-d in_asm` (QEMU-side, not gdb) were far more reliable diagnostics
+  for this board going forward than gdb for as long as the CPU model
+  is a mixed 32/64 `cortex-a53`.
+
+**Next step for whoever continues this**: don't re-run the same
+experiments - instead, get a clean read on exactly what `do_bootipq()`
+decides (signed vs. unsigned image, i.e. the `qca_scm_call(SCM_SVC_FUSE,
+QFPROM_IS_AUTHENTICATE_CMD, ...)` result) on the *spoofed* single
+autoboot pass specifically, ideally by adding a targeted `info_report()`
+UART-text watcher (the reliable mechanism already used for the
+"Starting kernel" trigger and CoreSight patching, in
+`mr80x_watch_for_kernel_handoff()`) for `do_boot_signedimg`/
+`do_boot_unsignedimg`'s own printfs, rather than the PC-range polling
+markers currently in `mr80x_psci_watch_tick()` (kept in place, gated
+one-shot, but 5ms-granularity polling can miss short-lived functions
+entirely - not proven reliable this session).
+
 ## Status / next steps (in order)
 
 1. [done] Boot-entry and memory-map research.
@@ -1893,3 +2036,8 @@ around that, not a replacement for it.
     (accepts either the original vendor key or the swapped-in custom
     one) and a full-size real firmware image, not just a small test
     payload.
+28. **In progress, not yet working end to end** (section 29): Option A,
+    the real appsbl `jump_kernel64()` handoff. Mechanism is implemented
+    and builds cleanly, with no regression to the normal AArch32 boot
+    path; the actual AArch32->AArch64 handoff has not yet been observed
+    to fire.
