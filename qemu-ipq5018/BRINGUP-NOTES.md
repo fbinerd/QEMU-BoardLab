@@ -2094,25 +2094,75 @@ offsets, not guessed.
 Verified via a real boot: zero clock-related WARNs, `procd: - init -`
 reached consistently (multiple back-to-back runs).
 
-**A separate, genuine problem found past that point - not a board
-emulation gap**: `kmodloader`'s normal boot-time module autoload
-crashes loading `vxlan.ko` - `Unable to handle kernel access to user
-memory ... vxlan_init_net+0x20`, a NULL-pointer deref (`net_generic()`
-returning NULL for `vxlan_net_id` immediately after
-`net_assign_generic()` should have just stored it) inside vanilla
-kernel/module code that never touches any of this board's emulated
-peripherals at all - reproduced identically (same PC, same fault
-address `0x40`) across every boot. Not investigated further this
-session; plausibly related to this machine's second CPU core failing
-PSCI `CPU_ON` (`psci: failed to boot CPU1 (-22)`, logged every boot -
-this board's PSCI model doesn't support bringing up a real second vCPU
-yet, unlike real hardware) changing scheduling/timing enough to expose
-a race that's otherwise masked, but that's a guess, not confirmed.
-Options for whoever continues: debug the kernel-internal race directly,
-implement real dual-CPU PSCI `CPU_ON` support and see if that alone
-changes the outcome, or rebuild the OpenWrt initramfs image without
-`vxlan.ko` (touches the OpenWrt build tree, not this project's own
-code, but ask first - out of scope for a quick fix either way).
+**A separate, genuine problem found past that point - confirmed root
+cause, not a board emulation gap, fixed without touching the OpenWrt
+build tree**: `kmodloader`'s normal boot-time module autoload crashed
+loading `vxlan.ko` - `Unable to handle kernel access to user memory
+... vxlan_init_net+0x20`, a NULL-pointer deref reading `net->gen`.
+
+Root-caused via disassembly, not guessed: `vxlan.ko` reads `net->gen`
+at struct offset `2760`, but `gdb`'s own debug-info query against the
+*current* `vmlinux-initramfs.debug` (`p (long)&((struct net*)0)->gen`)
+gives `2368` - a real, ~400-byte **struct-net ABI mismatch between this
+prebuilt `vxlan.ko` and the kernel it's loaded into**. Confirmed via
+file timestamps: `vxlan.ko` in this OpenWrt tree's `staging_dir` is
+dated well before the `vmlinux` it now ships alongside (the kernel got
+rebuilt/relinked at some point after `kmod-vxlan` was last packaged,
+without the module being regenerated to match) - a stale-module/build
+staleness issue in the OpenWrt tree, not a bug in vxlan's source, not a
+board-emulation gap, and *not fixed by rebuilding it* (attempted, but
+that touches the OpenWrt package/build system in ways outside this
+project's scope - reverted; no source files changed, only gitignored
+`build_dir`/`staging_dir` build-artifact state, confirmed via `git
+status` before backing out).
+
+The same mismatch affects **every** module using per-namespace
+generic pointers (`net_generic()`/`register_pernet_{subsys,device}`
+with `.id` set) - not just vxlan; `x_tables`, `nfnetlink`, `nf_nat`,
+`nf_tables`, `nf_conntrack`, and `ppp_generic` all hit the identical
+crash in turn once the previous one was blocked, confirmed via
+disassembly of each (`net.c` uses `struct net`'s `.deps`/generic-array
+field the same way every time - the "Code:" bytes in each panic dump
+decode to the exact same `ldr x0, [x0, #2760]` / `ldr xN, [x0, w1,
+uxtw #3]` pattern `ops_init()` produces when it calls into
+`net_generic()`).
+
+**Fixed** (`tools/build_full_firmware_openwrt.py --extra-bootargs`,
+default now `module_blacklist=vxlan,x_tables,nfnetlink,nf_nat,
+nf_tables,nf_conntrack,ppp_generic`): appends to the DTB's
+`chosen/bootargs-append` property (via a `dtc` decompile/edit/
+recompile round-trip, the same technique already used for Option B's
+DTB patches) - `module_blacklist=` is a real, mainline kernel
+`core_param` (`kernel/module/main.c`, checked directly in
+`load_module()`, so it blocks `insmod`/`kmodloader`'s syscall path,
+not just in-kernel `request_module()`). Everything depending on a
+blacklisted module fails to load too, but gracefully
+(`kmodloader: dependency not loaded x_tables`, not a crash) - expected,
+since none of iptables/nftables/PPP/VXLAN functionality is needed for
+this milestone (confirming the AArch64 handoff and reaching a stable,
+running system).
+
+One real bug caught building the fix itself, worth remembering: the
+first version inserted the blacklist string *before* the DTB
+property's existing value (right after the opening quote) instead of
+before the closing quote - appsbl's own `set_fs_bootargs()` (section
+14/`board/qca/arm/common/cmd_bootqca.c`) concatenates its own base
+cmdline directly onto this property's value with **no separator of its
+own**, relying entirely on the value's own leading space; inserting
+before it glued straight onto the base cmdline's last word with zero
+space (`"...rootwaitmodule_blacklist=vxlan"`, confirmed on a real
+boot - a single invalid parameter token, silently ignored by the
+kernel, so it looked like nothing happened at first). Fixed by
+inserting right before the closing quote instead, with an explicit
+leading space of its own regardless of what precedes it.
+
+**Verified via a real boot**: zero `Oops`/`Kernel panic`/reboots across
+a 200-second run (previously crash-looped every ~18s, forever) -
+`kmodloader`'s full module pass completes (with graceful
+"dependency not loaded" skips for the blacklisted modules' dependents),
+`zram0` swap comes up, and `urngd` (a normal OpenWrt userspace daemon)
+starts at ~145s - genuine, sustained forward progress into userspace,
+not just reaching `procd: - init -` and dying moments later.
 
 ## Status / next steps (in order)
 
@@ -2254,14 +2304,20 @@ code, but ask first - out of scope for a quick fix either way).
     (accepts either the original vendor key or the swapped-in custom
     one) and a full-size real firmware image, not just a small test
     payload.
-28. [done] MILESTONE (section 29): Option A, the real appsbl
+28. [done] MILESTONE (sections 29-30): Option A, the real appsbl
     `jump_kernel64()` handoff, confirmed working end to end - a real,
     modern, fully-sourced AArch64 OpenWrt kernel now boots via the
     genuine, non-bypassed appsbl boot chain (real NAND/UBI/FIT
-    loading, real SMC-mediated AArch32->AArch64 switch) all the way to
-    `procd: - init -`, using a new `images/full_firmware_openwrt.bin`
-    (built by `tools/build_full_firmware_openwrt.py`) that swaps only
-    the real flash image's `kernel` UBI volume for OpenWrt's own real
-    AArch64 initramfs kernel+DTB. Not yet separately confirmed: a full
-    interactive shell prompt via this same path - see section 29's
-    "What's deliberately NOT done yet".
+    loading, real SMC-mediated AArch32->AArch64 switch), using a new
+    `images/full_firmware_openwrt.bin` (built by
+    `tools/build_full_firmware_openwrt.py`) that swaps only the real
+    flash image's `kernel` UBI volume for OpenWrt's own real AArch64
+    initramfs kernel+DTB. All GCC clock-controller WARNs fixed
+    (section 30); a genuine stale-module/kernel ABI mismatch in this
+    OpenWrt tree (several netfilter/PPP/vxlan kmods, confirmed via
+    disassembly) worked around via `module_blacklist=` on the kernel
+    cmdline. Verified stable for 200+ seconds with zero crashes -
+    reaches `procd: - init -`, `zram0` swap, and `urngd` running in
+    userspace. Not yet separately confirmed: a full interactive shell
+    prompt via this same path - see section 29's "What's deliberately
+    NOT done yet".

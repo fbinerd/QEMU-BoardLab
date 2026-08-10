@@ -278,6 +278,19 @@ def main():
     ap.add_argument("--output",
                      default=os.path.join(repo, "images",
                                            "full_firmware_openwrt.bin"))
+    ap.add_argument("--extra-bootargs",
+                     default="module_blacklist=vxlan",
+                     help="Appended to the DTB's chosen/bootargs-append "
+                          "property (space-separated kernel cmdline "
+                          "fragment, standard mainline-kernel core_param - "
+                          "see load_module()'s blacklisted() check). "
+                          "Default blacklists vxlan.ko, which crashes "
+                          "(NULL deref in vxlan_init_net, a real struct-net "
+                          "ABI mismatch between this OpenWrt tree's current "
+                          "vmlinux and its stale prebuilt vxlan.ko - "
+                          "confirmed via disassembly, not a board-emulation "
+                          "bug - see BRINGUP-NOTES.md section 30). Pass "
+                          "'' to disable.")
     args = ap.parse_args()
 
     for path, label in [(args.full_firmware, "--full-firmware"),
@@ -292,6 +305,33 @@ def main():
         fdt_bin = os.path.join(tmp, "fdt.bin")
         run(["dumpimage", "-T", "flat_dt", "-p", "0", "-o", kernel_gz, args.openwrt_fit])
         run(["dumpimage", "-T", "flat_dt", "-p", "1", "-o", fdt_bin, args.openwrt_fit])
+
+        if args.extra_bootargs:
+            print("Patching DTB chosen/bootargs-append: +",
+                  repr(args.extra_bootargs))
+            dts_path = os.path.join(tmp, "fdt.dts")
+            run(["dtc", "-I", "dtb", "-O", "dts", "-o", dts_path, fdt_bin])
+            with open(dts_path) as f:
+                dts_text = f.read()
+            # Insert right before the closing quote of the property's
+            # *value* (not right after the opening quote): appsbl's
+            # set_fs_bootargs() concatenates its own base cmdline
+            # directly onto this property's value with no separator of
+            # its own, relying entirely on the value's own leading
+            # space - inserting before the opening quote instead (an
+            # earlier version of this script did that) glues onto the
+            # base cmdline's last word with no space at all
+            # ("rootwaitmodule_blacklist=vxlan", confirmed on a real
+            # boot). A leading space of our own here is added
+            # defensively regardless of what follows.
+            marker = 'bootargs-append = "'
+            start = dts_text.index(marker) + len(marker)
+            end = dts_text.index('"', start)
+            dts_text = (dts_text[:end] + " " + args.extra_bootargs +
+                        dts_text[end:])
+            with open(dts_path, "w") as f:
+                f.write(dts_text)
+            run(["dtc", "-I", "dts", "-O", "dtb", "-o", fdt_bin, dts_path])
 
         its_path = os.path.join(tmp, "mr80x-openwrt.its")
         itb_path = os.path.join(tmp, "mr80x-openwrt.itb")
