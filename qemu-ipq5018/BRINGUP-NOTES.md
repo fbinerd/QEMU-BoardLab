@@ -2358,6 +2358,15 @@ not just reaching `procd: - init -` and dying moments later.
     correct UBI-image construction. Confirms the initramfs recovery
     image (section 32's still-open console mystery) remains the only
     currently-viable path to a running userspace at all.
+32. **Still open** (section 34): the missing console prompt. GDB
+    struct introspection is confirmed permanently unavailable for this
+    exact kernel build (`CONFIG_DEBUG_INFO_REDUCED=y`, not a tooling
+    mistake). Bypassing all of OpenWrt's own init logic
+    (`rdinit=/bin/sh`, bare BusyBox `ash` as PID 1) still shows zero
+    interactivity and zero command output, ruling out `askfirst`/
+    `procd`/musl-stdio-buffering specifically as the cause and pointing
+    further upstream - genuinely unresolved, needs a custom minimal
+    test-init binary to narrow further (not attempted).
 
 ## 31. Two more real probe fixes, and triaging what's left after `procd: - init -`
 
@@ -2662,3 +2671,64 @@ rootfs path validated in this section is real, working UBI-image
 tooling now committed for whenever `qcom_snand` gets tackled, but
 can't itself be used to cross-check the console-prompt mystery until
 then.
+
+## 34. Chasing the missing console prompt further: a dead-end tooling limitation confirmed, and a sharper (still unresolved) data point
+
+Two more concrete steps on section 32's still-open mystery, both aimed
+at getting a definitive answer rather than more theorizing:
+
+**GDB struct introspection is dead for this exact kernel build, for a
+confirmed, structural reason** - attaching `gdb-multiarch` to a live
+`-s` (gdbserver) QEMU instance with `vmlinux-initramfs.debug` loaded
+resolves plain symbols fine (`print &init_task` correctly gives its
+real address, `whatis` correctly names its type), but `ptype
+init_task`/`ptype struct task_struct` both come back
+`<incomplete type>` - no member list at all, making a `for_each_
+process()`-style task-list walk impossible. Root cause confirmed by
+reading this exact kernel build's own `.config`, not guessed:
+`CONFIG_DEBUG_INFO_REDUCED=y` - a real, deliberate OpenWrt kbuild
+default that emits DWARF without full struct definitions for most
+types to save build time/disk space. The kernel's own
+`scripts/gdb/vmlinux-gdb.py` (present in this workspace's build tree,
+read-only) checks for exactly this and refuses to load at all when
+it's set ("Reduced debug information will prevent GDB from having
+complete types") - so even the *proper*, Linux-aware `lx-ps` tooling
+couldn't have helped here either way (separately, that tooling's own
+`constants.py` was never generated for this build, which itself would
+need a `make scripts_gdb` build step - out of bounds regardless). This
+isn't a gap in effort; the debug information genuinely isn't in the
+ELF, full stop. Closed for good, not just paused.
+
+**A sharper, still-unresolved data point**: rather than keep chasing
+*why* `askfirst`'s banner never appears, tested whether the
+UART+kernel-tty stack supports *any* interactive process at all by
+bypassing every layer of OpenWrt's own init logic - `rdinit=/bin/sh`
+on the kernel cmdline (added via the same `--extra-bootargs`
+mechanism, `tools/build_full_firmware_openwrt.py`) makes the kernel
+exec bare BusyBox `ash` directly as PID 1, confirmed via
+`Run /bin/sh as init process` in dmesg (no `/init`, no procd, no
+`askfirst`, no `uci`, no musl-stdio-buffering concerns specific to
+`printf()` - a single static binary). Sent input well after this
+line, over a comfortably long window (multiple retries, up to 30s):
+**zero output** - no shell prompt, no character echo, and critically,
+not even the *output of a command that should run unconditionally
+regardless of interactive-mode detection* (`echo
+HELLO_RDINIT_WORKS` never appeared, and a real ash - interactive or
+not - executes and prints output for commands read from stdin either
+way, it only skips the `$ ` prompt/line-editing in non-interactive
+mode). That specifically rules out "ash decided not to be
+interactive" as the explanation and points at something further
+upstream: either the bytes genuinely aren't reaching *this* process's
+stdin (despite the hardware-level RX fix in section 32 being
+independently verified correct via direct register-level tracing), or
+`ash` is blocked before ever reaching its read loop for a reason
+unrelated to procd/`askfirst` entirely.
+
+**Not yet done, and the natural next step if this gets picked back
+up**: this last test still can't fully distinguish "kernel tty layer
+problem" from "this one busybox binary's own startup path" without a
+custom, deliberately trivial init binary (e.g. a tiny statically-
+linked program that does nothing but `write()` a fixed banner and
+`read()`+echo bytes in a loop, no libc stdio, no termios/session-
+leader setup at all) spliced into the initramfs - meaningfully more
+engineering than a quick test, not attempted yet.
