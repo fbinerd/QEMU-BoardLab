@@ -806,8 +806,9 @@ static const MemoryRegionOps mr80x_nand_ops = {
  * happens once the BAM processes that descriptor.
  *
  * Modeled behavior: process synchronously on the EVNT_REGn kick write
- * - read back the just-added bam_desc, and when BAM_DESC_CMD_FLAG is
- * set, interpret its buffer as concatenated cmd_elements and apply
+ * - read back the just-added bam_desc, and when either known command
+ * descriptor flag is set, interpret its buffer as concatenated
+ * cmd_elements and apply
  * each directly against MR80XNandState's register file (the very
  * struct mr80x_nand_read/write above also use, so either access path
  * observes the same state):
@@ -824,8 +825,9 @@ static const MemoryRegionOps mr80x_nand_ops = {
  * bam_wait_for_interrupt()'s poll loop (BAM_IRQ_SRCS then
  * BAM_P_IRQ_STTSn, looking for P_PRCSD_DESC_EN_MASK=1) succeeds
  * immediately since we set both synchronously inside the kick write.
- * BAM_P_SW_OFSTSn's value is read by bam_read_offset_update() but
- * assigned to a local variable that's never used - safe to return 0.
+ * BAM_P_SW_OFSTSn's value is read by Linux's interrupt-driven
+ * bam-dma-engine completion path, so it must track the consumed FIFO
+ * offset for kernel DMA users even though APPSBL ignores it.
  *
  * The data-producer pipe (index/pipe_num 1) and status pipe (index 3)
  * carry real page *data* for qpic_nand_page_scope_read() - see
@@ -850,6 +852,7 @@ static const MemoryRegionOps mr80x_nand_ops = {
 #define MR80X_NAND_OOB_STREAM_SIZE 16
 #define MR80X_NAND_READ_STREAM_STRIDE \
     (MR80X_NAND_PAGE_SIZE + MR80X_NAND_OOB_STREAM_SIZE)
+#define MR80X_BAM_DESC_FIFO_SIZE (32 * KiB)
 
 #define BAM_P_CTRLn_BASE          0x00013000
 #define BAM_P_RSTn_BASE           0x00013004
@@ -861,7 +864,8 @@ static const MemoryRegionOps mr80x_nand_ops = {
 #define BAM_P_DESC_FIFO_ADDRn_BASE 0x0001381C
 #define BAM_P_FIFO_SIZESn_BASE   0x00013820
 #define BAM_IRQ_SRCS_BASE         0x00003000
-#define BAM_DESC_CMD_FLAG (1 << 3)
+#define BAM_DESC_CMD_FLAG_APPSBL (1 << 3)
+#define BAM_DESC_CMD_FLAG_LINUX  (1 << 11)
 #define BAM_P_PRCSD_DESC_MASK 1
 
 typedef struct MR80XBamPipe {
@@ -871,14 +875,11 @@ typedef struct MR80XBamPipe {
      * descriptors may wait here for the matching command-pipe kick. */
     uint32_t notified_evnt_off;
     uint32_t last_evnt_off;
-    uint32_t fifo_size; /* bytes, from BAM_P_FIFO_SIZESn - real hardware
-                          * masks the event/offset register modulo this,
-                          * NOT a fixed 16-bit wrap (bam_sys_gen_event()'s
-                          * `val &= fifo.size*BAM_DESC_SIZE - 1`). Getting
-                          * this wrong silently corrupts which guest
-                          * memory a later kick's descriptor is read
-                          * from once enough kicks accumulate past a
-                          * small pipe's real (small) FIFO. */
+    uint32_t fifo_size; /* backing descriptor ring bytes.  Linux writes
+                         * BAM_FIFO_SIZE (32K-8) to BAM_P_FIFO_SIZESn, but
+                         * the ring allocated by bam_alloc_chan() is
+                         * BAM_DESC_FIFO_SIZE (32K).  Use the backing
+                         * power-of-two ring size for offset wrapping. */
 } MR80XBamPipe;
 
 typedef struct MR80XBamState {
@@ -960,14 +961,14 @@ static void mr80x_bam_process_cmd_desc(MR80XBamState *s, hwaddr desc_addr)
     uint8_t desc[8];
     uint32_t buf_addr, i;
     uint16_t buf_size;
-    uint8_t flags;
+    uint16_t flags;
 
     cpu_physical_memory_read(desc_addr, desc, sizeof(desc));
     buf_addr = ldl_le_p(desc + 0);
     buf_size = lduw_le_p(desc + 4);
-    flags = desc[7];
+    flags = lduw_le_p(desc + 6);
 
-    if (!(flags & BAM_DESC_CMD_FLAG)) {
+    if (!(flags & (BAM_DESC_CMD_FLAG_APPSBL | BAM_DESC_CMD_FLAG_LINUX))) {
         return; /* data-pipe transfer, not a cmd_element batch */
     }
 
@@ -1161,7 +1162,10 @@ static void mr80x_bam_write(void *opaque, hwaddr offset, uint64_t value,
         offset < BAM_P_FIFO_SIZESn_BASE + 0x1000 * MR80X_BAM_NUM_PIPES &&
         (offset - BAM_P_FIFO_SIZESn_BASE) % 0x1000 == 0) {
         uint32_t n = (offset - BAM_P_FIFO_SIZESn_BASE) / 0x1000;
-        s->pipe[n].fifo_size = value; /* already in bytes, bam_pipe_fifo_init() */
+        s->pipe[n].fifo_size = value;
+        if (s->pipe[n].fifo_size == MR80X_BAM_DESC_FIFO_SIZE - 8) {
+            s->pipe[n].fifo_size = MR80X_BAM_DESC_FIFO_SIZE;
+        }
         return;
     }
 

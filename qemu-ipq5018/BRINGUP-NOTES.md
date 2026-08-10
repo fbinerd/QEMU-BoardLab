@@ -2878,12 +2878,12 @@ Status values used below:
 | E36-06 | open | `psci: failed to boot CPU1 (-22)`; `CPU1: failed to boot: -22` | Emulator boots single-core even though the DT/kernel expects SMP. | Implement enough PSCI CPU_ON handling / secondary CPU release for IPQ5018 AArch64 SMP, or patch DT to one CPU until SMP is modeled. |
 | E36-07 | open | `qcom-smem 4ab00000.smem: SMEM is not initialized by SBL`; probe `error -22` | Linux cannot consume Qualcomm SMEM metadata. | U-Boot tolerated our current minimal handoff, but Linux wants a valid SMEM table/header. Build a Linux-compatible fake SMEM region from vendor/OpenWrt expectations. |
 | E36-08 | triaged | `qcom_scm firmware:scm: failed to set download mode: -1` | Usually non-fatal, but the SCM emulation is incomplete. | Implement/accept the specific SCM call used for download-mode disable so Linux stops warning. Lower priority than NAND/MDIO. |
-| E36-09 | partial | original log: `qcom_snand 79b0000.spi: failure in submitting spi init descriptor`; `bam-dma-engine ... Cannot free busy channel`; probe `error -110`; after section 37: `spi-nand spi0.0: unknown raw ID 0000000000` on Linux 6.12, and `nand: second ID read did not match 00,00 against c8,c1` on vendor Linux 4.4.60 | Biggest runtime storage blocker: Linux still cannot attach the serial NAND, so a non-initramfs rootfs will not mount from real flash. | The DMA completion/timeout layer is fixed by section 37. The next blocker is emulating the Linux driver's repeated JEDEC/ID-read command sequence correctly; ID data currently turns into zeroes after the controller transaction completes. |
+| E36-09 | partial | original log: `qcom_snand 79b0000.spi: failure in submitting spi init descriptor`; `bam-dma-engine ... Cannot free busy channel`; probe `error -110`; after sections 37/38: OpenWrt 6.12 prints `spi-nand spi0.0: GigaDevice SPI NAND was found`; vendor 4.4.60 prints `nand: device found, Manufacturer ID: 0xc8, Chip ID: 0xc1` | Linux now attaches the serial NAND and enumerates MTD partitions from the real flash image. Runtime rootfs is still blocked later by UBI volume-table CRC errors. | The BAM timeout and repeated ID-read layers are fixed. Continue at the page-read/UBI data-fidelity layer: rootfs bytes returned through QPIC/BAM still differ from what UBI expects. |
 | E36-10 | open | `ipq4019-mdio 88000.mdio ... error -22`; `ipq4019-mdio 90000.mdio ... error -22` | Ethernet PHY discovery in Linux cannot start. | Likely clock/reset/MDIO register model gap. Audit OpenWrt DTS clock/reset requirements and QEMU MDIO/GMAC implementation. |
 | E36-11 | open | `ipq5018-gmac-dwmac ... IRQ eth_wake_irq not found`; `IRQ sfty not found`; deferred probe: `failed to parse stmmac dt parameters` | Linux GMAC does not probe. | Some IRQ names and/or stmmac DT parameters are missing in the effective DT, plus MDIO is already failing. Fix DT + clock/reset + MDIO together. |
 | E36-12 | open | `genirq: Setting trigger mode 1 for irq 24 failed`; `qcom-q6-mpd ... failed to acquire wdog IRQ`; remoteproc probe `error -22` | WiFi remoteproc cannot start. | Need valid WCSS/Q6 watchdog IRQ wiring and a broader remoteproc/firmware-loading model. Not required for NAND/rootfs, but required for "100%" hardware emulation. |
 | E36-13 | open | `thermal thermal_zone0..3: Temperature check failed (-110)` | Thermal zones time out. | Implement TSENS/thermal register responses or patch DT to defer thermal zones until the model exists. |
-| E36-14 | open | `UBI error: cannot open mtd rootfs, error -2` | Kernel cannot find runtime MTD `rootfs`; real flash rootfs boot is blocked. | Downstream of E36-09: Linux serial NAND probe fails, so no MTD partition table appears. Fix NAND DMA-engine path first. |
+| E36-14 | partial | original log: `UBI error: cannot open mtd rootfs, error -2`; after section 38: OpenWrt 6.12 creates `mtd11 (rootfs)` but fails with `vtbl_check: bad CRC`; vendor 4.4.60 creates `rootfs`/`rootfs_1` but panics after `ubi_attach_mtd_dev: failed to attach mtd11, error -22` | Kernel now finds the runtime `rootfs` MTD partition; real flash rootfs boot is still blocked because UBI cannot trust the volume table read from NAND. | No longer downstream of NAND probe. Next action is to fix QPIC page-read data layout/content for UBI: ECC/OOB/read-location/codeword or flash-offset mapping. |
 | E36-15 | data/build | repeated `jbd2: Unknown symbol ...`; `xhci_hcd: Unknown symbol ...`; later `kmodloader: 5 modules could not be probed` | Module noise during early boot. | Looks like OpenWrt module/kernel ABI mismatch or intentionally incomplete initramfs module set. Track separately from SoC emulation unless reproduced with a clean matching OpenWrt build. |
 | E36-16 | open | `ipq5018-tlmm ... unable to lock HW IRQ 14/16`; `gpio-keys ... failed to request irq` | Reset/WPS key IRQs do not work. | Improve TLMM GPIO direction/IRQ locking semantics so `gpio-keys` can claim button lines. |
 | E36-17 | data/build | `Cannot parse config file '/etc/fw_env.config': No such file or directory` | OpenWrt cannot read U-Boot env from userspace. | Rootfs config/package issue unless we decide to ship an emulator-specific `/etc/fw_env.config` in the test image. Related to E36-02 but not an SoC blocker. |
@@ -2984,3 +2984,97 @@ the Linux-side ID-read command sequence (`spi-qpic-snand.c` /
 the emulated QPIC register/data path return the same `c8 c1` ID bytes
 for every read variant the kernel performs, not just the APPSBL/U-Boot
 variant.
+
+## 38. Partial fix for E36-09/E36-14: Linux NAND ID and MTD partitions now work; next blocker is UBI data fidelity
+
+The second pass at E36-09 found two more Linux-vs-APPSBL BAM details.
+Together, they explain why APPSBL/U-Boot could use the emulated serial
+NAND while Linux still saw zeroes or mismatched ID bytes.
+
+First, Linux's upstream `drivers/dma/qcom/bam_dma.c` uses
+`DESC_FLAG_CMD = BIT(11)` in the 16-bit BAM descriptor flags field.
+The APPSBL/U-Boot path uses the older command flag bit already modeled
+by this emulator (`BIT(3)`). The command-pipe parser now accepts either
+flag, so command-element batches from both boot stages are interpreted.
+
+Second, Linux programs `BAM_P_FIFO_SIZESn` with `BAM_FIFO_SIZE`
+(`SZ_32K - 8`), but the descriptor ring allocated by `bam_alloc_chan()`
+is `BAM_DESC_FIFO_SIZE` (`SZ_32K`). The emulator used the programmed
+size directly as a power-of-two wrap mask. With `0x7ff8 - 1`, a new
+event offset of `0x0008` was masked back to zero, so the Linux command
+descriptor could be skipped or stale descriptors could be replayed.
+The model now normalizes the Linux-programmed `32K - 8` value back to
+the backing 32 KiB ring size before calculating descriptor deltas.
+
+Verified by rebuilding `mr80x-qemu:9.1.0` and booting the OpenWrt
+repacked image:
+
+```sh
+./run.sh --no-net --nand-image images/full_firmware_openwrt.bin
+```
+
+The old OpenWrt 6.12 symptoms no longer appear:
+
+- no `qcom_snand ... failure in submitting spi init descriptor`;
+- no `spi-nand spi0.0: unknown raw ID 0000000000`;
+- no `probe with driver spi-nand failed with error -95`.
+
+Instead, Linux now identifies the serial NAND and creates the partition
+table from the flash image:
+
+```text
+spi-nand spi0.0: GigaDevice SPI NAND was found.
+spi-nand spi0.0: 128 MiB, block size: 128 KiB, page size: 2048, OOB size: 128
+15 fixed-partitions partitions found on MTD device spi0.0
+mtd: setting mtd11 (rootfs) as root device
+```
+
+The next OpenWrt blocker is later, inside UBI:
+
+```text
+ubi0: attaching mtd11
+ubi0 error: vtbl_check: bad CRC at record 3: 0x9f200908, not 0x000000
+ubi0 error: ubi_read_volume_table: both volume tables are corrupted
+ubi0 error: ubi_attach_mtd_dev: failed to attach mtd11, error -22
+```
+
+Also verified with the unmodified full vendor flash image:
+
+```sh
+./run.sh --no-net --nand-image images/FULL_FIRMWARE.bin
+```
+
+The old vendor Linux 4.4.60 NAND-ID failure no longer appears:
+
+- no `nand: second ID read did not match 00,00 against c8,c1`;
+- no `nand: No NAND device found`.
+
+Instead, the vendor kernel now identifies the chip and enumerates the
+real flash partitions:
+
+```text
+nand: device found, Manufacturer ID: 0xc8, Chip ID: 0xc1
+nand: GigaDevice GD5F1GQ4RE9IG SPI NAND 1G 1.8V
+16 ofpart partitions found on MTD device qcom_nand.0
+0x000000640000-0x000003040000 : "rootfs"
+0x000003040000-0x000005a40000 : "rootfs_1"
+```
+
+The vendor path reaches the same next layer and then fails because UBI
+does not accept the volume-table bytes read from `rootfs`:
+
+```text
+ubi0: attaching mtd11
+ubi0 error: vtbl_check: bad CRC at record 11: 0x315afa8e, not 0xffffffff
+ubi0 error: process_lvol: both volume tables are corrupted
+ubi0 error: ubi_attach_mtd_dev: failed to attach mtd11, error -22
+VFS: Cannot open root device "mtd:ubi_rootfs" or unknown-block(31,11): error -2
+Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(31,11)
+```
+
+So E36-09 remains **partial** only because the subsystem is not fully
+bootable yet; the NAND probe/ID layer itself is fixed. E36-14 also
+moves from "no `rootfs` MTD exists" to "`rootfs` exists, but UBI data
+readback is not faithful enough". The next concrete task is to trace
+QPIC page reads for UBI volume-table pages: read-location programming,
+codeword layout, OOB/ECC bytes, and flash-file offset mapping.
