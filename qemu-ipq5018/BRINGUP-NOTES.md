@@ -1471,16 +1471,129 @@ from the FIT image, no debug symbols). Eventually panics
 watchdog-style 5-second countdown, back to the u-boot banner - a clean,
 real reboot cycle, not a hang.
 
-Resolving *this* specific crash would most likely mean either building a
-symbol-matched kernel to identify the exact faulting driver, or
-iteratively disabling/stubbing suspect DT nodes (coresight/ETM is a
-plausible first guess, being debug-only silicon this emulator obviously
-can't model) - each fix likely to reveal the next unimplemented
-peripheral's driver hitting the same class of problem. This confirms
-section 25's scope assessment: getting u-boot to fully verify, load, and
-correctly hand off to the kernel (this project's original goal) is done;
-getting that kernel all the way to a userspace shell is open-ended further
-work emulating individual Qualcomm platform drivers one at a time.
+**Update - resolved in section 27**: this exact crash was the CoreSight
+NULL-pointer Oops, fixed by patching the CoreSight nodes out of the live
+device tree before kernel handoff. The "iteratively disabling/stubbing
+suspect DT nodes" guess above was correct.
+
+## 27. Continuing past CoreSight: BAM probe fix, IRQ wiring, and the current frontier (kernel NAND DMA protocol)
+
+Direct continuation of section 26, working iteratively per explicit
+instruction: fix, rebuild, test, repeat on whatever crash/error appears
+next, until real progress stalls.
+
+**CoreSight NULL-pointer Oops - fixed.** Root-caused the crash flagged as
+open in section 26. Since the device tree comes from inside the signed
+FIT image (not this project's own source), the fix patches the *live*,
+already-loaded DTB in guest RAM directly, triggered off u-boot's own UART
+TX stream (the existing UART TX path now watches for the literal
+"Starting kernel" string - the last thing u-boot ever prints - confirming
+the DTB is fully placed and about to be handed off, no timing assumptions
+or hardcoded addresses needed). No libfdt available to this build, so
+this hand-rolls the flattened-devicetree structure-block format directly
+in `mr80x_patch_fdt_disable_coresight()`/`mr80x_try_patch_fdt_at()`.
+
+Getting this right took several real bugs, each found via temporary debug
+instrumentation against a live boot (removed once confirmed working):
+
+- A naive "first FDT magic in RAM" scan finds false positives before the
+  real DTB: the kernel image itself (decompressed at a lower address)
+  coincidentally contains the same 4 magic bytes somewhere in several MB
+  of code/data, and separately, u-boot's own FIT image container (loaded
+  whole, earlier, at `CONFIG_SYS_LOAD_ADDR`) is *itself* valid FDT-format
+  data. Fixed by only accepting a candidate whose "compatible"/"model"
+  property contains "ipq5018" - this board's real, independently-confirmed
+  identity (section 25).
+- An off-by-4 reading the FDT header: `off_dt_strings` is at byte offset
+  12, not 16 (offset 16 is `off_mem_rsvmap`) - made every property-name
+  string-table lookup resolve to garbage, so nothing ever matched
+  "compatible" and nothing got patched, silently.
+- CoreSight's TMC/funnel/ETM/replicator nodes don't have "coresight"
+  anywhere in their "compatible" string at all - they bind through the
+  generic ARM PrimeCell/AMBA bus via `compatible = "arm,primecell"` plus a
+  numeric peripheral ID. Fixed by tracking (per DT node, via a small
+  nesting-depth stack) whether the node carries any `"coresight-*"`
+  property instead (true of every real CoreSight component, e.g.
+  `coresight-name`, regardless of which bus binds it) and blanking that
+  node's "compatible" value if so.
+
+Verified: no more CoreSight probing in dmesg at all, no more panic. Kernel
+now gets past *all* driver probing through to attempting to mount root.
+
+**BAM probe (`bam-dma-engine`) failing with -EINVAL for every instance -
+fixed for the QPIC/NAND one.** New symptom after CoreSight: `UBI error:
+cannot open mtd rootfs`, traced back through `qcom-nandc 79b0000.qpic-nand:
+failed to request tx channel` to `bam-dma-engine: probe of 7984000.dma
+failed with error -22`. Root cause, found by reading the (newer, but same
+`qcom,bam-v1.7.0` register layout - matches this exact DT node's
+compatible string) `bam_dma.c` available elsewhere in this workspace:
+`bam_init()` reads `BAM_REVISION` (offset `0x1000` for this layout) to
+compute `num_ees` from bits `[11:8]`, and requires the DT's `"qcom,ee"`
+value (0 here) be strictly less than it. Left at this model's all-zero
+default for every unhandled BAM offset (falls through to
+`generic_regs[]`), `num_ees` read as 0, so `0 >= 0` was always true and
+probe always failed - for *every* BAM instance on the board, not just
+QPIC/NAND's. Fixed by seeding `BAM_REVISION` (`num_ees=1`) and
+`BAM_NUM_PIPES` (matching this model's real `MR80X_BAM_NUM_PIPES=4`) in
+`mr80x_bam_reset()`.
+
+Verified: the QPIC-NAND BAM instance (`7984000.dma`) now probes
+successfully and `qcom-nandc` obtains a DMA channel - real progress from
+"failed to request tx channel" to actually *submitting* descriptors, which
+now fail for a different, deeper reason (below). Two other BAM instances
+(`7884000.dma`, `704000.dma` - unrelated to NAND/rootfs, presumably
+console-DMA and crypto-engine BAMs) still fail to probe; lower priority
+since they don't block root mount.
+
+**Current frontier: `qcom-nandc 79b0000.qpic-nand: Error in submitting
+descriptor to write config reg`, then `failure submitting descs for
+command 255/144`, ultimately still `UBI error: cannot open mtd rootfs`.**
+Confirmed via temporary debug instrumentation that the kernel's "cmd" pipe
+(index 2 - `dmas = <0x05 0x00 0x05 0x01 0x05 0x02 0x05 0x03>` /
+`dma-names = "tx\0rx\0cmd\0status"` in the DT, the *same* 4 pipe roles and
+indices appsbl's own driver already uses) sends descriptors that: carry
+the `BAM_DESC_CMD_FLAG` bit this model checks for, decode to *plausible*
+`cmd_element`-format `{addr_n_cmd, reg_data, mask=0xFFFFFFFF, ...}` tuples,
+and target register addresses correctly within `[MR80X_NAND_BASE,
+MR80X_NAND_BASE + MR80X_NAND_SIZE)` - i.e. this model's *existing*
+`mr80x_bam_process_cmd_desc()` (built for appsbl's own hand-rolled
+cmd_element usage) appears to already be structurally compatible with
+whatever `write_reg_dma()`/`prep_dma_desc()` (in the reference driver, at
+least) constructs, and should be applying the register writes correctly.
+
+Also wired the BAM's own interrupt (SPI `0x92`, `dma@7984000`'s DT node)
+to the GIC - the kernel's `bam-dma-engine` is interrupt-driven (unlike
+appsbl's polling driver, which is why this stayed unwired through the
+whole rest of this project), pulsed whenever a pipe's `irq_stts` becomes
+set from descriptor processing, matching the reference driver's own
+`bam_dma_irq()`/`process_channel_irqs()` (reads `BAM_IRQ_SRCS_EE` then
+per-pipe `BAM_P_IRQ_STTS`/clears via `BAM_P_IRQ_CLR` - all three already
+correctly modeled here for appsbl's own use). Confirmed this is a real,
+correct fix in isolation, but a full boot test shows it alone doesn't
+resolve the error - identical failure persists.
+
+**Genuinely stuck without kernel source** at this exact point, unlike
+every other issue in this file: the literal error string ("Error in
+submitting descriptor to write config reg") doesn't appear in *any* Linux
+kernel source tree available anywhere in this workspace - this device's
+kernel is an older (4.4.60), downstream Qualcomm fork of `qcom_nandc.c`/
+`bam_dma.c`, and only *newer* (mainline-adjacent, different wording and
+probably different structure in places) versions of both files happen to
+be present elsewhere in this workspace for unrelated projects. Everything
+diagnosed so far in this section relied on those newer versions being
+*close enough* to infer the general mechanism (register offsets, overall
+probe/IRQ flow) - which worked for BAM_REVISION and the IRQ wiring, both
+independently confirmable as correct - but the exact reason the *specific*
+descriptor submission still fails needs either this device's *actual*
+kernel source (not available) or further blind experimentation (e.g.
+whether `write_reg_dma()`-equivalent code in *this* kernel batches
+multiple register writes into fewer/larger cmd_element buffers than
+`prep_dma_desc()` does, whether `BAM_P_SW_OFSTS` - read by
+`bam_read_offset_update()` per appsbl's own driver, section 13/14, but not
+obviously used by the reference `bam_dma.c` - matters to *this* kernel's
+driver specifically, or something about multi-descriptor completion
+ordering across the "tx"/"cmd" pipes this synchronous, single-kick-at-a-
+time model doesn't capture).
 
 ## Status / next steps (in order)
 
@@ -1578,25 +1691,30 @@ work emulating individual Qualcomm platform drivers one at a time.
     4 chars/write, unlike u-boot's always-1; was silently dropping
     3 of 4). Real, fully-readable kernel dmesg now flows for many
     seconds of genuine platform-driver probing.
-22. **Next, still open, and open-ended**: the kernel now hits a real,
-    specific NULL-pointer-dereference Oops during early driver probing
-    (full register dump + backtrace in section 26) and panics/reboots
-    - not a hang or silence anymore, a concrete bug to chase, but
-    likely the first of several as each fixed driver probe reveals the
-    next unimplemented peripheral. No symbol table matches this exact
-    32-bit ARM Linux 4.4.60 kernel build to identify the faulting
-    function precisely (the `System.map`/`vmlinux` elsewhere in this
-    workspace are for an unrelated aarch64 target). This is
-    fundamentally a different, larger scope than "emulate what u-boot
-    needs" (this project's original, now-complete goal) - getting a
-    full Linux userspace shell means emulating individual Qualcomm
-    platform drivers one at a time, open-ended.
-23. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
+22. [done] MILESTONE (section 27): root-caused and fixed the CoreSight
+    NULL-pointer Oops by patching those DT nodes out before kernel
+    handoff (debug-only silicon this emulator can't model). Also fixed
+    the kernel's `bam-dma-engine` probe failing for every BAM instance
+    (missing `BAM_REVISION`/`BAM_NUM_PIPES`) and wired the BAM's own
+    interrupt to the GIC. Kernel now gets past all driver probing to
+    attempting root mount.
+23. **Next, still open**: `qcom-nandc`'s DMA descriptor submission to
+    the QPIC/NAND BAM's "cmd" pipe still fails
+    (`UBI error: cannot open mtd rootfs`) even though the descriptor
+    content, addressing, and IRQ delivery all check out correctly
+    against the closest available reference driver source (section 27
+    has full detail). This device's *exact* kernel (4.4.60, a
+    downstream Qualcomm fork) isn't available anywhere in this
+    workspace to pin down the remaining gap precisely - the first
+    point in this whole project where continuing needs either that
+    source or further blind experimentation, rather than being
+    directly traceable the way everything up to here was.
+24. NAND *write* path (`DATA_CONSUMER_PIPE`, index 0) still isn't
     driven - real flashing after signature verification (section 16)
     still fails with "Attempt to write outside the flash area". Lower
     priority since it doesn't block the recovery/signing test flow
     (the HTTP response is "Upgrade Success" regardless).
-24. Once kernel handoff and NAND write both work: test `out/appsbl-dual-key.bin`
+25. Once kernel handoff and NAND write both work: test `out/appsbl-dual-key.bin`
     (accepts either the original vendor key or the swapped-in custom
     one) and a full-size real firmware image, not just a small test
     payload.
