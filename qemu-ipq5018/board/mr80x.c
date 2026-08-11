@@ -721,10 +721,15 @@ typedef struct MR80XNandState {
      * of real data, same as before this existed. */
     const uint8_t *image_data;
     size_t image_size;
-    /* Running byte offset in the current read stream.  The low 16 bits of
-     * NAND_ADDR0 select the initial column.  Page reads then stream each
-     * 2048-byte main area plus the 16 OOB bytes this APPSBL asks for before
-     * advancing to the next page in multi-page reads. */
+    /* Running byte offset in the current main-area read stream.  The low
+     * 16 bits of NAND_ADDR0 select the initial column.  APPSBL's bundled
+     * 2016-era NAND stack feeds NAND_ADDR0/1 as page numbers for the UBI
+     * boot volume it loads itself, while the Linux QPIC/SPI-NAND stacks
+     * observed after handoff feed the same registers in 512-byte codeword
+     * units.  mr80x_bam_process_raw_desc() below converts that register
+     * address according to the current boot phase.  Small OOB/spare/ECC
+     * data descriptors are synthesized as 0xff and deliberately do not
+     * consume bytes from the linear main-area backing file. */
     uint32_t page_read_offset;
 } MR80XNandState;
 
@@ -850,8 +855,6 @@ static const MemoryRegionOps mr80x_nand_ops = {
 #define MR80X_BAM_EE 0
 
 #define MR80X_NAND_OOB_STREAM_SIZE 16
-#define MR80X_NAND_READ_STREAM_STRIDE \
-    (MR80X_NAND_PAGE_SIZE + MR80X_NAND_OOB_STREAM_SIZE)
 #define MR80X_BAM_DESC_FIFO_SIZE (32 * KiB)
 
 #define BAM_P_CTRLn_BASE          0x00013000
@@ -1008,25 +1011,28 @@ static void mr80x_bam_process_cmd_desc(MR80XBamState *s, hwaddr desc_addr)
     }
 }
 
+/* Set when APPSBL has handed control to a Linux kernel.  It is intentionally
+ * not image-specific: both the vendor dump and the OpenWrt-repacked dump use
+ * APPSBL/U-Boot first, then a Linux QPIC/SPI-NAND driver after handoff. */
+static bool mr80x_linux_nand_phase;
+
 /* Data-producer pipe (real page reads) and status pipe (per-codeword
  * auto-status) descriptors are plain {dest, len} buffers, not
  * cmd_element batches - see the comment block above. The *source*
  * side (which bytes of real flash a given descriptor should deliver)
- * is tracked separately in MR80XNandState.page_read_offset.  It starts at
- * NAND_ADDR0's low-16-bit column and advances through the 2048-byte main
- * area plus the 16-byte OOB slot requested by this APPSBL before rolling
- * to the next page in multi-page reads.  The *destination* address is
- * always taken directly from the descriptor itself, since the real
- * driver already computes a distinct, correctly-offset buffer
- * pointer per codeword (qpic_nand.c's `buffer += data_bytes`
- * between iterations, not shown in the cmd/data split above but
- * present in the real loop). Once page_read_offset reaches
- * MR80X_NAND_PAGE_SIZE (2048), any further bytes in this same page
- * read are OOB/spare data (real serial NAND spare-area bytes, not
- * captured by a raw MR80X_NAND_IMAGE dump) - filled with 0xFF
- * ("erased flash") rather than real content, which is fine: nothing
- * that matters for booting (env parsing, kernel/rootfs loading)
- * reads OOB data, only the main 2048 bytes/page. */
+ * is tracked separately in MR80XNandState.page_read_offset.  APPSBL
+ * addresses the backing dump in 2048-byte page units while loading its
+ * bootable UBI volume; Linux addresses the controller in 512-byte
+ * codeword units.  MR80X_NAND_IMAGE is a linear dump of the 2048-byte
+ * main areas, so the base conversion must follow the phase.  The stream
+ * advances only for main-area descriptors.  Small OOB/spare/ECC
+ * descriptors are filled with 0xff because the dump does not contain
+ * physical spare bytes; however, UBI EC/VID headers may be read through
+ * small data descriptors too, so obvious UBI header reads are passed
+ * through from the image instead of being mistaken for OOB.  The
+ * *destination* address is always taken directly from the descriptor
+ * itself, since the real driver already computes distinct,
+ * correctly-offset buffers per codeword. */
 static void mr80x_bam_process_raw_desc(MR80XBamState *s, int pipe,
                                         hwaddr desc_addr)
 {
@@ -1051,19 +1057,56 @@ static void mr80x_bam_process_raw_desc(MR80XBamState *s, int pipe,
 
     /* MR80X_BAM_DATA_PRODUCER_PIPE */
     {
-        uint32_t base_page = (nand->regs[NAND_ADDR0_OFF / 4] >> 16) |
+        uint32_t base_addr = (nand->regs[NAND_ADDR0_OFF / 4] >> 16) |
                              (nand->regs[NAND_ADDR1_OFF / 4] << 16);
         uint32_t stream_off = nand->page_read_offset;
         uint32_t done = 0;
+        uint64_t file_base = mr80x_linux_nand_phase ?
+                             (uint64_t)base_addr * 512 :
+                             (uint64_t)base_addr * MR80X_NAND_PAGE_SIZE;
+
+        if (len < 128) {
+            uint32_t page_delta = stream_off / MR80X_NAND_PAGE_SIZE;
+            uint32_t column = stream_off % MR80X_NAND_PAGE_SIZE;
+            uint64_t file_off = file_base +
+                                (uint64_t)page_delta *
+                                MR80X_NAND_PAGE_SIZE + column;
+
+            if (mr80x_linux_nand_phase &&
+                nand->image_data && file_off + len <= nand->image_size &&
+                len >= 4 &&
+                !memcmp(nand->image_data + file_off, "UBI", 3)) {
+                memcpy(buf, nand->image_data + file_off, len);
+                cpu_physical_memory_write(dest_addr, buf, len);
+                nand->page_read_offset = stream_off + len;
+                return;
+            }
+
+            if (mr80x_linux_nand_phase && nand->image_data && len >= 4) {
+                uint64_t vid_off = file_base + MR80X_NAND_PAGE_SIZE;
+
+                if (vid_off + len <= nand->image_size &&
+                    !memcmp(nand->image_data + vid_off, "UBI", 3)) {
+                    memcpy(buf, nand->image_data + vid_off, len);
+                    cpu_physical_memory_write(dest_addr, buf, len);
+                    return;
+                }
+            }
+
+            memset(buf, 0xFF, len);
+            cpu_physical_memory_write(dest_addr, buf, len);
+            return;
+        }
 
         while (done < len) {
-            uint32_t page_delta = stream_off / MR80X_NAND_READ_STREAM_STRIDE;
-            uint32_t column = stream_off % MR80X_NAND_READ_STREAM_STRIDE;
+            uint32_t page_delta = stream_off / MR80X_NAND_PAGE_SIZE;
+            uint32_t column = stream_off % MR80X_NAND_PAGE_SIZE;
             uint32_t chunk;
 
             if (column < MR80X_NAND_PAGE_SIZE) {
                 uint32_t main_left = MR80X_NAND_PAGE_SIZE - column;
-                uint64_t file_off = (uint64_t)(base_page + page_delta) *
+                uint64_t file_off = file_base +
+                                    (uint64_t)page_delta *
                                     MR80X_NAND_PAGE_SIZE + column;
 
                 chunk = MIN((uint32_t)len - done, main_left);
@@ -1073,10 +1116,7 @@ static void mr80x_bam_process_raw_desc(MR80XBamState *s, int pipe,
                     memset(buf + done, 0xFF, chunk);
                 }
             } else {
-                uint32_t oob_left = MR80X_NAND_READ_STREAM_STRIDE - column;
-
-                chunk = MIN((uint32_t)len - done, oob_left);
-                memset(buf + done, 0xFF, chunk);
+                g_assert_not_reached();
             }
 
             done += chunk;
@@ -1819,6 +1859,7 @@ static void mr80x_watch_for_kernel_handoff(uint8_t c)
         mr80x_kernel_handoff_match++;
         if (mr80x_kernel_handoff_match == strlen(needle)) {
             mr80x_kernel_handoff_triggered = true;
+            mr80x_linux_nand_phase = true;
             mr80x_patch_fdt_disable_coresight(mr80x_machine);
         }
     } else {
@@ -2762,6 +2803,7 @@ static void mr80x_reset(void *opaque)
          * kernel Image + FDT appsbl's own FIT-loading logic already
          * placed there survive this reset untouched. */
         mr80x_aarch32_handoff_pending = false;
+        mr80x_linux_nand_phase = true;
 
         set_feature(&rs->cpu->env, ARM_FEATURE_AARCH64);
         unset_feature(&rs->cpu->env, ARM_FEATURE_EL3);
@@ -2797,6 +2839,7 @@ static void mr80x_reset(void *opaque)
     rs->cpu->psci_conduit = QEMU_PSCI_CONDUIT_DISABLED;
     mr80x_kernel_handoff_match = 0;
     mr80x_kernel_handoff_triggered = false;
+    mr80x_linux_nand_phase = false;
 
     if (!mr80x_psci_watch_timer) {
         mr80x_psci_watch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,

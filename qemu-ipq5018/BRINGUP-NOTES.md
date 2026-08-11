@@ -3078,3 +3078,72 @@ moves from "no `rootfs` MTD exists" to "`rootfs` exists, but UBI data
 readback is not faithful enough". The next concrete task is to trace
 QPIC page reads for UBI volume-table pages: read-location programming,
 codeword layout, OOB/ECC bytes, and flash-file offset mapping.
+
+## 39. Current dual-image error checklist: both dumps now share the same Linux UBI blocker
+
+Retested the same board model against both local images:
+
+```sh
+./run.sh --no-net --nand-image images/full_firmware_openwrt.bin
+./run.sh --no-net --nand-image images/FULL_FIRMWARE.bin
+```
+
+The same code path is still used for both images; the board model does
+not branch on the filename. The current NAND read mapping now branches
+only by boot phase: APPSBL/U-Boot keeps the page-unit interpretation
+that lets it load the FIT from UBI, while Linux uses the codeword-unit
+interpretation observed in the QPIC/SPI-NAND drivers.
+
+Checklist from the latest logs:
+
+- [x] APPSBL is loaded from the real full-flash image's APPSBL
+  partition.
+- [x] APPSBL/U-Boot detects serial NAND as GD5F1GQ4RE9IG
+  (`ID = c1c8`, `Vendor = c8`, `Device = c1`).
+- [x] APPSBL/U-Boot attaches its boot UBI volume and loads the FIT
+  `kernel` volume for both images.
+- [x] OpenWrt repacked image boots the AArch64 6.12 kernel and reaches
+  userspace/preinit.
+- [x] Vendor/full image boots the ARM 4.4.60 kernel and enumerates the
+  real NAND partitions.
+- [x] Linux-side NAND ID/probe works on both images:
+  `spi-nand spi0.0: GigaDevice SPI NAND was found` on OpenWrt and
+  `nand: device found, Manufacturer ID: 0xc8, Chip ID: 0xc1` on the
+  vendor kernel.
+- [x] Linux-side MTD partition discovery works on both images:
+  `rootfs` starts at `0x640000`; vendor also exposes `rootfs_1`.
+- [ ] Linux-side UBI attach is still not correct. The previous
+  volume-table CRC errors have moved, but the active failure on both
+  images is now:
+
+  ```text
+  ubi0: attaching mtd11
+  ubi0: scanning is finished
+  ubi0 error: ubi_read_volume_table: the layout volume was not found
+  ubi0 error: ubi_attach_mtd_dev: failed to attach mtd11, error -22
+  ```
+
+- [ ] Vendor/full still panics after that because the kernel has no
+  initramfs fallback:
+
+  ```text
+  VFS: Cannot open root device "mtd:ubi_rootfs" ...
+  Kernel panic - not syncing: VFS: Unable to mount root fs
+  ```
+
+- [ ] OpenWrt repacked continues into initramfs/preinit, but the real
+  rootfs UBI volume is not attached, so this is not yet a full flash
+  boot.
+- [ ] Secondary hardware gaps remain visible and are intentionally
+  separate from the rootfs blocker: SPI NOR probe warning, bad U-Boot
+  env CRC, ART MAC validation, SMEM, secondary CPU/PSCI, MDIO/GMAC
+  details, clocks, watchdog/thermal/remoteproc, and module dependency
+  noise in the repacked OpenWrt userspace.
+
+The immediate next fix is no longer NAND-ID or partition discovery.
+It is QPIC read-location fidelity for UBI layout-volume reads after
+Linux handoff: the emulator must distinguish main-area data descriptors
+from OOB/ECC descriptors using the programmed read-location registers,
+not only descriptor length. The current length/content heuristic is
+diagnostic and still insufficient for UBI to find the internal layout
+volume.
