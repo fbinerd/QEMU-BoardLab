@@ -3147,3 +3147,59 @@ from OOB/ECC descriptors using the programmed read-location registers,
 not only descriptor length. The current length/content heuristic is
 diagnostic and still insufficient for UBI to find the internal layout
 volume.
+
+## 40. Linux QPIC read-location queue: committed checkpoint before the next UBI data-fidelity pass
+
+The current board model now has an explicit Linux-side NAND read queue
+instead of trying to answer every BAM data descriptor from only the
+descriptor length. This is still the same generic path for both tested
+images:
+
+```sh
+./run.sh --no-net --nand-image images/full_firmware_openwrt.bin
+./run.sh --no-net --nand-image images/FULL_FIRMWARE.bin
+```
+
+What changed in this checkpoint:
+
+- QPIC `NAND_READ_LOCATION_*` and `NAND_READ_LOCATION_LAST_CW_*`
+  programming is tracked after Linux handoff.
+- Data returned through the BAM data-producer pipe is queued from the
+  programmed read locations, so descriptors consume the data prepared by
+  the matching `NAND_EXEC_CMD`.
+- Linux codeword addressing remains biased only in the runtime NAND
+  phase so APPSBL/U-Boot keep their proven page-unit boot mapping.
+- Large "last codeword" spare/OOB-only reads are now answered as erased
+  spare data (`0xff`) instead of accidentally leaking main-area UBI
+  bytes into bad-block/spare checks.
+- Temporary diagnostic `mr80x nand trace` logging was removed before
+  commit so normal boots stay readable.
+
+Updated correction checklist:
+
+- [x] Real full-flash APPSBL boot source is used.
+- [x] U-Boot detects the emulated serial NAND ID.
+- [x] U-Boot loads the `kernel` FIT from the real flash-backed UBI
+  volume.
+- [x] Linux NAND/SPI-NAND probe reaches the real MTD partition table on
+  both images.
+- [x] Linux bad-block/spare read path no longer reads main-area bytes
+  for the large spare-only read-location pattern observed during rootfs
+  scanning.
+- [ ] Linux UBI rootfs attach still fails later with
+  `ubi_read_volume_table: the layout volume was not found`; the next
+  fix needs a narrower trace around PEB0/PEB1 VID headers and volume
+  table reads (`0x640000`, `0x640800`, `0x641000`, `0x641800`) to finish
+  QPIC codeword/page/OOB fidelity.
+- [ ] Vendor/full image still panics only after this UBI attach failure
+  because it has no initramfs fallback.
+- [ ] Secondary hardware gaps remain outside this commit: ART MAC
+  validation, SPI NOR warning, SMEM, PSCI/CPU1, MDIO/GMAC details,
+  clocks/watchdog/thermal/remoteproc, and OpenWrt userspace module
+  dependency noise.
+
+This commit is therefore a real cleanup/progress checkpoint, not the
+final "perfect" hardware model. The next useful debug pass should be
+short and targeted: trace only early UBI layout-volume reads and compare
+the bytes delivered by BAM against the bytes at the same offsets in
+`images/full_firmware_openwrt.bin` and `images/FULL_FIRMWARE.bin`.

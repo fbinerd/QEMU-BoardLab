@@ -698,10 +698,40 @@ static const MemoryRegionOps mr80x_pshold_ops = {
 #define NAND_EXEC_CMD_OFF         0x0010
 #define NAND_FLASH_STATUS_OFF     0x0014
 #define NAND_READ_ID_OFF          0x0040
+#define NAND_READ_LOCATION_0_OFF  0x0F20
+#define NAND_READ_LOCATION_3_OFF  0x0F2C
+#define NAND_READ_LOCATION_LAST_CW_0_OFF 0x0F40
+#define NAND_READ_LOCATION_LAST_CW_3_OFF 0x0F4C
 #define NAND_DEV_CMD_VLD_V1_5_20_OFF 0x70AC
 
 #define NAND_CMD_FETCH_ID 0x0B
 #define MR80X_NAND_PAGE_SIZE 2048
+#define MR80X_NAND_READQ_DEPTH 32
+#define MR80X_NAND_READQ_MAX 4096
+/* The Linux QPIC/SPI-NAND stacks observed here program NAND_ADDR0/1 in
+ * 512-byte codeword units, but once MTD partition reads are routed back
+ * to the controller they arrive 0x200 codewords below the corresponding
+ * byte offset in this linear full-flash dump.  The first runtime UBI
+ * rootfs PEB is the clearest example in both supported images:
+ *   requested base 0x3000 -> raw 0x600000 without this bias,
+ *   real UBI EC header             is at 0x640000.
+ * Keep the bias Linux-only and apply it only past the low boot/training
+ * partitions so APPSBL/U-Boot and early low-offset probes retain their
+ * original addressing. */
+#define MR80X_LINUX_NAND_BIAS_START 0x00600000u
+#define MR80X_LINUX_NAND_FILE_BIAS  0x00040000u
+
+/* Set when APPSBL has handed control to a Linux kernel.  It is intentionally
+ * not image-specific: both the vendor dump and the OpenWrt-repacked dump use
+ * APPSBL/U-Boot first, then a Linux QPIC/SPI-NAND driver after handoff. */
+static bool mr80x_linux_nand_phase;
+
+typedef struct MR80XNandReadQueueEntry {
+    uint8_t data[MR80X_NAND_READQ_MAX];
+    uint32_t len;
+    uint32_t pos;
+    bool oob_only;
+} MR80XNandReadQueueEntry;
 
 /* Fake serial NAND identity: GigaDevice GD5F1GQ4RE9IG (id bytes
  * {0xc8,0xc1} in qpic_serial_nand_tbl[]) - chosen because its
@@ -721,6 +751,14 @@ typedef struct MR80XNandState {
      * of real data, same as before this existed. */
     const uint8_t *image_data;
     size_t image_size;
+    MR80XNandReadQueueEntry readq[MR80X_NAND_READQ_DEPTH];
+    uint32_t readq_head;
+    uint32_t readq_count;
+    uint32_t exec_read_offset;
+    uint32_t linux_oob_read_offset;
+    uint64_t read_loc_seq;
+    uint64_t read_loc_normal_gen;
+    uint64_t read_loc_last_gen;
     /* Running byte offset in the current main-area read stream.  The low
      * 16 bits of NAND_ADDR0 select the initial column.  APPSBL's bundled
      * 2016-era NAND stack feeds NAND_ADDR0/1 as page numbers for the UBI
@@ -740,6 +778,13 @@ static void mr80x_nand_reset(void *opaque)
     memset(s->regs, 0, sizeof(s->regs));
     s->regs[NAND_VERSION_OFF / 4] = 0x20000000u;
     s->page_read_offset = 0;
+    s->readq_head = 0;
+    s->readq_count = 0;
+    s->exec_read_offset = 0;
+    s->linux_oob_read_offset = 0;
+    s->read_loc_seq = 0;
+    s->read_loc_normal_gen = 0;
+    s->read_loc_last_gen = 0;
     /* image_data/image_size describe the persistent flash backing and must
      * survive a SoC reset, just like the contents of physical NAND. */
 }
@@ -747,6 +792,133 @@ static void mr80x_nand_reset(void *opaque)
 static uint32_t mr80x_nand_reg_read(MR80XNandState *s, hwaddr offset)
 {
     return s->regs[offset / 4];
+}
+
+static void mr80x_nand_readq_clear(MR80XNandState *s)
+{
+    s->readq_head = 0;
+    s->readq_count = 0;
+}
+
+static MR80XNandReadQueueEntry *mr80x_nand_readq_push(MR80XNandState *s)
+{
+    uint32_t slot;
+
+    if (s->readq_count == MR80X_NAND_READQ_DEPTH) {
+        s->readq_head = (s->readq_head + 1) % MR80X_NAND_READQ_DEPTH;
+        s->readq_count--;
+    }
+
+    slot = (s->readq_head + s->readq_count) % MR80X_NAND_READQ_DEPTH;
+    s->readq_count++;
+    s->readq[slot].len = 0;
+    s->readq[slot].pos = 0;
+    s->readq[slot].oob_only = false;
+    return &s->readq[slot];
+}
+
+static MR80XNandReadQueueEntry *mr80x_nand_readq_front(MR80XNandState *s)
+{
+    if (!s->readq_count) {
+        return NULL;
+    }
+    return &s->readq[s->readq_head];
+}
+
+static void mr80x_nand_readq_pop(MR80XNandState *s)
+{
+    if (s->readq_count) {
+        s->readq_head = (s->readq_head + 1) % MR80X_NAND_READQ_DEPTH;
+        s->readq_count--;
+    }
+}
+
+static void mr80x_nand_queue_linux_read(MR80XNandState *s)
+{
+    MR80XNandReadQueueEntry *qe;
+    uint32_t base_addr, i;
+    uint64_t file_base;
+    hwaddr loc_base;
+    uint32_t main_advanced = 0;
+
+    if (!mr80x_linux_nand_phase ||
+        (!s->read_loc_normal_gen && !s->read_loc_last_gen)) {
+        return;
+    }
+
+    base_addr = (s->regs[NAND_ADDR0_OFF / 4] >> 16) |
+                (s->regs[NAND_ADDR1_OFF / 4] << 16);
+    file_base = (uint64_t)base_addr * 512;
+    if (file_base >= MR80X_LINUX_NAND_BIAS_START) {
+        file_base += MR80X_LINUX_NAND_FILE_BIAS;
+    }
+    loc_base = (s->read_loc_last_gen > s->read_loc_normal_gen) ?
+               NAND_READ_LOCATION_LAST_CW_0_OFF : NAND_READ_LOCATION_0_OFF;
+
+    qe = mr80x_nand_readq_push(s);
+
+    for (i = 0; i < 4 && qe->len < MR80X_NAND_READQ_MAX; i++) {
+        uint32_t loc = s->regs[(loc_base + i * 4) / 4];
+        uint32_t off = loc & 0xFFFF;
+        uint32_t size = (loc >> 16) & 0x7FFF;
+        uint32_t chunk = MIN(size, MR80X_NAND_READQ_MAX - qe->len);
+        uint32_t copied = 0;
+        bool likely_spare_only = (i == 0 &&
+                                  loc_base == NAND_READ_LOCATION_LAST_CW_0_OFF &&
+                                  (loc & (1u << 31)) &&
+                                  chunk > 512);
+
+        if (!size) {
+            continue;
+        }
+
+        if (likely_spare_only) {
+            qe->oob_only = true;
+            memset(qe->data + qe->len, 0xFF, chunk);
+            qe->len += chunk;
+            copied += chunk;
+        } else if (i == 0 && off > 0 && chunk <= 128) {
+            uint64_t file_off = file_base + MR80X_NAND_PAGE_SIZE +
+                                s->linux_oob_read_offset;
+
+            if (s->image_data && file_off + chunk <= s->image_size) {
+                memcpy(qe->data + qe->len, s->image_data + file_off, chunk);
+            } else {
+                memset(qe->data + qe->len, 0xFF, chunk);
+            }
+            qe->len += chunk;
+            copied += chunk;
+            s->linux_oob_read_offset += chunk;
+        } else if (i == 0 && off < MR80X_NAND_PAGE_SIZE) {
+            uint32_t main_left = MR80X_NAND_PAGE_SIZE - off;
+            uint32_t main_chunk = MIN(chunk, main_left);
+            uint64_t file_off = file_base + s->exec_read_offset + off;
+
+            if (s->image_data && file_off + main_chunk <= s->image_size) {
+                memcpy(qe->data + qe->len, s->image_data + file_off,
+                       main_chunk);
+            } else {
+                memset(qe->data + qe->len, 0xFF, main_chunk);
+            }
+            qe->len += main_chunk;
+            copied += main_chunk;
+            main_advanced = MAX(main_advanced, off + main_chunk);
+        }
+
+        if (i == 0 && copied < chunk) {
+            memset(qe->data + qe->len, 0xFF, chunk - copied);
+            qe->len += chunk - copied;
+        }
+
+        if (loc & (1u << 31)) {
+            break;
+        }
+    }
+
+    s->exec_read_offset += main_advanced;
+    if (s->exec_read_offset >= MR80X_NAND_PAGE_SIZE) {
+        s->exec_read_offset %= MR80X_NAND_PAGE_SIZE;
+    }
 }
 
 /* Shared by both direct-MMIO writes and the BAM cmd-pipe engine below -
@@ -762,6 +934,19 @@ static void mr80x_nand_reg_write(MR80XNandState *s, hwaddr offset,
 
     if (offset == NAND_ADDR0_OFF) {
         s->page_read_offset = value & 0xffff;
+        s->exec_read_offset = value & 0xffff;
+        s->linux_oob_read_offset = 0;
+        mr80x_nand_readq_clear(s);
+    }
+
+    if (offset >= NAND_READ_LOCATION_0_OFF &&
+        offset <= NAND_READ_LOCATION_3_OFF) {
+        s->read_loc_normal_gen = ++s->read_loc_seq;
+    }
+
+    if (offset >= NAND_READ_LOCATION_LAST_CW_0_OFF &&
+        offset <= NAND_READ_LOCATION_LAST_CW_3_OFF) {
+        s->read_loc_last_gen = ++s->read_loc_seq;
     }
 
     if (offset == NAND_EXEC_CMD_OFF && (value & mask & 0x1)) {
@@ -771,6 +956,7 @@ static void mr80x_nand_reg_write(MR80XNandState *s, hwaddr offset,
         if (cmd == NAND_CMD_FETCH_ID) {
             s->regs[NAND_READ_ID_OFF / 4] = MR80X_FAKE_NAND_ID;
         }
+        mr80x_nand_queue_linux_read(s);
     }
 }
 
@@ -1011,11 +1197,6 @@ static void mr80x_bam_process_cmd_desc(MR80XBamState *s, hwaddr desc_addr)
     }
 }
 
-/* Set when APPSBL has handed control to a Linux kernel.  It is intentionally
- * not image-specific: both the vendor dump and the OpenWrt-repacked dump use
- * APPSBL/U-Boot first, then a Linux QPIC/SPI-NAND driver after handoff. */
-static bool mr80x_linux_nand_phase;
-
 /* Data-producer pipe (real page reads) and status pipe (per-codeword
  * auto-status) descriptors are plain {dest, len} buffers, not
  * cmd_element batches - see the comment block above. The *source*
@@ -1056,6 +1237,41 @@ static void mr80x_bam_process_raw_desc(MR80XBamState *s, int pipe,
     }
 
     /* MR80X_BAM_DATA_PRODUCER_PIPE */
+    if (mr80x_linux_nand_phase) {
+        uint32_t done = 0;
+
+        while (done < len) {
+            MR80XNandReadQueueEntry *qe = mr80x_nand_readq_front(nand);
+            uint32_t avail, chunk;
+
+            if (!qe || qe->pos >= qe->len) {
+                memset(buf + done, 0xFF, len - done);
+                break;
+            }
+
+            if (qe->oob_only) {
+                memset(buf + done, 0xFF, len - done);
+                mr80x_nand_readq_pop(nand);
+                done = len;
+                break;
+            }
+
+            avail = qe->len - qe->pos;
+            chunk = MIN((uint32_t)len - done, avail);
+            memcpy(buf + done, qe->data + qe->pos, chunk);
+            qe->pos += chunk;
+            done += chunk;
+
+            if (qe->pos >= qe->len) {
+                mr80x_nand_readq_pop(nand);
+            }
+        }
+
+        cpu_physical_memory_write(dest_addr, buf, len);
+        return;
+    }
+
+    /* MR80X_BAM_DATA_PRODUCER_PIPE */
     {
         uint32_t base_addr = (nand->regs[NAND_ADDR0_OFF / 4] >> 16) |
                              (nand->regs[NAND_ADDR1_OFF / 4] << 16);
@@ -1066,33 +1282,6 @@ static void mr80x_bam_process_raw_desc(MR80XBamState *s, int pipe,
                              (uint64_t)base_addr * MR80X_NAND_PAGE_SIZE;
 
         if (len < 128) {
-            uint32_t page_delta = stream_off / MR80X_NAND_PAGE_SIZE;
-            uint32_t column = stream_off % MR80X_NAND_PAGE_SIZE;
-            uint64_t file_off = file_base +
-                                (uint64_t)page_delta *
-                                MR80X_NAND_PAGE_SIZE + column;
-
-            if (mr80x_linux_nand_phase &&
-                nand->image_data && file_off + len <= nand->image_size &&
-                len >= 4 &&
-                !memcmp(nand->image_data + file_off, "UBI", 3)) {
-                memcpy(buf, nand->image_data + file_off, len);
-                cpu_physical_memory_write(dest_addr, buf, len);
-                nand->page_read_offset = stream_off + len;
-                return;
-            }
-
-            if (mr80x_linux_nand_phase && nand->image_data && len >= 4) {
-                uint64_t vid_off = file_base + MR80X_NAND_PAGE_SIZE;
-
-                if (vid_off + len <= nand->image_size &&
-                    !memcmp(nand->image_data + vid_off, "UBI", 3)) {
-                    memcpy(buf, nand->image_data + vid_off, len);
-                    cpu_physical_memory_write(dest_addr, buf, len);
-                    return;
-                }
-            }
-
             memset(buf, 0xFF, len);
             cpu_physical_memory_write(dest_addr, buf, len);
             return;
