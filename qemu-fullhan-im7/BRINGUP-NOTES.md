@@ -238,34 +238,143 @@ access elsewhere would be completely silent too — no way yet to tell
 computation" apart from "waiting on a register we do stub but haven't
 logged yet because it hasn't been reached" from the current log alone.
 
+## 5. Two real bugs found via gdbstub, then: the real U-Boot banner
+
+Continuing straight from attempt 3's silence, live, with the user
+watching (`./run.sh` from their own terminal, no output - same as
+attempt 3 above).
+
+**Diagnosis, not another guess**: attached `gdb-multiarch` to QEMU's
+`-S -gdb tcp::1234` gdbstub (both containers on `--network host` so they
+can reach each other), let it `continue` for a few seconds, then
+snapshotted registers. `sp = 0x0`, `pc` in some address this file never
+computed on purpose (`0xa5ec0270`, later `0xa2f4cc00` on a repeat) - a
+stack that was never really initialized, and a CPU that had wandered off
+somewhere.
+
+**Bug 1 - RAM didn't cover the real stack address.** Disassembling
+straight through from file offset `0x1000` (past the `0xFF` padding) to
+`0x2100` found something the earlier push-`{lr}`-density scan (section 1)
+never revealed because vector tables don't have that pattern: a genuine,
+textbook ARM exception vector table sits at file offset `0x2000` -
+`b 0x2054` (reset), seven `ldr pc, [pc, #20]` handler slots, and the
+classic `0x12345678` vector-table magic number right after. Reset code at
+`0x2054` is an equally textbook U-Boot `start.S`: CPSR mode switch to
+SVC, a VBAR write (see attempt 2 above - this is the exact instruction
+that faulted on `arm926`), cache/TLB invalidate, SCTLR read-modify-write
+(MMU/cache enable), then `sp = *(0x2398) - 0x480000 - 0x80`. Reading
+`0x2398` directly from the file: `0xA0800000` - a plain, sensible,
+already-correct absolute address, so this isn't a relocation problem.
+`0xA0800000 - 0x480080 = 0xA037FF80` - **~4.5 MB *below*
+`IM7CAM_RAM_BASE`**, which back then was the same as the image's load
+address. Every stack push landed in unmapped memory, silently discarded
+(`ignore_memory_transaction_failures = true`), corrupting execution with
+no error until the CPU eventually jumped somewhere nonsensical. Fixed by
+separating "where the image loads" (`IM7CAM_IMAGE_LOAD_ADDR`, unchanged,
+`0xA0800000`) from "where RAM starts" (`IM7CAM_RAM_BASE`, moved down to
+`0xA0000000` - a round, conservative choice comfortably below the
+computed SP, not itself independently confirmed as the chip's real DRAM
+base).
+
+**Bug 2 - the whole file (header included) was being loaded, but
+shouldn't be.** Same diagnostic technique, after bug 1's fix: `sp` *still*
+read back as `0`. The VBAR write above sets VBAR to the plain value at
+file offset `0x2398`, which is `0xA0800000` - i.e., in the image's own
+linked assumptions, its exception vector table's real runtime address
+*is* `IM7CAM_IMAGE_LOAD_ADDR` itself, not `IM7CAM_IMAGE_LOAD_ADDR + 0x2000`
+where this skeleton had been putting it (matching where the vector table
+sits *in the file*, under the "load the whole file unmodified" hypothesis
+section 1 started with). The only way both facts are true together is if
+the real loader **skips the first `0x2000` bytes** (header + relocation
+table) and places file offset `0x2000` at `IM7CAM_IMAGE_LOAD_ADDR`. Fixed:
+`im7cam_init()` now reads the file itself (`g_file_get_contents` +
+`rom_add_blob_fixed`, since `load_image_targphys()` has no byte-offset
+support) and loads everything from file offset `IM7CAM_HEADER_SKIP`
+(`0x2000`) onward; the entry point is now the plain load address, no
+`+0x2000` needed since that offset is now baked into what gets skipped
+before loading, not added after.
+
+**Result**: with both fixed, real trace output appeared - `0xF0700000`
+(the UART address from section 2) got hit with exactly the sequence
+predicted there (poll offset `0x7c` for bit `0x2`, write data to offset
+`0x0`, including the literal byte `0x41`/`'A'` matching the struct-init
+disassembly). Rewired the UART from a logging stub to a real (if
+minimal) polled device - TX-only, status register hardcoded
+always-ready, wired to the real `-serial stdio` backend the same way
+`qemu-ipq5018/board/mr80x.c`'s own UART does (`qemu_chr_fe_init(...,
+serial_hd(0), ...)`) - and:
+
+```
+U-Boot 2010.06 (Sep 27 2024 - 18:56:13)
+```
+
+**printed for real**, on the actual emulated console - the same banner
+string this device's real hardware prints, confirmed identical earlier
+in the device-level investigation (`particoes/0_U-Boot.bin`'s own
+strings). First real output from this machine model.
+
+(One more small bug hit and fixed along the way, not evidence-driven,
+just a build mistake: the first UART-wiring attempt segfaulted QEMU
+itself immediately, `gdb`'s backtrace pointed at `qemu_chr_fe_init`
+receiving a garbage `Chardev *` - `serial_hd()` is declared in
+`sysemu/sysemu.h`, which this file wasn't including, so the compiler
+silently assumed an `int`-returning implicit declaration and truncated
+the real pointer. Added the include, gone.)
+
+After the banner, execution spins hard (millions of iterations within
+the run) on `0xf0e00000` offset `0x1c` (write, an incrementing byte
+pattern `0x00..0xff` then `0xff << 20`) then offset `0x28` (read-only
+poll) - reads exactly like a timer/counter reload-then-wait-for-expiry
+sequence. Made that one read return `0xFFFFFFFF` (a quick "does this
+unblock it" probe, *not* a modeled register - unlike the UART case nothing
+in our own disassembly has been cross-referenced for this one yet) and
+the hard spin is gone: execution now walks through a long, non-repeating
+sequence of distinct register writes across that same `0xf0e00000` block
+(offsets `0x0`, `0x8`, `0x10`, `0x14`, `0x1c`, `0x20`, `0x2c`, `0x60`,
+`0xf4`, `0xf8`, `0xfc`, `0x100`, `0x104`, ...) with values like
+`0xb0000000` and `0xff00000` showing up - reads like a real clock/PLL
+controller init sequence, not a stuck loop. Still running (not yet
+reached another logged milestone) when the 10s test window ended.
+
 ## Status
 
-**Boots into real code, doesn't reach a device yet.** Concretely:
-image format (section 1), UART address (section 2, medium-high
-confidence), and now also CPU core (section 3 — upgraded from a guess to
-`cortex-a7`, confirmed ARMv7-A-class by a real VBAR fault, though the
-*exact* core within that class is still unconfirmed) all have real
-evidence behind them, not blind guesses, matching this project's standard.
+**Real progress, not just a skeleton anymore.** The actual
+`U-Boot 2010.06 (Sep 27 2024 - 18:56:13)` banner - this exact device's
+real banner - prints on the emulated console. Every address load-bearing
+enough to have actually mattered so far (image load/header-skip, entry
+point, UART base + TX/status register offsets, CPU ISA class) is now
+either directly confirmed by real execution or has real supporting
+evidence, not a guess, matching this project's standard throughout.
+
+What's proven by the fact that this booted this far:
+- `IM7CAM_IMAGE_LOAD_ADDR = 0xA0800000` with the first `0x2000` bytes of
+  the file skipped - confirmed (VBAR self-consistency, section 5).
+- `IM7CAM_ENTRY` = that same address, no offset - confirmed.
+- `cortex-a7` (or at least something ARMv7-A-class with the same visible
+  behavior) - confirmed enough to reach real C code and drive a real
+  peripheral correctly.
+- UART at `0xF0700000`, TX data at `+0x0`, status at `+0x7c` with ready
+  bit `0x2` - confirmed by the banner actually printing.
+- `IM7CAM_RAM_BASE = 0xA0000000` / `IM7CAM_RAM_SIZE = 64 MiB` - good
+  enough to cover everything touched so far; still not independently
+  confirmed as the chip's real DRAM window.
 
 Next steps, in order of how cheap they are to try:
 
-1. **Longer run + `-d in_asm` or a GDB session** (`gdb-multiarch` is
-   already in this board's own image) attached to the QEMU gdbstub to see
-   where the PC actually is after attempt 3's 10s window — settles
-   "looping" vs. "still making forward progress slowly" directly instead
-   of guessing from silence.
-2. If looping in RAM: the relocation table (section 1) is the next
-   suspect — if U-Boot's own startup code tries to walk/apply it and the
-   `0xed000000`-based addressing scheme means something this skeleton
-   isn't providing (e.g., expects that table's addresses to *also* be
-   accessible somewhere, not just be data), that would hang without ever
-   touching a peripheral.
-3. If looping on a genuinely-unmapped read: flip
-   `ignore_memory_transaction_failures` off temporarily to get a hard
-   fault with an address instead of silence — trades "boots further"
-   (real hardware/firmware tolerates aborts less gracefully when this is
-   off) for "tells you exactly where," useful as a one-shot diagnostic
-   even if left on normally.
-4. Confirm/refine `IM7CAM_RAM_SIZE` (currently a placeholder 64 MiB guess)
-   and `IM7CAM_RAM_BASE`'s exact whole-file-vs-header-skipped loading
-   question (still open per section 1) if the above point at either.
+1. **Let it run longer** (the 10s test window may simply not have been
+   enough for a real clock/PLL init sequence + whatever comes after) -
+   the cheapest thing to try before writing any more code.
+2. **Model `0xf0e00000` for real** if it turns out to still be stuck
+   somewhere in there on a longer run - same trace-driven method as the
+   UART: find the *specific* offset it spins on next, cross-reference
+   against the disassembly around where these writes originate (not done
+   yet for this block - the UART case had a full disassembly
+   cross-reference, section 2/4/5; this one so far is trace-only).
+3. **RX path** - nothing's needed it yet (TX-only U-Boot banner output),
+   but interactive console input (autoboot interrupt, `run dk`, etc. -
+   see the device-level investigation's TFTP recovery notes) will need
+   it. Not modeled at all currently.
+4. Once past whatever `0xf0e00000` is: watch for the next stub region
+   getting hit (I2C0/GPIO0/SPI0, or a genuinely new untraced address if
+   `ignore_memory_transaction_failures` is masking one) and repeat the
+   same method.
