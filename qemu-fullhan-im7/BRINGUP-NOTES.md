@@ -1519,3 +1519,80 @@ interrupt, minimal interrupt controller, Fullhan SPI capability status, and
 the vendor console-index compatibility fix are active. Full boot is not yet
 claimed: MMC voltage-switch polling and incomplete clock-tree values are the
 next blockers.
+
+## 18. Two MMC hosts, direct MMU translation, and the real rootfs wall
+
+The repeated `voltage switch read MCI_RESP0..3 : 0x0` was investigated with
+the authorized kernel and flash artifacts under
+`openwrt-build-tools/tools/firmware-lab/work/miboim7-tudo-sobre`; they were
+read-only reference inputs and were not modified.
+
+The live request routine at `0xC01F0800` reads its host MMIO base from object
+offset `+0x10`. Its command-status loop reads MMIO `+0x44`; bit 2 takes the
+completed-command path, while bit 10 reaches the driver's literal
+`irq cmd status stat = 0x%x is timeout error!`. With neither bit present the
+routine retries up to 100 times, reads response words, stores `-ETIMEDOUT`,
+and produces the visible voltage-switch retry. This agrees with the common
+DesignWare MMC raw-interrupt layout, but the conclusion here comes from this
+kernel's own branches and strings rather than that resemblance.
+
+The callback at `0xC01EF8D0` reads MMIO `+0x50`, masks bit 0 and returns it.
+The first prototype incorrectly called that bit `ready` and retained all
+unknown writes. The trace disproved both choices:
+
+- a write of 1 to `+0x10` followed by 51 reads is a self-clearing reset wait;
+  retaining the write made the bit remain stuck, so unknown writes are again
+  trace-only;
+- changing `+0x50` from zero to one changed the visible kernel result from
+  `card0 connected!` to `card0 disconnected!`. Bit 0 therefore means card
+  absent, not ready.
+
+An earlier guest-error trace appeared to associate the host with
+`0xE0700000`, but that was only temporal correlation with another block. The
+decisive check used QEMU's page translation while the driver was stopped:
+
+```text
+host0 object 0xC21CAA40, MMIO VA 0xC2A04000
+gva2gpa 0xC2A04000 -> 0xE2000000
+
+host1 object 0xC21CAE40, MMIO VA 0xC2A0C000
+gva2gpa 0xC2A0C000 -> 0xE2200000
+```
+
+As a cross-check, the provisional model at `0xE0700000` returned command-done
+when read physically with monitor `xp`, while the stopped driver's `r7` still
+contained zero. The provisional address was removed. Two narrow MMC regions
+now exist at the directly translated physical bases. Because no SD/SDIO
+image is attached, each exposes card-absent at `+0x50`; no fake card protocol
+or data contents are claimed.
+
+The exact normal runner command was rebuilt and tested for 60 seconds. The
+result changed materially:
+
+```text
+card0 disconnected!
+card1 disconnected!
+NET: Registered protocol family 17
+init_machine_late
+hctosys: unable to open rtc device (rtc0)
+List of all partitions:
+1f04            5696 mtdblock4  (driver?)
+No filesystem could mount root, tried:  squashfs
+Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(31,4)
+```
+
+The voltage-switch loop is gone. The new wall is the real root filesystem
+read through Linux's SPI/MTD path: partition discovery succeeds and identifies
+the correct `mtdblock4`, but SquashFS cannot read/mount its contents. This is
+now the next fidelity target; the kernel panic is not presented as a complete
+boot.
+
+## Status (updated again, section 18)
+
+The documented runner visibly boots Linux through all built-in device probes
+and reaches the root mount attempt. Both directly identified MMC hosts are
+coherently reported absent when no card image is supplied, eliminating the
+previous endless voltage-switch diagnostics. Full boot is still not claimed:
+the Linux SPI/MTD read path does not yet supply a mountable SquashFS image from
+the real flash-backed `mtdblock4`, and missing clock-tree values still produce
+non-fatal division-by-zero diagnostics during probe.

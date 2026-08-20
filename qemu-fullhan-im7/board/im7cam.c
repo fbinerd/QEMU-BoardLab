@@ -191,6 +191,28 @@
 #define IM7CAM_INTC_REG_ACK_LO 0x08
 #define IM7CAM_TIMER0_HWIRQ 3
 
+/* Section 18: the vendor MMC host object's mapped base was captured live
+ * as virtual 0xC2A04000. QEMU's own `gva2gpa 0xC2A04000` translates it to
+ * physical 0xE2000000. This corrects an earlier temporal correlation with
+ * sparse guest-error accesses at 0xE0700000: an `xp` read proved the model
+ * at E070 returned bit 2 while r7 in the actual driver remained zero.
+ * A second callback hit captured host1 at virtual 0xC2A0C000, translated
+ * directly by `gva2gpa` to physical 0xE2200000.
+ * The callback at 0xC01EF8D0 loads base + 0x50, masks bit 0 and returns it.
+ * A controlled run proves 0 means connected and 1 means disconnected.
+ * Since no removable-card image is attached, both discovered hosts expose
+ * the proven absent indication. Unknown writes remain
+ * trace-only: the first experiment retained them and exposed offset +0x10
+ * as a self-clearing reset bit, where storing the written 1 made the driver
+ * retry its read 51 times and stop. */
+#define IM7CAM_MMC0_BASE 0xE2000000
+#define IM7CAM_MMC1_BASE 0xE2200000
+#define IM7CAM_MMC_SIZE 0x1000
+#define IM7CAM_MMC_REG_RAW_IRQ 0x44
+#define IM7CAM_MMC_REG_CARD_ABSENT 0x50
+#define IM7CAM_MMC_IRQ_COMMAND_DONE (1 << 2)
+#define IM7CAM_MMC_CARD_ABSENT 1
+
 /* This exact vendor kernel leaves its registered fh_serial console index
  * at -1, making its write callback return without touching the UART. The
  * static object is virtual 0xC034C038 -> RAM physical 0xA034C038; index is
@@ -940,6 +962,64 @@ static void im7cam_add_dma(MemoryRegion *sysmem, Im7camSpiState *spi)
 }
 
 /* ============================================================
+ * Evidence-scoped MMC probe model. This is not yet a card/data-path
+ * implementation: it exposes the card-absence bit whose meaning was proven
+ * by the kernel's own visible connected/disconnected report.
+ * ============================================================ */
+
+typedef struct Im7camMmcState {
+    MemoryRegion iomem;
+} Im7camMmcState;
+
+static uint64_t im7cam_mmc_read(void *opaque, hwaddr offset, unsigned size)
+{
+    if (offset == IM7CAM_MMC_REG_CARD_ABSENT) {
+        /* The initial name "ready" was disproved by the visible probe:
+         * changing this bit from 0 to 1 changed the kernel's report from
+         * `card0 connected!` to `card0 disconnected!`. No SD image is
+         * attached, so absent is the only coherent state. */
+        return IM7CAM_MMC_CARD_ABSENT;
+    }
+    if (offset == IM7CAM_MMC_REG_RAW_IRQ) {
+        /* 0xc01f0890 tests bit 2 first and takes the completed-command
+         * path. Bit 10 instead prints the driver's literal "timeout
+         * error". With neither bit, it retries 100 times and reports
+         * -ETIMEDOUT, which caused the visible voltage-switch loop. */
+        return IM7CAM_MMC_IRQ_COMMAND_DONE;
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: observed MMC READ off=0x%" HWADDR_PRIx
+                  " size=%u\n", offset, size);
+    return 0;
+}
+
+static void im7cam_mmc_write(void *opaque, hwaddr offset, uint64_t value,
+                             unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: observed MMC WRITE off=0x%" HWADDR_PRIx
+                  " size=%u val=0x%" PRIx64 "\n", offset, size, value);
+}
+
+static const MemoryRegionOps im7cam_mmc_ops = {
+    .read = im7cam_mmc_read,
+    .write = im7cam_mmc_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static void im7cam_add_mmc(MemoryRegion *sysmem, hwaddr base,
+                           const char *name)
+{
+    Im7camMmcState *s = g_new0(Im7camMmcState, 1);
+
+    memory_region_init_io(&s->iomem, NULL, &im7cam_mmc_ops, s,
+                          name, IM7CAM_MMC_SIZE);
+    memory_region_add_subregion(sysmem, base, &s->iomem);
+}
+
+/* ============================================================
  * Free-running counter, backed by QEMU's own virtual clock so it's
  * always genuinely advancing - just enough for guest code's own
  * elapsed-time/timeout math to eventually see time pass, not a real
@@ -1295,6 +1375,8 @@ static void im7cam_init(MachineState *machine)
     Im7camSpiState *spi = im7cam_add_spi(sysmem,
                                          getenv("IM7CAM_SPI_IMAGE"));
     im7cam_add_dma(sysmem, spi);
+    im7cam_add_mmc(sysmem, IM7CAM_MMC0_BASE, "im7cam.mmc0");
+    im7cam_add_mmc(sysmem, IM7CAM_MMC1_BASE, "im7cam.mmc1");
     Im7camIntcState *intc = im7cam_add_intc(sysmem, cpu);
     im7cam_add_timer(sysmem, intc);
     im7cam_add_reset_ctrl(sysmem);
