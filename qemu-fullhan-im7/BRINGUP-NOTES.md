@@ -886,3 +886,62 @@ as every fix in this file: disassemble around the frozen PC's file
 offset once its exact meaning is understood, don't guess. Recorded here
 so this session's log doesn't lose the thread if it gets interrupted
 before finishing that investigation.
+
+## 11. Past the reset wall too - now stuck on partition-table parsing
+
+Directly asked to keep looping - self-paced, autonomous continuation of
+section 10.
+
+Disassembled around the `0xE0300000` hang (file offset `0x25bb8`):
+`bics r1,r0,r2; bne back`, polling offset `0x2c0` for a `1<<N` bit,
+writing back to offset `0x338` once satisfied - reads like a generic
+interrupt/sync-primitive wait (not confirmed which). Mapped as this
+file's usual first move for anything new - a plain logging stub - then,
+since a bare stub obviously wouldn't unblock a "wait for bit set" poll,
+added the same kind of cheap "make it succeed" probe section 5/6 used
+for the very first timer hang: offset `0x2c0` returns `0xFFFFFFFF`
+unconditionally. Explicitly marked in the code as a probe, not a
+citation-backed register model, unlike everything else in this file.
+
+**Result**: past it immediately, and the "SF: Unsupported manufacturer"
+war is conclusively over - not just quieter, actually gone, along with
+"Can not find any available flash." (present in every single run before
+section 10's fix, absent now). But a new, different failure appears:
+`fail to load partition.txt from 60000` / `fail to init partinfo` -
+loading the actual **partition table** (from the `partition` CramFS
+partition at file offset `0x60000`, confirmed real per the device-level
+investigation) still fails, even though basic flash communication now
+demonstrably works (the ID probe proves that). Ends the same way as
+every other unresolved-flash run: full TFTP recovery attempt, then
+`resetting ...`.
+
+**Working theory, not yet confirmed**: section 10 only fixed the
+byte-mode (`sl==8`) read path, used by the small 5-byte ID probe. Loading
+a whole partition-table file is a much larger read, plausibly taking the
+*other* read path this file already found but never exercised - file
+offset `0x9e14`'s genuinely 32-bit-wide FIFO drain (`sl==32`,
+`ldr ip,[fp]; str ip,[r9,r0,lsl#2]`, four bytes actually consumed per
+access, correctly, unlike the byte-mode bug). If that path has its own
+version of section 10's bug #1 (relying on `IM7CAM_SPI_REG_AVAIL` to
+report a real chunk size, currently hardcoded to always `1` regardless
+of access width) it would make correspondingly little forward progress
+per poll for a bulk 32-bit-word read, or interact with the "always 1"
+answer in some other wrong way this session hasn't traced yet. Not
+confirmed - the next concrete step, same method as every fix in this
+file: get a real trace of *this specific* failure (which register
+gets polled, what data actually comes back) rather than reasoning from
+the code shape alone.
+
+## Status (updated again, section 11)
+
+Two real, load-bearing subsystems now confirmed correct end-to-end and
+not just individually: UART (TX+RX, disassembly-confirmed protocol) and
+the SPI flash ID probe (root cause found via real U-Boot 2010.06 source,
+both the missing byte-count register and the size-blind FIFO
+consumption bug fixed). The boot now gets further than at any earlier
+point in this file's history - past the manufacturer-detection wall that
+consumed most of sections 6-10 combined - before hitting a new, distinct
+wall in partition-table loading. Likely the same *class* of bug
+(chunk-size/available-count handling) hitting a different, larger-read
+code path, not yet confirmed. Next step: real trace of the
+`0x9e14`/32-bit-word path specifically.

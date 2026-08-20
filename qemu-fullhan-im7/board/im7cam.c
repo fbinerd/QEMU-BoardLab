@@ -135,6 +135,17 @@
 #define IM7CAM_GPIO0_BASE 0xF0300000
 #define IM7CAM_SPI0_LABELED_BASE  0xF0500000  /* fh8852v201-dump's SPI0 label - see IM7CAM_SPI_BASE below, this chip's real one turned out to be elsewhere */
 #define IM7CAM_UNK_D_BASE 0xF0D00000
+/* Section 10: first thing hit past the fixed RDID/flash-probe wall - a
+ * completely different peripheral prefix (not 0xF0xxxxxx like every
+ * other block in this file). Disassembly around the hang
+ * (`bics r1,r0,r2; bne back` polling offset 0x2c0 for a `1<<N` bit,
+ * writing back to offset 0x338 once satisfied) reads like a generic
+ * interrupt/sync-primitive wait, not confirmed what it really is yet -
+ * mapped as a plain logging stub first (this file's own established
+ * first move for anything new) specifically to observe real access
+ * patterns before modeling it, same as UART/SPI/timer/reset-ctrl all
+ * started. */
+#define IM7CAM_UNK_E0300000_BASE 0xE0300000
 #define IM7CAM_PERIPH_STUB_SIZE 0x10000
 
 /* Free-running timer/counter - found via gdbstub, not the trace log this
@@ -222,9 +233,25 @@
 
 static uint64_t im7cam_unimp_read(void *opaque, hwaddr offset, unsigned size)
 {
+    const char *name = (const char *)opaque;
+
+    /* Cheap "make the poll succeed and see what happens next" probe -
+     * same technique section 5/6 used to get past the very first
+     * timer-adjacent hang, explicitly NOT a modeled register (unlike
+     * every other special-cased offset in this file, which all have a
+     * disassembly citation backing the exact value). File offset
+     * 0x25bb8's `bics r1,r0,r2; bne back` wants offset 0x2c0 to contain
+     * whatever bit(s) r0 needs set - 0xFFFFFFFF trivially satisfies any
+     * single/multi-bit test, at the cost of not knowing what the real
+     * bit layout is. Revisit properly once real trace output shows what
+     * this code does *after* getting past this point. */
+    if (name && !strcmp(name, "im7cam.unk-0xe0300000") && offset == 0x2c0) {
+        return 0xFFFFFFFF;
+    }
+
     qemu_log_mask(LOG_UNIMP,
                   "im7cam: unimplemented READ  region=%s off=0x%" HWADDR_PRIx
-                  " size=%u\n", (const char *)opaque, offset, size);
+                  " size=%u\n", name, offset, size);
     return 0;
 }
 
@@ -812,6 +839,9 @@ static void im7cam_init(MachineState *machine)
                              IM7CAM_PERIPH_STUB_SIZE);
     im7cam_add_unimp_region(sysmem, "im7cam.unk-0xf0d00000",
                              IM7CAM_UNK_D_BASE, IM7CAM_PERIPH_STUB_SIZE);
+    im7cam_add_unimp_region(sysmem, "im7cam.unk-0xe0300000",
+                             IM7CAM_UNK_E0300000_BASE,
+                             IM7CAM_PERIPH_STUB_SIZE);
 
     if (!machine->kernel_filename) {
         error_report("im7cam: no -kernel given - pass the extracted "
