@@ -168,7 +168,12 @@
  * rate is exactly what that write would be setting up. */
 #define IM7CAM_TIMER_BASE 0xF0C00000
 #define IM7CAM_TIMER_SIZE 0x10000
+#define IM7CAM_TIMER_REG_LOAD 0x00
 #define IM7CAM_TIMER_REG_COUNT 0x04
+#define IM7CAM_TIMER_REG_CONTROL 0x08
+#define IM7CAM_TIMER_REG_LOAD_1 0x14
+#define IM7CAM_TIMER_REG_DOWNCOUNT 0x18
+#define IM7CAM_TIMER_REG_CONTROL_1 0x1c
 
 /* Reset/clock-management block (GCC-equivalent, guessing at the label
  * qemu-ipq5018/board/mr80x.c uses for the analogous IPQ5018 controller -
@@ -916,10 +921,32 @@ static void im7cam_add_dma(MemoryRegion *sysmem, Im7camSpiState *spi)
  * this register block's real tick rate or width turns out to be.
  * ============================================================ */
 
+typedef struct Im7camTimerState {
+    MemoryRegion iomem;
+    uint32_t load[2];
+    uint32_t control[2];
+} Im7camTimerState;
+
 static uint64_t im7cam_timer_read(void *opaque, hwaddr offset, unsigned size)
 {
+    Im7camTimerState *s = opaque;
+    uint32_t ticks = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
     if (offset == IM7CAM_TIMER_REG_COUNT) {
-        return (uint32_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        return (s->control[0] & 1) ? ticks : 0;
+    }
+    if (offset == IM7CAM_TIMER_REG_DOWNCOUNT) {
+        /* Section 14: Linux's clocksource callback at 0xc01f43cc reads
+         * this register and immediately applies MVN. Expose the same
+         * virtual ticks as a descending counter so the guest observes
+         * the complemented result as monotonically increasing. */
+        return (s->control[1] & 1) ? ~ticks : 0;
+    }
+    if (offset == IM7CAM_TIMER_REG_CONTROL) {
+        return s->control[0];
+    }
+    if (offset == IM7CAM_TIMER_REG_CONTROL_1) {
+        return s->control[1];
     }
     qemu_log_mask(LOG_UNIMP,
                   "im7cam: unimplemented READ  region=im7cam.timer "
@@ -930,6 +957,24 @@ static uint64_t im7cam_timer_read(void *opaque, hwaddr offset, unsigned size)
 static void im7cam_timer_write(void *opaque, hwaddr offset, uint64_t value,
                                 unsigned size)
 {
+    Im7camTimerState *s = opaque;
+
+    if (offset == IM7CAM_TIMER_REG_LOAD) {
+        s->load[0] = value;
+        return;
+    }
+    if (offset == IM7CAM_TIMER_REG_LOAD_1) {
+        s->load[1] = value;
+        return;
+    }
+    if (offset == IM7CAM_TIMER_REG_CONTROL) {
+        s->control[0] = value;
+        return;
+    }
+    if (offset == IM7CAM_TIMER_REG_CONTROL_1) {
+        s->control[1] = value;
+        return;
+    }
     qemu_log_mask(LOG_UNIMP,
                   "im7cam: unimplemented WRITE region=im7cam.timer "
                   "off=0x%" HWADDR_PRIx " size=%u val=0x%" PRIx64 "\n",
@@ -946,11 +991,11 @@ static const MemoryRegionOps im7cam_timer_ops = {
 
 static void im7cam_add_timer(MemoryRegion *sysmem)
 {
-    MemoryRegion *mr = g_new0(MemoryRegion, 1);
+    Im7camTimerState *s = g_new0(Im7camTimerState, 1);
 
-    memory_region_init_io(mr, NULL, &im7cam_timer_ops, NULL, "im7cam.timer",
-                           IM7CAM_TIMER_SIZE);
-    memory_region_add_subregion(sysmem, IM7CAM_TIMER_BASE, mr);
+    memory_region_init_io(&s->iomem, NULL, &im7cam_timer_ops, s,
+                           "im7cam.timer", IM7CAM_TIMER_SIZE);
+    memory_region_add_subregion(sysmem, IM7CAM_TIMER_BASE, &s->iomem);
 }
 
 /* ============================================================

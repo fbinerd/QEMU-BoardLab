@@ -1262,3 +1262,86 @@ kernel's own `proc_info` table identifies ARM11/ARMv6 and the `arm1176`
 QEMU model reaches linked kernel code. The current first kernel-side wall
 is the unmapped behavior of timer offset `0x18`; this is the next focused
 bring-up target.
+
+## 14. Linux clocksource at timer `+0x18`
+
+Section 13's repeated reads were localized with a hardware read
+watchpoint on the kernel's virtual address `0xFE010018`. It fires at
+`0xC01F43D4` in this compact callback:
+
+```text
+c01f43cc: ldr r3, [pc, #16]   ; address of timer pointer
+c01f43d0: ldr r3, [r3, #4]   ; r3 = 0xfe010018
+c01f43d4: ldr r0, [r3]       ; raw hardware count
+c01f43d8: mov r1, #0
+c01f43dc: mvn r0, r0          ; expose an increasing clocksource
+c01f43e0: bx  lr
+```
+
+The old unimplemented read returned zero, so the callback returned
+`0xFFFFFFFF` forever. Kernel delay/time calibration consequently made
+millions of calls without observing elapsed time. Timer offset `0x18`
+is now backed by the complement of QEMU virtual-clock ticks: it behaves
+as a descending 32-bit hardware counter, and the driver's own `mvn`
+turns it back into the increasing value it expects. Offset `0x04`
+retains its existing increasing counter behavior for U-Boot.
+
+This is intentionally a semantic minimum, not a claim about the real
+clock frequency, reload registers, or interrupt routing. Those require
+separate evidence; the presently confirmed requirement is wraparound
+32-bit progress with the direction shown above.
+
+The first version stopped there and exposed `+0x18` unconditionally.
+It removed the log flood (about 4.45 million lines became about 13,300
+in a comparable trace) and let Linux configure both timer channels, but
+a subsequent gdb stop still landed in `0xC01F44C4`--`0xC01F4510`. That
+second loop reads channel 0's current value at virtual `0xFE010004`
+(physical `+0x04`) and waits for zero after disabling the channel. The
+old section-6 approximation returned virtual-clock nanoseconds at
+`+0x04` even while disabled, so Linux could only escape accidentally at
+a 32-bit wrap.
+
+The timer model is consequently stateful at the minimum level supported
+by the trace. It records the two observed channel triplets:
+
+| Channel | load | current value | control |
+|---:|---:|---:|---:|
+| 0 | `+0x00` | `+0x04` | `+0x08` |
+| 1 | `+0x14` | `+0x18` | `+0x1C` |
+
+Control bit 0 gates each counter. A disabled channel reads zero, which
+matches the kernel's stop-and-wait sequence; enabled channel 0 exposes
+the increasing virtual ticks U-Boot already relies on, while enabled
+channel 1 exposes their complement for Linux's `mvn` clocksource. Load
+values and full control words are retained even though reload/IRQ
+semantics are not modeled yet. This preserves the evidence boundary:
+only behavior exercised by the real boot path is implemented.
+
+The rebuilt image confirms both parts of the fix. Timer `+0x18` no
+longer appears as unimplemented, the repeated-read flood is gone, and
+Linux gets beyond the timer-channel setup. A later gdb stop now lands at
+`0xC0009D94` in the standard early delay-calibration shape:
+
+```text
+c0009d8c: ldr r2, [r8]       ; snapshot a global tick value
+c0009d90: str r4, [r3]
+c0009d94: ldr r3, [r8]
+c0009d98: cmp r2, r3
+c0009d9c: beq c0009d94       ; wait for the first tick to change
+```
+
+The value never changes because this skeleton has no interrupt
+controller or timer IRQ wired to the CPU. This is a genuinely new wall,
+not another counter-direction issue: the clocksource progresses, but no
+clock-event interrupt advances the kernel tick. The next bring-up step
+is to identify the interrupt-controller block and the IRQ selected by
+the channel-0 timer setup, then assert that line according to the
+observed timer control/reload state.
+
+## Status (updated again, section 14)
+
+Both timer channels now provide the minimal counter/control semantics
+the real boot path demonstrates. Linux completes its timer setup and
+reaches delay calibration. Boot is presently blocked waiting for its
+first timer interrupt; interrupt-controller discovery and timer IRQ
+wiring are the next focused target.
