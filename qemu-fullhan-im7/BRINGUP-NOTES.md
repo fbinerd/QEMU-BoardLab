@@ -378,3 +378,118 @@ Next steps, in order of how cheap they are to try:
    getting hit (I2C0/GPIO0/SPI0, or a genuinely new untraced address if
    `ignore_memory_transaction_failures` is masking one) and repeat the
    same method.
+
+## 6. Real SPI controller, a real timer, and real flash-backed reads
+
+Prompted by the user explicitly asking for NAND/flash-backed booting like
+`qemu-ipq5018`'s `--nand-image`, and by two more real hangs found the same
+way as section 5 (gdbstub snapshot, not guessed).
+
+**What "im7cam.unk-0xf0e00000" turned out to be**: not one mystery block -
+disassembling around the exact hang address (file offset `0xa140`, found
+via `arm-none-eabi-objdump --start-address=0xa100 --stop-address=0xa200`)
+showed a completely ordinary poll: `ldr r3,[r4,#0x28]; and r3,r3,#5; cmp
+r3,#4; bne back`, sitting right next to the exact byte write the trace log
+already showed (`off=0x60 val=0x9f`, matching `str r1,[r4,#0x60]` a few
+lines up in the same disassembly). Renamed the region `IM7CAM_SPI_BASE`
+and built a real (if still evidence-light past these two registers)
+device: FIFO at `+0x60`, status at `+0x28` hardcoded to `0x4` (idle, no
+error - satisfies that exact mask/compare). This is a *second*,
+chip-specific SPI address, different from `IM7CAM_SPI0_LABELED_BASE`
+(`0xF0500000`, the sibling-chip label from section 2/`fh8852v201-dump`) -
+that stub is kept mapped but unused/renamed
+`im7cam.spi0-guess-unused` for now, since nothing has touched it.
+
+**The earlier "fixed" `0x28` poll broke this one**: the section 5 probe
+(`return 0xFFFFFFFF` for that offset) satisfied whatever bit test came
+first, but `0xFFFFFFFF & 5` is `5`, never `4` - so *this* poll, hit later
+on a subsequent call into the same routine, spun forever. Same register,
+two different call sites checking different exact values - a static
+"always return X" guess for a shared status register was always going to
+break one of them eventually. Fixed by returning the disassembly-derived
+`0x4` unconditionally instead.
+
+**A second, separate hang, found the same way (gdbstub snapshot →
+disassemble the frozen PC)**: past the SPI status fix, PC froze at RAM
+address `0xa0820924` (file offset `0x22924`) across two 3-second-apart
+snapshots. That's inside a generic elapsed-time/timeout helper -
+`ldr r2,[r0,#4]` where `r0` is a pool-constant pointer to
+`IM7CAM_TIMER_BASE` (`0xF0C00000` - the same block that got written
+`0x5f5e100` = 100,000,000, a very clock-rate-shaped number, during the
+earlier clock/PLL-looking init sequence in section 5) - a real hardware
+free-running counter read, always 0 from the old catch-all stub, so a
+bounded wait-with-timeout loop's timeout side could never fire. Not an
+infinite loop in the code, an infinite *wait* the skeleton was
+accidentally forcing by never advancing time. Fixed with a genuinely
+minimal timer device: reads at `+0x4` return `qemu_clock_get_ns
+(QEMU_CLOCK_VIRTUAL)` truncated to 32 bits - always moving, not modeling
+the real tick rate/width/IRQs at all.
+
+**Result of both fixes**: the real U-Boot banner is followed by real,
+device-specific output that matches the actual investigation in the
+sibling `openwrt-build-tools` repo *exactly* -
+`fail to load bootargsParametersV22.txt` / `bootargsParametersV21.txt`
+(the literal filenames inside `2_partition.bin`'s CramFS), `DRAM: 64 MiB`,
+`TEXT_BASE:a0800000`, and eventually `Net:` / `MAC: 00:12:34:56:78:9a`
+before the test window ends - a large stretch of genuine, chip-specific
+boot log, not a stub artifact.
+
+**Real flash backing, `--nand-image`-style**: `im7cam_init()` now takes
+`IM7CAM_SPI_IMAGE` (env var, mirroring `MR80X_NAND_IMAGE`'s pattern) and
+loads the real 8 MB dump (`miboim7-spi-en25qh64-8mb-20260819.bin` from the
+device-level investigation) via `g_file_get_contents()`. The SPI device
+parses standard SPI NOR opcodes shifted through the FIFO: `0x03`/`0x0B`
+(READ/FAST_READ) latch a 24-bit big-endian address from the next 3 bytes
+and serve real subsequent bytes from the backing file, auto-incrementing;
+`0x9F` (RDID) and `0x05` (RDSR) return canned responses (real EN25QH64
+JEDEC ID `1C 70 17` - from general knowledge of the part, not
+independently re-verified against a datasheet this session; and an
+"idle, no error" status byte). A write of `0` to `+0x08` resets the
+per-transaction byte accumulator - inferred from the disassembled
+open/close bracket around each burst (`[r4+8]=0` before, `=1` after,
+file offset `0xa120`/`0xa130`), not independently confirmed as literally
+meaning "reset the FIFO parser."
+
+**Known-bad, not yet resolved**: the flash *does* get read for real once
+a `0x03`/`0x0B` command is recognized (confirmed - see next paragraph),
+but the very first thing U-Boot does with it - `SF: Unsupported
+manufacturer b0 e4 83 a0 00` / `Fail probe spi flash.` - still fails, and
+the same exact garbage bytes print with or without the RDID/RDSR support
+above. Traced (`"len is %d"`/`"Unsupported manufacturer"` string
+cross-reference, file offset `0x9d78`'s function) to a *plain 32-bit*
+`str r3,[r4,#0x60]` writing `0xFFFFFFFF` (`mvn r3,#0`) as what should be
+the RDID trigger - added size-aware read/write to the FIFO (a real 4-byte
+`ldr`/`str` should shift 4 sequential bytes, not repeat/zero-pad one) on
+the theory that access-width blindness was the bug, but the *exact same*
+garbage bytes came back afterward, unchanged to the byte - meaning this
+particular probe path isn't exercising `IM7CAM_SPI_BASE`'s FIFO logic at
+all, despite `r4` for the *surrounding* code (offsets `0x0`/`0x4`/`0x8`
+etc., all logged against `im7cam.spi`) resolving correctly. Most likely
+explanation not yet checked: `r0` going into that `0x9d78` function may be
+a generic "spi_slave"-style struct with an *extra* level of pointer
+indirection this trace hasn't been walked through yet, so the real
+opcode/response exchange for *this specific call* happens against a
+struct field this file hasn't identified, not against `IM7CAM_SPI_BASE`
+directly. Left as-is rather than guessed further - matches the earlier
+finding (section 5) that this device's own disassembly, not another
+probe, is what actually resolves these.
+
+**Doesn't block boot**: U-Boot treats the flash-probe failure as
+non-fatal (`Can not find any available flash.` × N, `bad CRC, using
+default environment`) and keeps going - reaches `Net:`/MAC printing
+before the test window ends. Getting a real kernel/rootfs load working
+still needs the RDID mismatch above resolved (or at minimum, confirming
+whether the READ-path address latching this session *did* build correctly
+works for a plain `sf read`/`bootm` attempt even with the ID check
+failing - not tried yet).
+
+## Status (updated)
+
+Boots to real, device-specific U-Boot output well past the banner - DRAM
+size, environment/partition-table load attempts (with real, matching
+filenames), network MAC - backed by a real SPI flash device with an
+actual working timer, not stubs, for everything confirmed so far. The
+JEDEC ID probe is the current known-wrong piece; next session should
+start there (walk `0x9d78`'s caller to find what `r0` really points to,
+rather than extending the current `IM7CAM_SPI_BASE` model further on a
+guess).

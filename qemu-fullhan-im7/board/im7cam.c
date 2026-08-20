@@ -34,6 +34,7 @@
 #include "sysemu/reset.h"
 #include "sysemu/sysemu.h"
 #include "chardev/char-fe.h"
+#include "qemu/timer.h"
 #include "cpu.h"
 #include "qom/object.h"
 
@@ -111,11 +112,46 @@
  * exactly the information this stub exists to surface). */
 #define IM7CAM_I2C0_BASE  0xF0200000
 #define IM7CAM_GPIO0_BASE 0xF0300000
-#define IM7CAM_SPI0_BASE  0xF0500000
-#define IM7CAM_UNK_C_BASE 0xF0C00000
+#define IM7CAM_SPI0_LABELED_BASE  0xF0500000  /* fh8852v201-dump's SPI0 label - see IM7CAM_SPI_BASE below, this chip's real one turned out to be elsewhere */
 #define IM7CAM_UNK_D_BASE 0xF0D00000
-#define IM7CAM_UNK_E_BASE 0xF0E00000
 #define IM7CAM_PERIPH_STUB_SIZE 0x10000
+
+/* Free-running timer/counter - found via gdbstub, not the trace log this
+ * time (section 6): the SPI status poll (previous comment block) doesn't
+ * spin bare - the actual hang was a real, bounded wait-with-timeout loop
+ * that calls a get-elapsed-ticks helper each iteration, and that helper
+ * reads a hardware counter at this block's offset 0x04. Since the
+ * catch-all stub always returns 0 there, elapsed time never advances and
+ * the timeout side of the wait never fires - not a true infinite loop in
+ * the code, just an infinite wait for a timeout that this skeleton was
+ * suppressing. Consistent with earlier trace evidence too: this same
+ * block got written 0x5f5e100 (100,000,000 - a very clock-rate-shaped
+ * number) at offset 0x0 during the earlier clock/PLL-looking init
+ * sequence (section 5) - a free-running counter with a configurable tick
+ * rate is exactly what that write would be setting up. */
+#define IM7CAM_TIMER_BASE 0xF0C00000
+#define IM7CAM_TIMER_SIZE 0x10000
+#define IM7CAM_TIMER_REG_COUNT 0x04
+
+/* This chip's REAL SPI (flash) controller - confirmed by live disassembly
+ * (section 6 of BRINGUP-NOTES.md), not the sibling-chip label above. What
+ * used to be the "im7cam.unk-0xf0e00000" catch-all stub turned out, once
+ * the guest actually started using it heavily, to be exactly this: a
+ * status-poll hang at file offset 0xa140 (`ldr r3,[r4,#0x28]; and
+ * r3,r3,#5; cmp r3,#4; bne back`) sitting right next to a byte written to
+ * `[r4,#0x60]` matching this region's real trace output exactly
+ * (`off=0x60 val=0x9f`) - r4 is this peripheral's base. `[r4,#0x60]` is
+ * the TX/RX data FIFO, `[r4,#0x28]` is a status register whose "idle,
+ * ready, no error" encoding is `0x4` (bit2 set, bit0 clear per that
+ * mask). Everything else in this block (offsets 0x0/0x8/0x10/0x14/0x1c/
+ * 0x20/0x2c and a second cluster at 0xf4/0xf8/0xfc/0x100/0x104) is still
+ * unconfirmed control/clock-config noise, passed through to the same
+ * logging stub every other unmodeled register uses. */
+#define IM7CAM_SPI_BASE       0xF0E00000
+#define IM7CAM_SPI_SIZE       0x10000
+#define IM7CAM_SPI_REG_DATA   0x60
+#define IM7CAM_SPI_REG_STATUS 0x28
+#define IM7CAM_SPI_STATUS_IDLE 0x4
 
 /* ============================================================
  * Catch-all logging stub for every peripheral - literally everything
@@ -129,25 +165,9 @@
 
 static uint64_t im7cam_unimp_read(void *opaque, hwaddr offset, unsigned size)
 {
-    const char *name = (const char *)opaque;
-
-    /* First real "graduate a stub once the trace shows what it needs"
-     * case after the UART one: 0xf0e00000 off 0x1c/0x28 is written an
-     * incrementing byte pattern (0x00..0xff, then 0xff<<20) then spun on
-     * at off 0x28 - reads exactly like a timer/counter's reload-then-
-     * poll-for-expiry sequence. Not yet confirmed *which* register means
-     * what (unlike the UART case, no cross-reference from our own
-     * disassembly has been done for this one yet) - this is a quick
-     * "make the poll succeed and see what happens next" probe, not a
-     * modeled register. Revisit properly if/when it turns out to matter
-     * beyond just unblocking this one spin. */
-    if (name && !strcmp(name, "im7cam.unk-0xf0e00000") && offset == 0x28) {
-        return 0xFFFFFFFF;
-    }
-
     qemu_log_mask(LOG_UNIMP,
                   "im7cam: unimplemented READ  region=%s off=0x%" HWADDR_PRIx
-                  " size=%u\n", name, offset, size);
+                  " size=%u\n", (const char *)opaque, offset, size);
     return 0;
 }
 
@@ -240,6 +260,282 @@ static void im7cam_add_uart(MemoryRegion *sysmem)
     qemu_chr_fe_init(&s->chr, serial_hd(0), &error_abort);
 }
 
+/* ============================================================
+ * Real (if still evidence-light past the two registers section 6 of
+ * BRINGUP-NOTES.md actually confirmed) SPI/flash controller model - the
+ * qemu-ipq5018/board/mr80x.c equivalent of its --nand-image real-flash
+ * backing, for the same reason: without real data behind flash reads,
+ * U-Boot can get the controller "working" (status always idle) but would
+ * only ever read back zeroes/garbage for the actual kernel/rootfs it's
+ * trying to load - can't get further than a bootloader banner without
+ * this.
+ *
+ * Protocol model (heuristic, NOT disassembly-confirmed the way the two
+ * registers below are - expect this part to need iteration once real
+ * trace output shows it's wrong):
+ *   - a write of 0 to offset 0x08 resets the byte accumulator (matches
+ *     the disassembled open/close bracket at file offset 0xa120/0xa130:
+ *     [r4+8]=0 before a burst, =1 after - read as "transaction
+ *     start/end", not confirmed as literally an accumulator reset, but
+ *     it's the only observed signal that brackets each burst).
+ *   - each byte written to the FIFO (offset 0x60, IM7CAM_SPI_REG_DATA)
+ *     appends to that accumulator. Once 4 bytes are in and the first is
+ *     a standard SPI NOR opcode (0x03 READ or 0x0B FAST_READ), the
+ *     remaining 3 are taken as a big-endian 24-bit flash address and
+ *     latched - completely standard SPI NOR protocol, not chip-specific,
+ *     but WHETHER this controller's driver actually uses that standard
+ *     4-byte-header shape hasn't been independently confirmed the way
+ *     the UART's protocol was (section 5) - this is inferred from the
+ *     opcode value alone, not cross-referenced against the driver's own
+ *     disassembly yet.
+ *   - once an address is latched, each FIFO *read* returns the next byte
+ *     from the backing image at that address (auto-incrementing) - or
+ *     0xFF (typical erased-NOR-flash value) if no backing image was
+ *     given.
+ *   - status (offset 0x28, IM7CAM_SPI_REG_STATUS) always reads as
+ *     IM7CAM_SPI_STATUS_IDLE (0x4) - this part *is* disassembly-confirmed
+ *     (section 6): file offset 0xa140's poll is exactly
+ *     `ldr r3,[r4,#0x28]; and r3,r3,#5; cmp r3,#4; bne back`, so 0x4
+ *     satisfies it on the very first read, no busy/wait cycle modeled.
+ * ============================================================ */
+
+typedef struct Im7camSpiState {
+    MemoryRegion iomem;
+    uint8_t *flash_data;
+    size_t flash_size;
+    uint8_t cmd_buf[4];
+    unsigned cmd_len;
+    bool addr_latched;
+    uint32_t read_addr;
+    const uint8_t *resp_buf;
+    unsigned resp_len;
+    unsigned resp_pos;
+} Im7camSpiState;
+
+/* Real chip is an Eon EN25QH64 (confirmed by the device-level
+ * investigation - see qemu-fullhan-im7/BRINGUP-NOTES.md's "where the
+ * firmware came from" section). JEDEC ID (manufacturer 0x1C = Eon,
+ * memory type 0x70, capacity 0x17 = 64 Mbit) is from general knowledge
+ * of this part, not re-verified against a datasheet in this session -
+ * only matters if U-Boot's probe actually checks it against a known-part
+ * table rather than just logging it (not confirmed either way yet). */
+static const uint8_t IM7CAM_SPI_JEDEC_ID[3] = { 0x1C, 0x70, 0x17 };
+/* SPI NOR status register 1, all bits clear: not busy (WIP=0), write
+ * enable latch clear, no block protection, no error - the standard idle
+ * encoding for essentially any SPI NOR part, not chip-specific. */
+static const uint8_t IM7CAM_SPI_STATUS_REG1[1] = { 0x00 };
+
+static void im7cam_spi_load_image(Im7camSpiState *s, const char *path)
+{
+    gchar *buf = NULL;
+    gsize len = 0;
+    GError *gerr = NULL;
+
+    if (!path) {
+        info_report("im7cam: no SPI flash image given (IM7CAM_SPI_IMAGE) - "
+                     "reads from the SPI controller will return 0xFF "
+                     "(erased-flash value), U-Boot will not find a real "
+                     "kernel/rootfs");
+        return;
+    }
+    if (!g_file_get_contents(path, &buf, &len, &gerr)) {
+        error_report("im7cam: could not read SPI image '%s': %s", path,
+                      gerr->message);
+        exit(1);
+    }
+    s->flash_data = (uint8_t *)buf;
+    s->flash_size = len;
+    info_report("im7cam: SPI flash backed by '%s' (%zu bytes)", path, len);
+}
+
+/* Pull one byte from whichever source is active: a canned command
+ * response (RDID/RDSR) first, else the latched flash address, else the
+ * erased-flash default. Shared by both 1-byte and multi-byte reads
+ * below - a real 4-byte LDR against this FIFO pulls 4 *sequential* new
+ * bytes, not the same byte replicated/zero-padded (found the hard way:
+ * the JEDEC ID probe uses 32-bit-wide FIFO reads, ldr not ldrb, to drain
+ * 4 bytes at a time - the original size-blind version of this function
+ * returned only one real byte per access, zero-padded, and the guest
+ * read back garbage IDs like "b0 e4 83 a0" as a result). */
+static uint8_t im7cam_spi_next_byte(Im7camSpiState *s)
+{
+    if (s->resp_buf && s->resp_pos < s->resp_len) {
+        return s->resp_buf[s->resp_pos++];
+    }
+    if (s->addr_latched) {
+        uint8_t byte = 0xFF;
+
+        if (s->flash_data && s->read_addr < s->flash_size) {
+            byte = s->flash_data[s->read_addr];
+        }
+        s->read_addr++;
+        return byte;
+    }
+    return 0xFF;
+}
+
+static uint64_t im7cam_spi_read(void *opaque, hwaddr offset, unsigned size)
+{
+    Im7camSpiState *s = opaque;
+
+    if (offset == IM7CAM_SPI_REG_STATUS) {
+        return IM7CAM_SPI_STATUS_IDLE;
+    }
+    if (offset == IM7CAM_SPI_REG_DATA) {
+        uint32_t word = 0;
+        unsigned i;
+
+        for (i = 0; i < size; i++) {
+            word |= (uint32_t)im7cam_spi_next_byte(s) << (8 * i);
+        }
+        return word;
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: unimplemented READ  region=im7cam.spi "
+                  "off=0x%" HWADDR_PRIx " size=%u\n", offset, size);
+    return 0;
+}
+
+/* One byte shifted into the command/address accumulator. Split out from
+ * im7cam_spi_write() so multi-byte writes (the ID-probe path uses a
+ * plain 32-bit `str`, not `strb` - see the big comment above
+ * IM7CAM_SPI_JEDEC_ID's declaration site) feed this the same way a real
+ * byte-wide FIFO exposed through a wider register would: one new byte
+ * per 8 bits of the access, LSB first. */
+static void im7cam_spi_write_byte(Im7camSpiState *s, uint8_t byte)
+{
+    if (s->cmd_len == 0) {
+        /* First byte of a new transaction: the opcode. RDID (0x9F) and
+         * RDSR (0x05) have no address phase at all - the flash starts
+         * shifting a canned response back on the very next clock, unlike
+         * READ/FAST_READ's 3-byte address phase below. Both confirmed
+         * needed by real trace output: without this, U-Boot's own flash
+         * probe read garbage left over from a previous READ command's
+         * address-latched state and reported a bogus manufacturer ID. */
+        s->cmd_buf[s->cmd_len++] = byte;
+        switch (byte) {
+        case 0x9F:
+            s->resp_buf = IM7CAM_SPI_JEDEC_ID;
+            s->resp_len = sizeof(IM7CAM_SPI_JEDEC_ID);
+            s->resp_pos = 0;
+            break;
+        case 0x05:
+            s->resp_buf = IM7CAM_SPI_STATUS_REG1;
+            s->resp_len = sizeof(IM7CAM_SPI_STATUS_REG1);
+            s->resp_pos = 0;
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+    if (!s->addr_latched && s->cmd_len < sizeof(s->cmd_buf)) {
+        s->cmd_buf[s->cmd_len++] = byte;
+        if (s->cmd_len == sizeof(s->cmd_buf) &&
+            (s->cmd_buf[0] == 0x03 || s->cmd_buf[0] == 0x0B)) {
+            s->read_addr = ((uint32_t)s->cmd_buf[1] << 16) |
+                            ((uint32_t)s->cmd_buf[2] << 8) |
+                            s->cmd_buf[3];
+            s->addr_latched = true;
+            qemu_log_mask(LOG_UNIMP,
+                          "im7cam: spi read command, opcode=0x%02x "
+                          "addr=0x%06x\n", s->cmd_buf[0], s->read_addr);
+        }
+    }
+}
+
+static void im7cam_spi_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    Im7camSpiState *s = opaque;
+
+    if (offset == 0x08 && value == 0) {
+        s->cmd_len = 0;
+        s->addr_latched = false;
+        s->resp_buf = NULL;
+        s->resp_len = 0;
+        s->resp_pos = 0;
+        return;
+    }
+    if (offset == IM7CAM_SPI_REG_DATA) {
+        unsigned i;
+
+        for (i = 0; i < size; i++) {
+            im7cam_spi_write_byte(s, (uint8_t)(value >> (8 * i)));
+        }
+        return;
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: unimplemented WRITE region=im7cam.spi "
+                  "off=0x%" HWADDR_PRIx " size=%u val=0x%" PRIx64 "\n",
+                  offset, size, value);
+}
+
+static const MemoryRegionOps im7cam_spi_ops = {
+    .read = im7cam_spi_read,
+    .write = im7cam_spi_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static void im7cam_add_spi(MemoryRegion *sysmem, const char *image_path)
+{
+    Im7camSpiState *s = g_new0(Im7camSpiState, 1);
+
+    im7cam_spi_load_image(s, image_path);
+    memory_region_init_io(&s->iomem, NULL, &im7cam_spi_ops, s,
+                           "im7cam.spi", IM7CAM_SPI_SIZE);
+    memory_region_add_subregion(sysmem, IM7CAM_SPI_BASE, &s->iomem);
+}
+
+/* ============================================================
+ * Free-running counter, backed by QEMU's own virtual clock so it's
+ * always genuinely advancing - just enough for guest code's own
+ * elapsed-time/timeout math to eventually see time pass, not a real
+ * modeled reload/prescaler/IRQ timer. Nothing here is chip-specific;
+ * this is the generic "any wait-with-timeout loop just needs *a*
+ * monotonically increasing value" fix, applicable regardless of what
+ * this register block's real tick rate or width turns out to be.
+ * ============================================================ */
+
+static uint64_t im7cam_timer_read(void *opaque, hwaddr offset, unsigned size)
+{
+    if (offset == IM7CAM_TIMER_REG_COUNT) {
+        return (uint32_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: unimplemented READ  region=im7cam.timer "
+                  "off=0x%" HWADDR_PRIx " size=%u\n", offset, size);
+    return 0;
+}
+
+static void im7cam_timer_write(void *opaque, hwaddr offset, uint64_t value,
+                                unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: unimplemented WRITE region=im7cam.timer "
+                  "off=0x%" HWADDR_PRIx " size=%u val=0x%" PRIx64 "\n",
+                  offset, size, value);
+}
+
+static const MemoryRegionOps im7cam_timer_ops = {
+    .read = im7cam_timer_read,
+    .write = im7cam_timer_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static void im7cam_add_timer(MemoryRegion *sysmem)
+{
+    MemoryRegion *mr = g_new0(MemoryRegion, 1);
+
+    memory_region_init_io(mr, NULL, &im7cam_timer_ops, NULL, "im7cam.timer",
+                           IM7CAM_TIMER_SIZE);
+    memory_region_add_subregion(sysmem, IM7CAM_TIMER_BASE, mr);
+}
+
 /* ---- reset: just points the CPU at the hypothesized entry point.
  * No RAM re-population on reset yet (unlike mr80x_reset()) - this
  * skeleton is meant for a single boot attempt per QEMU invocation, not
@@ -287,18 +583,17 @@ static void im7cam_init(MachineState *machine)
     memory_region_add_subregion(sysmem, IM7CAM_RAM_BASE, machine->ram);
 
     im7cam_add_uart(sysmem);
+    im7cam_add_spi(sysmem, getenv("IM7CAM_SPI_IMAGE"));
+    im7cam_add_timer(sysmem);
     im7cam_add_unimp_region(sysmem, "im7cam.i2c0-guess", IM7CAM_I2C0_BASE,
                              IM7CAM_PERIPH_STUB_SIZE);
     im7cam_add_unimp_region(sysmem, "im7cam.gpio0-guess", IM7CAM_GPIO0_BASE,
                              IM7CAM_PERIPH_STUB_SIZE);
-    im7cam_add_unimp_region(sysmem, "im7cam.spi0-guess", IM7CAM_SPI0_BASE,
+    im7cam_add_unimp_region(sysmem, "im7cam.spi0-guess-unused",
+                             IM7CAM_SPI0_LABELED_BASE,
                              IM7CAM_PERIPH_STUB_SIZE);
-    im7cam_add_unimp_region(sysmem, "im7cam.unk-0xf0c00000",
-                             IM7CAM_UNK_C_BASE, IM7CAM_PERIPH_STUB_SIZE);
     im7cam_add_unimp_region(sysmem, "im7cam.unk-0xf0d00000",
                              IM7CAM_UNK_D_BASE, IM7CAM_PERIPH_STUB_SIZE);
-    im7cam_add_unimp_region(sysmem, "im7cam.unk-0xf0e00000",
-                             IM7CAM_UNK_E_BASE, IM7CAM_PERIPH_STUB_SIZE);
 
     if (!machine->kernel_filename) {
         error_report("im7cam: no -kernel given - pass the extracted "
