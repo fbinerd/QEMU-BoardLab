@@ -1863,3 +1863,80 @@ Normal invocation now has the physical-board interaction contract: visible
 countdown, optional user interruption, automatic kernel boot on timeout. The
 section 21 flag-based behavior is retained only as historical investigation
 context and is explicitly superseded by this section.
+
+## 23. Restore the complete real U-Boot log (and its real one-second delay)
+
+Section 22 restored the external autoboot contract, but its single synthetic
+countdown line did not explain a larger regression reported by the user: an
+older bring-up run displayed DRAM, partition, console, network and image
+loading messages, whereas the current valid-SPI run appeared to print only
+the U-Boot banner before Linux. The missing text was not evidence that those
+parts of U-Boot had stopped executing. It was being generated and retained in
+U-Boot's own RAM logs instead of being sent directly to the modeled UART.
+
+The behavior changed when SPI RDID and environment reads began working. The
+old verbose capture used U-Boot's bad-CRC/default-environment path, whose
+compiled default has `dh_keyboard=0`. The valid production `hwid` environment
+has `dh_keyboard=1`. Changing only that byte in a temporary copy, while
+updating the environment CRC, restored direct output but also changed the
+real boot policy into a lengthy SD/TFTP recovery flow. Therefore neither the
+dump nor `dh_keyboard` may be patched merely to obtain prettier output.
+
+A live GDB comparison at `0xA0811B50` (entry to the standard countdown) found
+the functional mode byte at `0xA0849F64`: it is 1 for the production path and
+0 for the default path. With mode 1, the genuine messages are present in two
+RAM areas:
+
+```text
+early mode/length/data: 0xA0849F64 / 0xA0849F68 / 0xA0849F6C
+main log descriptor:    0xA083E4B0
+descriptor +0x18:       capacity (0x4000)
+descriptor +0x1c:       buffer pointer (observed 0xA0380008)
+descriptor +0x20:       current write position
+```
+
+At the countdown breakpoint, the main position was 633 bytes and began with
+the real `gBootLogPtr`, partition, `bootargs`, `In/Out/Err`, `TEXT_BASE` and
+SD-init messages. The early scratch area contained the real timing and
+`DRAM:  64 MiB` messages. This proves the correct source is U-Boot's live
+buffers, not reconstructed host strings.
+
+The UART model now polls those exact structures every 1 ms of virtual time,
+validates their mode, capacity, pointer and bounds, and sends only newly
+appended bytes to the console. It starts after the private OEM `'*'` has been
+consumed so the banner remains first and the default-environment path is not
+duplicated. It performs one final drain when the PC leaves the U-Boot image,
+capturing the genuine `Starting kernel ...`, then stops before Linux can reuse
+the linked globals. The synthetic countdown from section 22 was removed: the
+visible countdown is now the actual string written by this U-Boot binary.
+
+This exposed a separate timer polarity bug. Disassembly shows
+`udelay()` at `0xA081D340` calling `0xA0820A54`, which obtains time through
+`0xA0820918`. That function reads timer register `0xF0C00004` and applies
+`MVN`, because the hardware register is a down-counter. The model incorrectly
+returned increasing microsecond ticks at that offset, so the complemented
+time ran backwards and the 101 calls to `udelay(10000)` in the countdown
+could finish almost immediately. Register `0x04` now returns `~ticks`, just
+like the confirmed down-counter semantics already modeled for timer 1. This
+makes the U-Boot-owned one-second key window real; no host sleep or forced
+autoboot decision is used.
+
+Validation used the unmodified 8 MiB SPI dump and the public runner. In an
+allocated TTY, the test waited until the real `Hit any key to stop autoboot:`
+became visible and only then sent `x`; U-Boot responded with `disable wdt` and
+its real `>` prompt, with no `Starting kernel` or `BogoMIPS`. The first
+non-TTY automation attempt was correctly rejected as a test-harness error:
+`docker -i` left the host pseudo-terminal in canonical mode and retained `x`
+until newline, while `run.sh` uses `docker -it` for a real interactive
+terminal. With no input, the other test showed the complete U-Boot log,
+`Starting kernel`, Linux `BogoMIPS`, and
+`VFS: Mounted root (squashfs filesystem)`, then continued into vendor
+userspace.
+
+## Status (updated again, section 23)
+
+The default full-SPI run now executes the production environment unchanged,
+displays the complete genuine U-Boot boot log, provides the real timed
+keypress window and automatically reaches kernel/rootfs when no key is
+pressed. Sections 21 and 22 remain the investigation history; their synthetic
+countdown implementation is superseded by this section.

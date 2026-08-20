@@ -124,6 +124,21 @@
 #define IM7CAM_UART_REG_RX_STATUS 0x14
 #define IM7CAM_UART_RXSTATUS_READY (1 << 0)
 
+/* The production environment (`dh_keyboard=1`) keeps the early U-Boot log
+ * in RAM instead of sending its text to UART.  These addresses and layouts
+ * are from the exact binary's live state; see BRINGUP-NOTES.md section 23. */
+#define IM7CAM_UBOOT_LOG_MODE_ADDR    0xA0849F64
+#define IM7CAM_UBOOT_EARLY_LOG_LEN    0xA0849F68
+#define IM7CAM_UBOOT_EARLY_LOG_DATA   0xA0849F6C
+#define IM7CAM_UBOOT_EARLY_LOG_MAX    0x1000
+#define IM7CAM_UBOOT_LOG_STRUCT       0xA083E4B0
+#define IM7CAM_UBOOT_LOG_CAP_OFF      0x18
+#define IM7CAM_UBOOT_LOG_BUF_OFF      0x1C
+#define IM7CAM_UBOOT_LOG_POS_OFF      0x20
+#define IM7CAM_UBOOT_LOG_CAPACITY     0x4000
+#define IM7CAM_UBOOT_IMAGE_END        0xA0860000
+#define IM7CAM_UBOOT_LOG_POLL_NS      1000000
+
 /* Other 0xF0??0000-pattern addresses found the exact same way as the UART
  * one (present as a literal 32-bit word inside our own U-Boot binary,
  * within the confirmed .text region) - see BRINGUP-NOTES.md section 2.
@@ -355,10 +370,104 @@ static void im7cam_add_unimp_region(MemoryRegion *sysmem, const char *name,
 typedef struct Im7camUartState {
     MemoryRegion iomem;
     CharBackend chr;
+    ARMCPU *cpu;
+    QEMUTimer *bootlog_timer;
     bool rx_valid;
     uint8_t rx_byte;
     bool autoboot_unlock_pending;
+    bool bootlog_ready;
+    bool bootlog_seen;
+    uint32_t early_log_pos;
+    uint32_t bootlog_buffer;
+    uint32_t bootlog_pos;
 } Im7camUartState;
+
+static uint32_t im7cam_phys_read_u32(hwaddr addr)
+{
+    uint32_t value;
+
+    cpu_physical_memory_read(addr, &value, sizeof(value));
+    return le32_to_cpu(value);
+}
+
+static void im7cam_uart_write_log(Im7camUartState *s, hwaddr addr,
+                                   uint32_t len)
+{
+    uint8_t buf[256];
+
+    while (len) {
+        uint32_t chunk = MIN(len, (uint32_t)sizeof(buf));
+
+        cpu_physical_memory_read(addr, buf, chunk);
+        for (uint32_t i = 0; i < chunk; i++) {
+            if (buf[i] == '\n') {
+                static const uint8_t cr = '\r';
+
+                qemu_chr_fe_write_all(&s->chr, &cr, 1);
+            }
+            qemu_chr_fe_write_all(&s->chr, &buf[i], 1);
+        }
+        addr += chunk;
+        len -= chunk;
+    }
+}
+
+static void im7cam_uart_mirror_bootlog(void *opaque)
+{
+    Im7camUartState *s = opaque;
+    uint32_t mode = im7cam_phys_read_u32(IM7CAM_UBOOT_LOG_MODE_ADDR);
+    uint32_t early_len = im7cam_phys_read_u32(IM7CAM_UBOOT_EARLY_LOG_LEN);
+    uint32_t capacity = im7cam_phys_read_u32(IM7CAM_UBOOT_LOG_STRUCT +
+                                             IM7CAM_UBOOT_LOG_CAP_OFF);
+    uint32_t buffer = im7cam_phys_read_u32(IM7CAM_UBOOT_LOG_STRUCT +
+                                           IM7CAM_UBOOT_LOG_BUF_OFF);
+    uint32_t pos = im7cam_phys_read_u32(IM7CAM_UBOOT_LOG_STRUCT +
+                                        IM7CAM_UBOOT_LOG_POS_OFF);
+    vaddr pc = s->cpu->env.regs[15];
+    bool buffer_valid = capacity == IM7CAM_UBOOT_LOG_CAPACITY &&
+                        buffer >= IM7CAM_RAM_BASE &&
+                        buffer + capacity <= IM7CAM_RAM_BASE +
+                                             IM7CAM_RAM_SIZE &&
+                        pos <= capacity;
+    bool handoff = s->bootlog_seen &&
+                   (pc < IM7CAM_IMAGE_LOAD_ADDR ||
+                    pc >= IM7CAM_UBOOT_IMAGE_END);
+
+    /* Waiting for the main buffer also keeps this early scratch log behind
+     * the directly transmitted U-Boot banner, matching its real order. */
+    if (s->bootlog_ready && mode == 1 && buffer_valid &&
+        early_len <= IM7CAM_UBOOT_EARLY_LOG_MAX &&
+        early_len > s->early_log_pos) {
+        im7cam_uart_write_log(s,
+                              IM7CAM_UBOOT_EARLY_LOG_DATA + s->early_log_pos,
+                              early_len - s->early_log_pos);
+        s->early_log_pos = early_len;
+        s->bootlog_seen = true;
+    }
+
+    if (s->bootlog_ready && mode == 1 && buffer_valid) {
+        if (buffer != s->bootlog_buffer || pos < s->bootlog_pos) {
+            s->bootlog_buffer = buffer;
+            s->bootlog_pos = 0;
+        }
+        if (pos > s->bootlog_pos) {
+            im7cam_uart_write_log(s, buffer + s->bootlog_pos,
+                                  pos - s->bootlog_pos);
+            s->bootlog_pos = pos;
+            s->bootlog_seen = true;
+        }
+    }
+
+    /* Drain once after U-Boot jumps away, then stop before Linux can reuse
+     * these linked globals and make ordinary RAM look like new log state. */
+    if (handoff) {
+        return;
+    }
+
+    timer_mod(s->bootlog_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              IM7CAM_UBOOT_LOG_POLL_NS);
+}
 
 static uint64_t im7cam_uart_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -375,16 +484,8 @@ static uint64_t im7cam_uart_read(void *opaque, hwaddr offset, unsigned size)
         s->rx_valid = false;
         qemu_chr_fe_accept_input(&s->chr);
         if (s->autoboot_unlock_pending) {
-            static const uint8_t countdown[] =
-                "\rHit any key to stop autoboot:  1 ";
-
-            /* The production environment's private '*' gate routes the
-             * following countdown text away from this UART in emulation.
-             * Hardware users nevertheless see the ordinary countdown.
-             * Expose that same external contract while leaving U-Boot's
-             * own one-second loop, key test and bootcmd decision in charge. */
             s->autoboot_unlock_pending = false;
-            qemu_chr_fe_write_all(&s->chr, countdown, sizeof(countdown) - 1);
+            s->bootlog_ready = true;
         }
         return c;
     }
@@ -440,10 +541,16 @@ static void im7cam_uart_receive(void *opaque, const uint8_t *buf, int size)
     }
 }
 
-static Im7camUartState *im7cam_add_uart(MemoryRegion *sysmem)
+static Im7camUartState *im7cam_add_uart(MemoryRegion *sysmem, ARMCPU *cpu)
 {
     Im7camUartState *s = g_new0(Im7camUartState, 1);
 
+    s->cpu = cpu;
+    s->bootlog_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     im7cam_uart_mirror_bootlog, s);
+    timer_mod(s->bootlog_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              IM7CAM_UBOOT_LOG_POLL_NS);
     memory_region_init_io(&s->iomem, NULL, &im7cam_uart_ops, s,
                            "im7cam.uart", IM7CAM_UART_SIZE);
     memory_region_add_subregion(sysmem, IM7CAM_UART_BASE, &s->iomem);
@@ -1228,7 +1335,12 @@ static uint64_t im7cam_timer_read(void *opaque, hwaddr offset, unsigned size)
     uint32_t ticks = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000;
 
     if (offset == IM7CAM_TIMER_REG_COUNT) {
-        return (s->control[0] & 1) ? ticks : 0;
+        /* U-Boot's get_ticks() reads this hardware down-counter and
+         * immediately applies MVN, producing monotonically increasing
+         * microsecond ticks.  Returning increasing ticks here made the
+         * complemented value run backwards, so udelay() and the autoboot
+         * window expired almost instantly. */
+        return (s->control[0] & 1) ? ~ticks : 0;
     }
     if (offset == IM7CAM_TIMER_REG_DOWNCOUNT) {
         /* Section 14: Linux's clocksource callback at 0xc01f43cc reads
@@ -1413,7 +1525,7 @@ static void im7cam_init(MachineState *machine)
 
     memory_region_add_subregion(sysmem, IM7CAM_RAM_BASE, machine->ram);
 
-    Im7camUartState *uart = im7cam_add_uart(sysmem);
+    Im7camUartState *uart = im7cam_add_uart(sysmem, cpu);
     /* The physical board exposes the ordinary interactive bootdelay, but
      * this vendor binary hides it behind an internal '*' gate.  Satisfy
      * only that private gate before execution.  No countdown-stop key is
