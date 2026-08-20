@@ -590,3 +590,126 @@ confirmed sources instead of "not verified"/"just a placeholder" hedges.
 No behavioral change - both values were already correct, this just
 upgrades the paper trail behind them, consistent with this file's
 standing rule of citing evidence over asserting confidence.
+
+## 8. Reset controller, real bidirectional UART, and a stubborn RDID mystery
+
+Prompted directly by the user hitting a real, practical problem: `-d
+unimp` left on by default flooded an interactive terminal with hundreds
+of log lines per retry loop (harmless, self-resolving loops - section 6
+- but unusable to watch live), reading as a hang even though the
+emulator was fine. Fixed first (`run.sh`): `-d unimp` is no longer
+on by default, moved behind `--trace`. Confirmed the actual boot is fast
+and clean without it - same 34-line log, real DRAM/env/Net output,
+reached in well under the old 20s test window instead of scrolling
+forever.
+
+**A third real hang, past where testing had gone before**: with tracing
+off (so testing could run longer without terminal-flood distorting
+timing), the boot reliably stopped dead after `MAC: 00:12:34:56:78:9a` -
+30s, zero further output, not just slow. Same method as every hang
+before it: gdbstub snapshot (`0xa081ba5c`), disassemble
+(`arm-none-eabi-objdump --start-address=0x1d9c0 --stop-address=0x1db00`).
+Found a plain reset-controller idiom, repeated at least twice in the same
+function: write a masked value to `0xF0000000+0x54` (clearing one
+specific bit), then spin reading that *same* offset until it reads back
+`0xFFFFFFFF` (all bits set = "reset acked"). `0xF0000000` had never been
+mapped at all before this - genuinely different from every earlier hang,
+which were all modeled-but-wrong stubs; this address was silently eaten
+by `ignore_memory_transaction_failures` (reads as 0, which never
+satisfies `== -1`), with zero trace output pointing at it even with `-d
+unimp` on, since nothing had ever logged an access to a region that
+plain doesn't exist. Fixed with a new `im7cam.reset-ctrl` device:
+offset `0x54` always reads back `0xFFFFFFFF`; everything else in the
+block still falls through to the standard logging stub.
+
+**Result**: with that fixed, the boot runs dramatically further - the
+device's own real network/TFTP recovery flow now executes end to end:
+`Using FH EMAC device`, a real TFTP attempt (`Download Filename
+'upgrade_info_...txt'`), retries with a backup server, `failed.txt` as a
+last resort, and finally `resetting ...` - a genuine watchdog/soft
+reset the firmware itself triggers after exhausting recovery attempts,
+not an emulator crash. This is this device's real, by-design behavior
+when it can't find valid flash - matches the TFTP recovery mechanism the
+sibling device-level investigation already documented from the
+extracted `1_hwid.bin` U-Boot environment (the `da`/`dk`/`dr` command
+shortcuts, `serverip`/`ipaddr` defaults) almost exactly. No PHY is
+modeled (`***ERROR: auto negotiation timeout`) and no real TFTP server
+is reachable from inside the container by default - both expected, not
+new bugs.
+
+**Real bidirectional UART, disassembly-confirmed, not guessed**: the
+user's actual goal was interactive console access, which needs RX
+(TX-only until now). Found the driver's own `getc()`-equivalent
+(`arm-none-eabi-objdump --start-address=0xa8a0 --stop-address=0xaa18`):
+poll offset `0x14` until bit 0 is set (RX data ready), then read the
+byte from offset `0x0` - the *same* register the TX path writes to, one
+shared data port for both directions, a completely ordinary UART
+design. Implemented for real: `im7cam.uart` now has a one-byte RX
+buffer fed by the real `-serial stdio` chardev via
+`qemu_chr_fe_set_handlers()` (mirrors `qemu-ipq5018/board/mr80x.c`'s own
+UART RX wiring), with proper backpressure (`can_receive` returns 0 while
+a byte is still waiting to be read by the guest, so keystrokes don't get
+silently dropped).
+
+**But it doesn't help yet, for a reason that isn't a UART bug**: fed
+newline keystrokes continuously through the whole boot (`docker run -i`
+piping `printf '\n'` in a loop) and grepped the trace for any read of
+UART offset `0x14` (RX status) across the *entire* boot - zero hits.
+This device's flash-probe-failure recovery path (the one section 6/8
+above actually reaches, since the RDID mismatch below is still open)
+genuinely never polls the keyboard at all - it's an unconditional,
+by-design automatic network-recovery loop, not an interruptible
+autoboot countdown. Getting to a state that actually checks for a
+keypress (`bootdelay`-gated autoboot on the *normal* `kload;bootm` path,
+per the device's real env - see the device-level investigation) needs
+the flash probe to succeed first, which is where the remaining RDID
+mismatch below directly blocks the user's stated priority, not just a
+"nice to have."
+
+**RDID mismatch: substantially re-investigated, still unresolved.**
+Section 6 left this as "probably an extra pointer indirection." Directly
+disproven this session: found the single call site of the RDID-driving
+function (`grep -n "bl\s*0x9d78"` across the whole disassembled binary -
+exactly one hit), set a breakpoint at its entry, and confirmed live:
+`r0` points at a RAM struct whose first word genuinely *is*
+`0xF0E00000` (`x/1xw $r0` → `0xf0e00000`) - no extra indirection, `r4`
+resolves exactly as this file already modeled. Went further: a hardware
+watchpoint on `*(int*)0xf0e00060` (the FIFO address) confirmed writes
+really do reach it, and enabling opcode-received logging confirmed the
+real driver genuinely sends `0x9F` to this device (`"im7cam: spi RDID
+opcode received"` appears in the trace, once per probe attempt, matching
+`SF: Unsupported manufacturer` appearing twice). Formed and tested one
+concrete hypothesis - the offset-8 "reset" trigger was clearing the
+pending RDID response before U-Boot's own read-back loop ran - fixed it
+(resp_buf's lifetime no longer tied to that toggle) and reran: **byte for
+byte identical garbage**, unchanged. So that wasn't it either. Left
+exactly here, not guessed further: the write path is now confirmed
+correct at every point checked (call site, base address, opcode
+delivery), yet the printed manufacturer bytes never change no matter
+what's tried on the response side - meaning whatever actually produces
+those specific bytes (`b0 e4 83 a0 00` / `02 00 00 00 9f`, consistently,
+across every attempt) isn't coming from `im7cam_spi_next_byte()` at all.
+Next real step, not attempted yet: single-step *forward* from the
+confirmed opcode-write point (rather than working backward from the
+print statement, which is what every attempt so far has done) to find
+exactly which instruction produces each of the 5 printed bytes - almost
+certainly reveals either a completely different read path (a "quick ID"
+auto-sequence hardware feature this file hasn't found, matching the
+"len is 5, not 3" oddity noted back in section 6) or a bug in how this
+function's caller assembles/prints the 5-byte buffer that has nothing to
+do with the SPI device model at all.
+
+## Status (updated again)
+
+Boots to the device's own real, complete recovery-mode flow -
+banner → DRAM → env → **network/TFTP recovery attempt → reset** - not a
+stub artifact anywhere in that path. UART is genuinely bidirectional now
+(TX confirmed working since section 5; RX now implemented and
+protocol-confirmed via disassembly, just not yet reachable because nothing
+on the current boot path asks for input). The RDID mismatch is the one
+remaining piece standing between here and an interactive console: it's
+what's keeping the flash probe failing, which is what routes every boot
+into the unconditional recovery flow instead of the normal, keypress-
+interruptible `bootdelay` path. Next session should pick up exactly
+where section 8 left off - forward-tracing from the confirmed opcode
+write, not another attempt at guessing the response side.

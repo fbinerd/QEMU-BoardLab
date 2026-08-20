@@ -99,15 +99,27 @@
  * after a poll loop reading offset 0x7c until bit 0x2 (2) is set -
  * confirmed by cross-referencing the exact byte value written ('A',
  * 0x41) against section 2's disassembly of the device-init call site,
- * which primed a struct with that exact byte. TX only (no RX modeled -
- * nothing's exercised that path yet); other offsets seen in the trace
- * (0x4, 0x8, 0xc - written 0/0x9/0x80/7 etc., presumably baud/line
- * control) are accepted and logged but not modeled for real yet. */
+ * which primed a struct with that exact byte. Other offsets seen in the
+ * trace (0x4, 0x8, 0xc - written 0/0x9/0x80/7 etc., presumably baud/line
+ * control) are accepted and logged but not modeled for real yet.
+ *
+ * RX added later (section 8): disassembled the driver's own getc()-style
+ * function (`arm-none-eabi-objdump --start-address=0xa8a0
+ * --stop-address=0xaa18`) and found a completely ordinary poll-then-read
+ * loop - `ldr lr,[base+0x14]; tst lr,#1; beq retry; ldrb r3,[base]` -
+ * poll offset 0x14 until bit 0 (RX-data-ready) is set, then read the
+ * byte from the *same* offset 0 the TX path writes to (one shared data
+ * register for both directions, a very ordinary UART design - not
+ * guessed, read straight off the driver's own disassembly). */
 #define IM7CAM_UART_BASE      0xF0700000
 #define IM7CAM_UART_SIZE      0x1000
-#define IM7CAM_UART_REG_TX     0x00
+#define IM7CAM_UART_REG_DATA   0x00 /* write = TX, read = RX - same address */
+#define IM7CAM_UART_REG_TX     IM7CAM_UART_REG_DATA
+#define IM7CAM_UART_REG_RX     IM7CAM_UART_REG_DATA
 #define IM7CAM_UART_REG_STATUS 0x7c
 #define IM7CAM_UART_STATUS_TXRDY (1 << 1)
+#define IM7CAM_UART_REG_RX_STATUS 0x14
+#define IM7CAM_UART_RXSTATUS_READY (1 << 0)
 
 /* Other 0xF0??0000-pattern addresses found the exact same way as the UART
  * one (present as a literal 32-bit word inside our own U-Boot binary,
@@ -141,6 +153,26 @@
 #define IM7CAM_TIMER_BASE 0xF0C00000
 #define IM7CAM_TIMER_SIZE 0x10000
 #define IM7CAM_TIMER_REG_COUNT 0x04
+
+/* Reset/clock-management block (GCC-equivalent, guessing at the label
+ * qemu-ipq5018/board/mr80x.c uses for the analogous IPQ5018 controller -
+ * this device's own real name for it isn't known). Found the same way as
+ * the timer: gdbstub-frozen PC, disassembled (`arm-none-eabi-objdump
+ * --start-address=0x1d9c0 --stop-address=0x1db00`), landed on a
+ * completely ordinary "soft-reset a sub-block, poll for hardware ack"
+ * idiom repeated at least twice in the same function: `mvn r3,#N;
+ * str r3,[r4,#0x54]; ldr r3,[r4,#0x54]; cmn r3,#1; bne back` - write a
+ * masked value (clearing one specific reset bit) to offset 0x54, then
+ * spin until the SAME offset reads back as 0xFFFFFFFF (all bits set,
+ * i.e. "reset released/acked"). This board's stub previously left
+ * 0xF0000000 completely unmapped - genuinely different from every other
+ * hang so far in this file, which were all *modeled-but-wrong* stubs;
+ * this address had never been touched or logged at all until this
+ * session, since ignore_memory_transaction_failures silently eats
+ * unmapped reads as 0, which never satisfies the == -1 check. */
+#define IM7CAM_RESET_BASE 0xF0000000
+#define IM7CAM_RESET_SIZE 0x10000
+#define IM7CAM_RESET_REG_ACK 0x54
 
 /* This chip's REAL SPI (flash) controller - confirmed by live disassembly
  * (section 6 of BRINGUP-NOTES.md), not the sibling-chip label above. What
@@ -222,12 +254,24 @@ static void im7cam_add_unimp_region(MemoryRegion *sysmem, const char *name,
 typedef struct Im7camUartState {
     MemoryRegion iomem;
     CharBackend chr;
+    bool rx_valid;
+    uint8_t rx_byte;
 } Im7camUartState;
 
 static uint64_t im7cam_uart_read(void *opaque, hwaddr offset, unsigned size)
 {
+    Im7camUartState *s = opaque;
+
     if (offset == IM7CAM_UART_REG_STATUS) {
         return IM7CAM_UART_STATUS_TXRDY;
+    }
+    if (offset == IM7CAM_UART_REG_RX_STATUS) {
+        return s->rx_valid ? IM7CAM_UART_RXSTATUS_READY : 0;
+    }
+    if (offset == IM7CAM_UART_REG_RX) {
+        uint8_t c = s->rx_byte;
+        s->rx_valid = false;
+        return c;
     }
     qemu_log_mask(LOG_UNIMP,
                   "im7cam: unimplemented READ  region=im7cam.uart "
@@ -259,6 +303,28 @@ static const MemoryRegionOps im7cam_uart_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+/* Single-byte RX buffer is enough for interactive typing (autoboot
+ * interrupt, u-boot console input) - a real FIFO would matter for
+ * pasted/bulk input, not needed yet. can_receive backpressures the
+ * chardev (returns 0 = "not ready") while a byte is still waiting to be
+ * read by the guest, so nothing gets silently dropped. */
+static int im7cam_uart_can_receive(void *opaque)
+{
+    Im7camUartState *s = opaque;
+
+    return s->rx_valid ? 0 : 1;
+}
+
+static void im7cam_uart_receive(void *opaque, const uint8_t *buf, int size)
+{
+    Im7camUartState *s = opaque;
+
+    if (size > 0) {
+        s->rx_byte = buf[0];
+        s->rx_valid = true;
+    }
+}
+
 static void im7cam_add_uart(MemoryRegion *sysmem)
 {
     Im7camUartState *s = g_new0(Im7camUartState, 1);
@@ -267,6 +333,9 @@ static void im7cam_add_uart(MemoryRegion *sysmem)
                            "im7cam.uart", IM7CAM_UART_SIZE);
     memory_region_add_subregion(sysmem, IM7CAM_UART_BASE, &s->iomem);
     qemu_chr_fe_init(&s->chr, serial_hd(0), &error_abort);
+    qemu_chr_fe_set_handlers(&s->chr, im7cam_uart_can_receive,
+                              im7cam_uart_receive, NULL, NULL, s, NULL,
+                              true);
 }
 
 /* ============================================================
@@ -431,13 +500,25 @@ static void im7cam_spi_write_byte(Im7camSpiState *s, uint8_t byte)
             s->resp_buf = IM7CAM_SPI_JEDEC_ID;
             s->resp_len = sizeof(IM7CAM_SPI_JEDEC_ID);
             s->resp_pos = 0;
+            qemu_log_mask(LOG_UNIMP, "im7cam: spi RDID opcode received\n");
             break;
         case 0x05:
             s->resp_buf = IM7CAM_SPI_STATUS_REG1;
             s->resp_len = sizeof(IM7CAM_SPI_STATUS_REG1);
             s->resp_pos = 0;
+            qemu_log_mask(LOG_UNIMP, "im7cam: spi RDSR opcode received\n");
             break;
         default:
+            /* Genuinely new, unrecognized opcode - drop any stale
+             * RDID/RDSR response a *previous* transaction left pending
+             * (see the offset-8 comment in im7cam_spi_write() for why
+             * that can't safely happen at the offset-8 toggle anymore). */
+            s->resp_buf = NULL;
+            s->resp_len = 0;
+            s->resp_pos = 0;
+            qemu_log_mask(LOG_UNIMP,
+                          "im7cam: spi first-byte opcode=0x%02x "
+                          "(unrecognized)\n", byte);
             break;
         }
         return;
@@ -463,11 +544,23 @@ static void im7cam_spi_write(void *opaque, hwaddr offset, uint64_t value,
     Im7camSpiState *s = opaque;
 
     if (offset == 0x08 && value == 0) {
+        /* NOT a full protocol reset, despite looking like one at first
+         * (see the big comment above im7cam_spi_write_byte(), which
+         * originally cleared resp_buf here too). Live gdbstub tracing
+         * (a write watchpoint on the FIFO address, single-stepped)
+         * caught the real sequence: opcode 0x9F genuinely reaches this
+         * device (confirmed - "im7cam: spi RDID opcode received" logs),
+         * but offset 8 gets toggled 0-then-1 again immediately after,
+         * as a routine open/close bracket around a buffer op unrelated
+         * to the pending RDID response - clearing resp_buf here wiped
+         * the JEDEC ID before U-Boot's own read-back loop ever ran,
+         * which is exactly why "SF: Unsupported manufacturer" kept
+         * reporting stale/garbage bytes even after the opcode handling
+         * above was added. cmd_len/addr_latched (the READ/FAST_READ
+         * address-phase accumulator) still reset here - only resp_buf's
+         * lifetime changed. */
         s->cmd_len = 0;
         s->addr_latched = false;
-        s->resp_buf = NULL;
-        s->resp_len = 0;
-        s->resp_pos = 0;
         return;
     }
     if (offset == IM7CAM_SPI_REG_DATA) {
@@ -549,6 +642,58 @@ static void im7cam_add_timer(MemoryRegion *sysmem)
     memory_region_add_subregion(sysmem, IM7CAM_TIMER_BASE, mr);
 }
 
+/* ============================================================
+ * Reset/clock-management block - see the big comment above
+ * IM7CAM_RESET_BASE. Only one register confirmed: writes to the ack
+ * register are accepted (and logged, in case a real driver cares what
+ * gets written), reads from it always report "acked" (0xFFFFFFFF) -
+ * every sub-block reset this file has seen so far just needs to look
+ * instantly complete, no real reset sequencing modeled. Every other
+ * register in this block falls through to the same logging stub as
+ * every other unmodeled peripheral.
+ * ============================================================ */
+
+static uint64_t im7cam_reset_ctrl_read(void *opaque, hwaddr offset,
+                                        unsigned size)
+{
+    if (offset == IM7CAM_RESET_REG_ACK) {
+        return 0xFFFFFFFF;
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: unimplemented READ  region=im7cam.reset-ctrl "
+                  "off=0x%" HWADDR_PRIx " size=%u\n", offset, size);
+    return 0;
+}
+
+static void im7cam_reset_ctrl_write(void *opaque, hwaddr offset,
+                                     uint64_t value, unsigned size)
+{
+    if (offset == IM7CAM_RESET_REG_ACK) {
+        return;
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: unimplemented WRITE region=im7cam.reset-ctrl "
+                  "off=0x%" HWADDR_PRIx " size=%u val=0x%" PRIx64 "\n",
+                  offset, size, value);
+}
+
+static const MemoryRegionOps im7cam_reset_ctrl_ops = {
+    .read = im7cam_reset_ctrl_read,
+    .write = im7cam_reset_ctrl_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static void im7cam_add_reset_ctrl(MemoryRegion *sysmem)
+{
+    MemoryRegion *mr = g_new0(MemoryRegion, 1);
+
+    memory_region_init_io(mr, NULL, &im7cam_reset_ctrl_ops, NULL,
+                           "im7cam.reset-ctrl", IM7CAM_RESET_SIZE);
+    memory_region_add_subregion(sysmem, IM7CAM_RESET_BASE, mr);
+}
+
 /* ---- reset: just points the CPU at the hypothesized entry point.
  * No RAM re-population on reset yet (unlike mr80x_reset()) - this
  * skeleton is meant for a single boot attempt per QEMU invocation, not
@@ -598,6 +743,7 @@ static void im7cam_init(MachineState *machine)
     im7cam_add_uart(sysmem);
     im7cam_add_spi(sysmem, getenv("IM7CAM_SPI_IMAGE"));
     im7cam_add_timer(sysmem);
+    im7cam_add_reset_ctrl(sysmem);
     im7cam_add_unimp_region(sysmem, "im7cam.i2c0-guess", IM7CAM_I2C0_BASE,
                              IM7CAM_PERIPH_STUB_SIZE);
     im7cam_add_unimp_region(sysmem, "im7cam.gpio0-guess", IM7CAM_GPIO0_BASE,

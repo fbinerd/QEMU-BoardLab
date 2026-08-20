@@ -6,7 +6,7 @@
 # flash reads, but the JEDEC ID probe itself still reports a bogus chip).
 #
 # Usage:
-#   ./run.sh [--spi-image PATH] [path-to-0_U-Boot.bin]
+#   ./run.sh [--spi-image PATH] [--trace] [path-to-0_U-Boot.bin]
 #
 # With no positional argument, looks for images/0_U-Boot.bin (gitignored -
 # copy it in yourself from the source investigation, see BRINGUP-NOTES.md
@@ -19,20 +19,34 @@
 # back to the real dump's location in the sibling openwrt-build-tools
 # investigation.
 #
-# -d unimp: makes the logging stub's trace actually visible (LOG_UNIMP is
-# silent by default). Ctrl-A X quits QEMU.
+# --trace: turns on `-d unimp` (LOG_UNIMP, silent by default) to see
+# every access an unmodeled register gets - the tool this whole board's
+# bringup method depends on (see BRINGUP-NOTES.md), but NOT the default
+# here anymore: several of the guest's own real init loops retry a
+# register hundreds of times in a row before giving up and moving on
+# (harmless, self-resolving, a few hundred ms of real boot time) - with
+# --trace on, that's hundreds of log lines per retry loop flooding an
+# interactive terminal, which reads as a hang even though the emulator
+# itself is fine. Use --trace only when actually hunting a new register,
+# same as this file's own bringup sessions did - not for normal use.
+# Ctrl-A X quits QEMU.
 
 set -euo pipefail
 
 IMAGE=im7cam-qemu:9.1.0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPI_IMAGE=""
+TRACE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --spi-image)
             SPI_IMAGE="$2"
             shift 2
+            ;;
+        --trace)
+            TRACE=1
+            shift
             ;;
         *)
             KERNEL="$1"
@@ -79,6 +93,12 @@ if [[ -n "$SPI_IMAGE" ]]; then
     DOCKER_ENV+=(-e "IM7CAM_SPI_IMAGE=/spi/${SPI_FILE}")
 fi
 
+QEMU_TRACE_ARGS=()
+if [[ "$TRACE" -eq 1 ]]; then
+    QEMU_TRACE_ARGS=(-d unimp)
+    echo "Tracing on (-d unimp) - expect a lot of retry-loop noise, see this script's own comments."
+fi
+
 echo "Booting ${KERNEL} in the im7cam skeleton machine."
 echo "Console below IS the UART. Ctrl-A X to quit."
 echo
@@ -88,5 +108,5 @@ exec docker run --rm -it \
     "${DOCKER_ENV[@]}" \
     "$IMAGE" \
     /build/qemu-9.1.0/build/qemu-system-arm -M im7cam -nographic -monitor none \
-    -serial stdio -d unimp \
+    -serial stdio "${QEMU_TRACE_ARGS[@]}" \
     -kernel "/fw/${KERNEL_FILE}"
