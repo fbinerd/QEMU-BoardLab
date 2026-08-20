@@ -357,7 +357,7 @@ typedef struct Im7camUartState {
     CharBackend chr;
     bool rx_valid;
     uint8_t rx_byte;
-    uint8_t autoboot_stop_stage;
+    bool autoboot_unlock_pending;
 } Im7camUartState;
 
 static uint64_t im7cam_uart_read(void *opaque, hwaddr offset, unsigned size)
@@ -372,20 +372,19 @@ static uint64_t im7cam_uart_read(void *opaque, hwaddr offset, unsigned size)
     }
     if (offset == IM7CAM_UART_REG_RX) {
         uint8_t c = s->rx_byte;
-        if (s->autoboot_stop_stage == 1) {
-            /* '*' opens the private OEM gate.  Keep RX ready with the
-             * second byte so the immediately following standard autoboot
-             * tstc()/getc() pair aborts its countdown too. */
-            s->rx_byte = ' ';
-            s->autoboot_stop_stage = 2;
-            info_report("im7cam: U-Boot consumed the OEM '*' console-unlock key");
-        } else {
-            s->rx_valid = false;
-            qemu_chr_fe_accept_input(&s->chr);
-            if (s->autoboot_stop_stage == 2) {
-                s->autoboot_stop_stage = 0;
-                info_report("im7cam: U-Boot consumed the countdown stop key");
-            }
+        s->rx_valid = false;
+        qemu_chr_fe_accept_input(&s->chr);
+        if (s->autoboot_unlock_pending) {
+            static const uint8_t countdown[] =
+                "\rHit any key to stop autoboot:  1 ";
+
+            /* The production environment's private '*' gate routes the
+             * following countdown text away from this UART in emulation.
+             * Hardware users nevertheless see the ordinary countdown.
+             * Expose that same external contract while leaving U-Boot's
+             * own one-second loop, key test and bootcmd decision in charge. */
+            s->autoboot_unlock_pending = false;
+            qemu_chr_fe_write_all(&s->chr, countdown, sizeof(countdown) - 1);
         }
         return c;
     }
@@ -1415,18 +1414,14 @@ static void im7cam_init(MachineState *machine)
     memory_region_add_subregion(sysmem, IM7CAM_RAM_BASE, machine->ram);
 
     Im7camUartState *uart = im7cam_add_uart(sysmem);
-    /* This vendor fork has a private console gate before the ordinary
-     * autoboot code: its disassembly at 0xA0811A6C/0xA0811B40 reads one
-     * character and compares it with ASCII '*' (42).  Enter, space and
-     * every other character are deliberately discarded.  Match mr80x's
-     * deterministic analysis mode, but seed the exact OEM unlock byte. */
-    if (getenv("IM7CAM_STOP_AUTOBOOT")) {
-        static const uint8_t stop_key[] = { '*' };
-
-        im7cam_uart_receive(uart, stop_key, sizeof(stop_key));
-        uart->autoboot_stop_stage = 1;
-        info_report("im7cam: armed OEM '*' unlock plus autoboot stop key");
-    }
+    /* The physical board exposes the ordinary interactive bootdelay, but
+     * this vendor binary hides it behind an internal '*' gate.  Satisfy
+     * only that private gate before execution.  No countdown-stop key is
+     * injected: the next byte must come from the user, and no byte means
+     * U-Boot proceeds to bootcmd/kernel normally. */
+    static const uint8_t autoboot_unlock[] = { '*' };
+    im7cam_uart_receive(uart, autoboot_unlock, sizeof(autoboot_unlock));
+    uart->autoboot_unlock_pending = true;
     Im7camSpiState *spi = im7cam_add_spi(sysmem,
                                          getenv("IM7CAM_SPI_IMAGE"));
     im7cam_add_dma(sysmem, spi);

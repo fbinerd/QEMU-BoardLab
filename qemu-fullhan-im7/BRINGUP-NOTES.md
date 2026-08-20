@@ -1810,3 +1810,56 @@ analysis mode now enters the real U-Boot command prompt deterministically,
 and repeated terminal input works after each byte is consumed. The missing
 visible countdown is documented as OEM firmware behavior, not emulated timer
 speed or a missing environment variable.
+
+## 22. Correction: board-like autoboot is the default, not an option
+
+The user correctly rejected section 21's `--stop-autoboot` interface: a flag
+that unconditionally enters the prompt is useful for debugging, but it is the
+opposite of the physical board's observable behavior. The board displays a
+short countdown, accepts a key during that window, and otherwise continues to
+the kernel. The emulator must do that on its ordinary invocation.
+
+The section 21 disassembly still explains the vendor binary: it contains a
+private `'*'` gate immediately before its standard `bootdelay=1` loop. The
+revised model satisfies only that internal gate. It does **not** inject the
+second byte that aborts autoboot. After U-Boot consumes the private unlock,
+UART RX is empty and re-armed, so the next byte can only be a real user key.
+The guest's own countdown loop and `bootcmd` decision remain authoritative.
+
+The production environment also redirects the countdown text away from the
+emulated UART after the banner even though the loop executes. At the exact
+point U-Boot consumes its internal unlock, the UART model therefore exposes
+the same line the physical-board user expects:
+
+```text
+Hit any key to stop autoboot:  1
+```
+
+This is a console-visibility compatibility shim, not a replacement timer or
+host-side decision: waiting and branching are still performed by the real
+U-Boot code. If no host byte arrives, it runs the real `bootcmd`, loads Linux
+from SPI and continues normally. If a host byte arrives during that one-second
+guest window, U-Boot consumes it and enters its real `>` command interpreter.
+
+`--stop-autoboot` and `IM7CAM_STOP_AUTOBOOT` were removed. The intended command
+is again simply:
+
+```sh
+./qemu-fullhan-im7/run.sh \
+  --spi-image /media/dados_2tb/opw/openwrt-build-tools/tools/firmware-lab/work/miboim7-tudo-sobre/miboim7-spi-en25qh64-8mb-20260819.bin
+```
+
+That exact public command was rebuilt and tested in both branches. With no
+stdin byte it printed the countdown, then reached Linux `BogoMIPS`, mounted
+the real SquashFS root and reached `[pdc] hwidName:IPC-S21F-imou`. Repeating
+the same command while delivering one real `x` byte during the window printed
+the countdown followed by `disable wdt` and the real `>` prompt; no Linux
+milestone appeared during the test. No runner option or environment variable
+distinguished the two runs--only whether the user supplied a byte.
+
+## Status (updated again, section 22)
+
+Normal invocation now has the physical-board interaction contract: visible
+countdown, optional user interruption, automatic kernel boot on timeout. The
+section 21 flag-based behavior is retained only as historical investigation
+context and is explicitly superseded by this section.
