@@ -103,7 +103,12 @@ echo "Booting ${KERNEL} in the im7cam skeleton machine."
 echo "Console below IS the UART. Ctrl-A X to quit."
 echo
 
-exec docker run --rm -it \
+DOCKER_STDIN_ARGS=(-i)
+if [[ -t 0 && -t 1 ]]; then
+    DOCKER_STDIN_ARGS=(-it)
+fi
+
+exec docker run --rm "${DOCKER_STDIN_ARGS[@]}" \
     "${DOCKER_VOLUMES[@]}" \
     "${DOCKER_ENV[@]}" \
     "$IMAGE" \

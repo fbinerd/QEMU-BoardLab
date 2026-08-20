@@ -1399,3 +1399,17 @@ kernel remains in `calibrate_delay()` waiting for the global tick to
 change. Next step: recover the Fullhan interrupt-controller dispatch and
 mask/ack protocol from the live kernel, wire timer0 to IRQ 19, and then
 use the newly functional tick to continue boot.
+
+## 16. `run.sh` no longer requires a TTY
+
+Testing the documented invocation verbatim exposed a runner bug before
+QEMU itself started: the script unconditionally passed `-it` to
+`docker run`. Docker rejects `-t` when stdin is a pipe or the command is
+launched by automation, with `cannot attach stdin to a TTY-enabled
+container because stdin is not a terminal`.
+
+The runner now checks both stdin and stdout with `[[ -t ... ]]`. In a
+real interactive terminal it retains `-it`, including QEMU's `Ctrl-A X`
+escape; otherwise it uses `-i` without allocating a pseudo-TTY. The same
+published command therefore works interactively and in non-interactive
+test/automation environments.
