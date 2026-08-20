@@ -1413,3 +1413,109 @@ real interactive terminal it retains `-it`, including QEMU's `Ctrl-A X`
 escape; otherwise it uses `-i` without allocating a pseudo-TTY. The same
 published command therefore works interactively and in non-interactive
 test/automation environments.
+
+## 17. Timer IRQ routing, visible Linux console, and SPI capability probe
+
+The section-15 IRQ number was incomplete. Disassembling the live high-vector
+IRQ path first located `handle_arch_irq` through the pointer at `0xC03397E8`.
+The handler at `0xC0009360` scans 64 pending bits starting at virtual
+`0xFE000030` with `find_first_bit()`, which uses **byte** loads, and then calls
+`irq_find_mapping()` before generic dispatch. A `-d guest_errors` run proves
+those virtual accesses land at physical `0xE0200030`--`0xE0200037`; the
+earlier `0xE0000000` inference was wrong.
+
+The first interrupt-controller prototype exposed two more useful failures:
+
+1. accepting only word reads made the byte-scanning handler report repeated
+   `unexpected IRQ trap at vector 00`; pending reads now support every slice
+   of the eight-byte bitmap;
+2. routing pending bit 19 made `irq_find_mapping(domain, 19)` return Linux IRQ
+   35, which had no timer action. The clock-event object at `0xC2013000`
+   actually stores Linux IRQ 19, not hwirq 19. This domain has a +16 virtual
+   IRQ offset, so Linux IRQ 19 is hwirq 3. Kernel initialization independently
+   confirms that conclusion by writing `0x8` to controller offset `+0x00`.
+
+The IRQ-chip callback reads controller `+0x08`, ORs `BIT(hwirq)`, and writes
+it back. During the deliberately wrong hwirq-19 experiment this was the
+repeated value `0x00080000`, identifying `+0x08` as the low pending
+acknowledge. The model now exposes the physical controller at `0xE0200000`,
+asserts the ARM CPU IRQ input for timer hwirq 3, returns its pending bit at
+`+0x30`, and clears it on the `+0x08` acknowledge.
+
+Timer tracing provided the exact periodic setup:
+
+```text
+timer0 control=0x2 load=0x5f5e100
+timer0 load=0x2710 control=0x2
+timer0 control=0x3 load=0x2710
+```
+
+`0x2710` is 10,000 ticks at the already-proven 1 MHz clock, i.e. 100 Hz.
+Control bit 0 enables the counter and bit 1 is auto-reload. A QEMU virtual
+timer now expires after `load * 1000` ns, sets timer status bit 0 at `+0xA0`,
+raises hwirq 3, and automatically reloads while control bit 1 remains set.
+This advances the kernel tick and gets Linux out of `calibrate_delay()`.
+
+### Why Linux output was still invisible
+
+The kernel had been progressing silently, exactly as the user's failed test
+reported. Its in-memory console object begins at virtual `0xC034C038` and
+contains the literal name `ttyS`; the signed index at `+0x2A` remains `-1`.
+The registered console write callback at `0xC0191E30` starts with:
+
+```text
+ldrsh r12, [r0, #42]
+cmp   r12, #0
+bxlt  lr
+```
+
+That directly explains both `console [ttyS-1] enabled` in the hidden printk
+ring and the complete absence of kernel UART accesses. A live gdb experiment
+changed only `0xC034C062` from `0xFFFF` to zero; subsequent kernel messages
+immediately appeared through the existing UART model. The machine now applies
+that exact vendor-kernel compatibility fix in physical RAM
+(`0xA034C062`) only when the neighboring object still has the `ttyS` signature
+and the index is exactly `-1`. No firmware file is modified.
+
+### Linux SPI probe and the next wall
+
+With timer IRQs working, Linux originally reached PID 1 and then hit a kernel
+`BUG()` at `0xC01AD83C`. This was not corrupt SquashFS or an incompatible
+BusyBox: the authorized firmware-analysis directory confirms `/sbin/init` is
+a symlink to an intact ARMv4T/EABI5 BusyBox. Disassembly shows the failing
+function is the Fullhan SPI driver's capability assertion over status register
+`+0x28`. It requires bit 9 and bit 2 set while bits 10, 3, and 0 are clear.
+The old status value `0x4` was enough for U-Boot's `(status & 5) == 4` poll but
+not for Linux; `0x204` is the minimal value satisfying both binaries.
+
+After rebuilding, the exact public runner command was tested for 35 seconds
+non-interactively. It now produces 429 lines and visibly reaches, among other
+milestones:
+
+```text
+1902.18 BogoMIPS (lpj=9510912)
+clocksource: Switched to clocksource timer1
+fh_dmac fh_dmac.0: FH DMA Controller, 6 channels
+Serial: fh serial driver
+ttyS.0: ttyS0 at MMIO 0xf0700000 (irq = 34, ...)
+0x000000000000-0x000000050000 : "U-Boot"
+card0 connected!
+NET: Registered protocol family 17
+init_machine_late
+```
+
+The Linux console is therefore visibly functional and the prior
+banner-only result is fixed. The current observed wall is later device
+initialization: the unmodeled MMC controller repeatedly prints
+`voltage switch read MCI_RESP0..3 : 0x0`. Separate repeated division-by-zero
+diagnostics remain evidence of missing clock-tree register values; Linux
+continues past them, so those and MMC are the next fidelity targets.
+
+## Status (updated again, section 17)
+
+The documented runner now visibly boots the real Linux 4.9.129 kernel well
+beyond early initialization. SPI flash/DMA, the clocksource, periodic timer
+interrupt, minimal interrupt controller, Fullhan SPI capability status, and
+the vendor console-index compatibility fix are active. Full boot is not yet
+claimed: MMC voltage-switch polling and incomplete clock-tree values are the
+next blockers.

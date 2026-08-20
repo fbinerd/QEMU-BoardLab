@@ -1,9 +1,10 @@
 #!/bin/bash
 # Boots the extracted im7 (Imou IPC-S21F) U-Boot partition in the im7cam
 # QEMU skeleton machine. Not a finished boot yet - see BRINGUP-NOTES.md
-# for exactly what's confirmed vs. still a probe (section 14 as of this
-# writing: SPI DMA loads the partition table and Linux image; the ARM11
-# 1 MHz kernel clocksource now advances; timer0 IRQ 19 is the next wall).
+# for exactly what's confirmed vs. still a probe (section 17 as of this
+# writing: SPI DMA loads the real Linux/rootfs; the 1 MHz periodic timer,
+# interrupt controller and vendor-kernel console are sufficient for visible
+# Linux device initialization; MMC voltage-switch polling is the next wall).
 #
 # Usage:
 #   ./run.sh [--spi-image PATH] [--trace] [path-to-0_U-Boot.bin]

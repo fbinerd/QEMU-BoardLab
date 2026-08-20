@@ -29,6 +29,7 @@
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "hw/sysbus.h"
+#include "hw/irq.h"
 #include "hw/boards.h"
 #include "hw/loader.h"
 #include "sysemu/reset.h"
@@ -174,6 +175,29 @@
 #define IM7CAM_TIMER_REG_LOAD_1 0x14
 #define IM7CAM_TIMER_REG_DOWNCOUNT 0x18
 #define IM7CAM_TIMER_REG_CONTROL_1 0x1c
+#define IM7CAM_TIMER_REG_IRQ_STATUS 0xa0
+
+/* Section 17: the live Linux IRQ entry point reads a 64-bit pending
+ * bitmap at virtual 0xFE000030. A guest-error trace of those exact byte
+ * loads proves the non-linear static mapping lands at physical
+ * 0xE0200030..37. The IRQ domain maps hwirq 19 to Linux IRQ 35, while
+ * timer0's clock-event object is registered on Linux IRQ 19; the domain
+ * offset therefore makes timer0 hwirq 3. Kernel init independently
+ * enables bit 3 by writing 0x8 at INTC +0x00. */
+#define IM7CAM_INTC_BASE 0xE0200000
+#define IM7CAM_INTC_SIZE 0x1000
+#define IM7CAM_INTC_REG_PENDING_LO 0x30
+#define IM7CAM_INTC_REG_PENDING_HI 0x34
+#define IM7CAM_INTC_REG_ACK_LO 0x08
+#define IM7CAM_TIMER0_HWIRQ 3
+
+/* This exact vendor kernel leaves its registered fh_serial console index
+ * at -1, making its write callback return without touching the UART. The
+ * static object is virtual 0xC034C038 -> RAM physical 0xA034C038; index is
+ * the signed halfword at +0x2a. See section 17 for the live proof. */
+#define IM7CAM_KERNEL_CONSOLE_PHYS 0xA034C038
+#define IM7CAM_KERNEL_CONSOLE_INDEX_PHYS (IM7CAM_KERNEL_CONSOLE_PHYS + 0x2a)
+#define IM7CAM_KERNEL_CONSOLE_NAME UINT32_C(0x53797474) /* "ttyS" LE */
 
 /* Reset/clock-management block (GCC-equivalent, guessing at the label
  * qemu-ipq5018/board/mr80x.c uses for the analogous IPQ5018 controller -
@@ -213,7 +237,11 @@
 #define IM7CAM_SPI_SIZE       0x10000
 #define IM7CAM_SPI_REG_DATA   0x60
 #define IM7CAM_SPI_REG_STATUS 0x28
-#define IM7CAM_SPI_STATUS_IDLE 0x4
+/* U-Boot only checks (status & 5) == 4. The Linux FH SPI probe performs
+ * stricter capability assertions and requires bit 9 plus bit 2, while
+ * rejecting bits 10, 3 and 0; 0x204 is the minimal value satisfying
+ * both binaries' own checks. */
+#define IM7CAM_SPI_STATUS_IDLE 0x204
 
 /* THE actual root cause of the whole "SF: Unsupported manufacturer"
  * saga (BRINGUP-NOTES.md sections 6/8/9) - found by getting real, public
@@ -921,11 +949,156 @@ static void im7cam_add_dma(MemoryRegion *sysmem, Im7camSpiState *spi)
  * this register block's real tick rate or width turns out to be.
  * ============================================================ */
 
+typedef struct Im7camIntcState {
+    MemoryRegion iomem;
+    qemu_irq cpu_irq;
+    uint64_t pending;
+} Im7camIntcState;
+
+static void im7cam_intc_update(Im7camIntcState *s)
+{
+    qemu_set_irq(s->cpu_irq, s->pending != 0);
+}
+
+static void im7cam_intc_raise(Im7camIntcState *s, unsigned irq)
+{
+    s->pending |= 1ULL << irq;
+    im7cam_intc_update(s);
+}
+
+static void im7cam_intc_lower(Im7camIntcState *s, unsigned irq)
+{
+    s->pending &= ~(1ULL << irq);
+    im7cam_intc_update(s);
+}
+
+static uint64_t im7cam_intc_read(void *opaque, hwaddr offset, unsigned size)
+{
+    Im7camIntcState *s = opaque;
+    if (offset >= IM7CAM_INTC_REG_PENDING_LO &&
+        offset + size <= IM7CAM_INTC_REG_PENDING_LO + sizeof(s->pending)) {
+        unsigned shift = (offset - IM7CAM_INTC_REG_PENDING_LO) * 8;
+        uint64_t mask = size == 8 ? UINT64_MAX : (1ULL << (size * 8)) - 1;
+
+        /* find_first_bit() scans this MMIO bitmap with byte loads, so all
+         * naturally aligned byte/halfword/word slices must work. Pending
+         * remains asserted until the timer's own status is consumed. */
+        return (s->pending >> shift) & mask;
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: unimplemented READ  region=im7cam.intc "
+                  "off=0x%" HWADDR_PRIx " size=%u\n", offset, size);
+    return 0;
+}
+
+static void im7cam_intc_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    Im7camIntcState *s = opaque;
+
+    if (offset == IM7CAM_INTC_REG_ACK_LO) {
+        /* The kernel's IRQ-chip callback reads this register, ORs in
+         * BIT(hwirq), and writes it back. The deliberately wrong first
+         * routing through hwirq 19 produced 0x00080000 here on every
+         * interrupt, identifying this as the low-word acknowledge. */
+        s->pending &= ~(uint32_t)value;
+        im7cam_intc_update(s);
+        return;
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: unimplemented WRITE region=im7cam.intc "
+                  "off=0x%" HWADDR_PRIx " size=%u val=0x%" PRIx64 "\n",
+                  offset, size, value);
+}
+
+static const MemoryRegionOps im7cam_intc_ops = {
+    .read = im7cam_intc_read,
+    .write = im7cam_intc_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static Im7camIntcState *im7cam_add_intc(MemoryRegion *sysmem, ARMCPU *cpu)
+{
+    Im7camIntcState *s = g_new0(Im7camIntcState, 1);
+
+    s->cpu_irq = qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ);
+    memory_region_init_io(&s->iomem, NULL, &im7cam_intc_ops, s,
+                          "im7cam.intc", IM7CAM_INTC_SIZE);
+    memory_region_add_subregion(sysmem, IM7CAM_INTC_BASE, &s->iomem);
+    return s;
+}
+
 typedef struct Im7camTimerState {
     MemoryRegion iomem;
     uint32_t load[2];
     uint32_t control[2];
+    uint32_t irq_status;
+    QEMUTimer *timer0;
+    Im7camIntcState *intc;
+    bool console_index_fixed;
 } Im7camTimerState;
+
+static void im7cam_fix_kernel_console_index(Im7camTimerState *s)
+{
+    uint32_t name;
+    uint16_t index;
+
+    if (s->console_index_fixed) {
+        return;
+    }
+    cpu_physical_memory_read(IM7CAM_KERNEL_CONSOLE_PHYS, &name,
+                             sizeof(name));
+    cpu_physical_memory_read(IM7CAM_KERNEL_CONSOLE_INDEX_PHYS, &index,
+                             sizeof(index));
+    if (le32_to_cpu(name) == IM7CAM_KERNEL_CONSOLE_NAME &&
+        le16_to_cpu(index) == UINT16_MAX) {
+        index = cpu_to_le16(0);
+        cpu_physical_memory_write(IM7CAM_KERNEL_CONSOLE_INDEX_PHYS, &index,
+                                  sizeof(index));
+        s->console_index_fixed = true;
+        qemu_log_mask(LOG_UNIMP,
+                      "im7cam: corrected vendor fh_serial console index "
+                      "from -1 to 0\n");
+    }
+}
+
+static void im7cam_timer0_expire(void *opaque)
+{
+    Im7camTimerState *s = opaque;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: timer0 expire load=0x%x control=0x%x\n",
+                  s->load[0], s->control[0]);
+    if (!(s->control[0] & 1)) {
+        return;
+    }
+    im7cam_fix_kernel_console_index(s);
+    s->irq_status |= 1;
+    /* Linux's set_state_periodic() writes control=3 after loading
+     * freq/HZ, proving bit 1 is auto-reload. Its one-shot path preserves
+     * bit 2 instead. */
+    if (!(s->control[0] & 2)) {
+        s->control[0] &= ~1;
+    }
+    im7cam_intc_raise(s->intc, IM7CAM_TIMER0_HWIRQ);
+
+    if (s->control[0] & 1) {
+        timer_mod(s->timer0, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  MAX((uint64_t)s->load[0] * 1000, UINT64_C(1000)));
+    }
+}
+
+static void im7cam_timer0_arm(Im7camTimerState *s)
+{
+    if (!(s->control[0] & 1)) {
+        timer_del(s->timer0);
+        return;
+    }
+    timer_mod(s->timer0, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              MAX((uint64_t)s->load[0] * 1000, UINT64_C(1000)));
+}
 
 static uint64_t im7cam_timer_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -949,6 +1122,17 @@ static uint64_t im7cam_timer_read(void *opaque, hwaddr offset, unsigned size)
     if (offset == IM7CAM_TIMER_REG_CONTROL_1) {
         return s->control[1];
     }
+    if (offset == IM7CAM_TIMER_REG_IRQ_STATUS) {
+        uint32_t status = s->irq_status;
+
+        qemu_log_mask(LOG_UNIMP,
+                      "im7cam: timer IRQ status read -> 0x%x\n", status);
+        s->irq_status = 0;
+        if (status & 1) {
+            im7cam_intc_lower(s->intc, IM7CAM_TIMER0_HWIRQ);
+        }
+        return status;
+    }
     qemu_log_mask(LOG_UNIMP,
                   "im7cam: unimplemented READ  region=im7cam.timer "
                   "off=0x%" HWADDR_PRIx " size=%u\n", offset, size);
@@ -962,6 +1146,10 @@ static void im7cam_timer_write(void *opaque, hwaddr offset, uint64_t value,
 
     if (offset == IM7CAM_TIMER_REG_LOAD) {
         s->load[0] = value;
+        qemu_log_mask(LOG_UNIMP,
+                      "im7cam: timer0 load=0x%x control=0x%x\n",
+                      s->load[0], s->control[0]);
+        im7cam_timer0_arm(s);
         return;
     }
     if (offset == IM7CAM_TIMER_REG_LOAD_1) {
@@ -970,6 +1158,10 @@ static void im7cam_timer_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (offset == IM7CAM_TIMER_REG_CONTROL) {
         s->control[0] = value;
+        qemu_log_mask(LOG_UNIMP,
+                      "im7cam: timer0 control=0x%x load=0x%x\n",
+                      s->control[0], s->load[0]);
+        im7cam_timer0_arm(s);
         return;
     }
     if (offset == IM7CAM_TIMER_REG_CONTROL_1) {
@@ -990,10 +1182,12 @@ static const MemoryRegionOps im7cam_timer_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
-static void im7cam_add_timer(MemoryRegion *sysmem)
+static void im7cam_add_timer(MemoryRegion *sysmem, Im7camIntcState *intc)
 {
     Im7camTimerState *s = g_new0(Im7camTimerState, 1);
 
+    s->intc = intc;
+    s->timer0 = timer_new_ns(QEMU_CLOCK_VIRTUAL, im7cam_timer0_expire, s);
     memory_region_init_io(&s->iomem, NULL, &im7cam_timer_ops, s,
                            "im7cam.timer", IM7CAM_TIMER_SIZE);
     memory_region_add_subregion(sysmem, IM7CAM_TIMER_BASE, &s->iomem);
@@ -1101,7 +1295,8 @@ static void im7cam_init(MachineState *machine)
     Im7camSpiState *spi = im7cam_add_spi(sysmem,
                                          getenv("IM7CAM_SPI_IMAGE"));
     im7cam_add_dma(sysmem, spi);
-    im7cam_add_timer(sysmem);
+    Im7camIntcState *intc = im7cam_add_intc(sysmem, cpu);
+    im7cam_add_timer(sysmem, intc);
     im7cam_add_reset_ctrl(sysmem);
     im7cam_add_unimp_region(sysmem, "im7cam.i2c0-guess", IM7CAM_I2C0_BASE,
                              IM7CAM_PERIPH_STUB_SIZE);
