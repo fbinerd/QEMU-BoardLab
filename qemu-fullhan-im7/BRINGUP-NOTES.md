@@ -1968,6 +1968,10 @@ and timer state, resets the boot-log cursor and re-arms its polling timer,
 then re-creates the private OEM `'*'` unlock byte before resetting the CPU to
 `0xA0800000`. Flash backing and its read-only contents are preserved.
 
+Section 25 supersedes that implementation detail: the unlock is now supplied
+only when the exact OEM gate reads UART status, rather than pre-seeded during
+reset. The observable reset behavior remains the same.
+
 The interactive regression test entered the prompt during the first boot,
 issued `reset`, observed a second `U-Boot 2010.06` banner and the complete
 `DRAM:  64 MiB` log, then interrupted the second real countdown and obtained
@@ -1979,3 +1983,91 @@ initializations in the same QEMU/container instance.
 The original U-Boot `reset` command now restarts the emulated board rather
 than hanging in its hardware-wait loop. The next requested work is a real FH
 EMAC data path connected to the TFTP service in `openwrt-build-tools`.
+
+## 25. FH EMAC, manual TFTP, normal boot policy and reset regression
+
+The original U-Boot contains an FH EMAC driver rather than one of QEMU's
+existing generic NICs. Disassembly of this exact partition identified its
+MMIO region at `0xE0600000`, the MAC MDIO registers at offsets `0x10/0x14`
+and the DMA registers at offsets `0x1004` (TX poll), `0x1008` (RX poll),
+`0x100c` (RX descriptor) and `0x1010` (TX descriptor). Its descriptors are
+16-byte little-endian records: word 0 bit 31 is OWN, word 1 low 11 bits are
+the buffer length/capacity, word 2 is the buffer address and word 3 points to
+the next descriptor. Received length is returned in word 0 bits 16--29.
+
+`im7cam-gmac` implements precisely that observed U-Boot protocol, exposes PHY
+ID `001c:c816`, moves descriptor buffers between guest RAM and a normal QEMU
+netdev, and uses QEMU's packet queue when no receive descriptor is ready.
+`run.sh` attaches it unconditionally to user networking; there is deliberately
+no `--net` opt-in. The region becomes active after a real user byte interrupts
+autoboot. It is disabled again by guest reset and re-enabled by the next real
+keypress. Linux's larger FH GMAC register/IRQ contract has not yet been
+validated, so this section claims working U-Boot Ethernet/TFTP only.
+
+The first network-enabled run exposed a pre-existing false recovery decision.
+The exact GPIO getter at `0xA0824068`, its bank table at `0xA08276D8`, and the
+live board parameter table at `0xA082E9B0` show that the active-low update/reset
+button is GPIO 23 and bank-0 input data is `0xF0300050`. The old all-zero stub
+there therefore meant "button held". A real GPIO model now returns bit 23 high
+on ordinary power-on. GDB confirmed the configured pin as `0x17`, the MMIO
+value as `0x00800000`, and the button helper's return value as 1.
+
+A second OEM policy still called its automatic updater after the countdown
+when both production variables `autoupdate` and `noeth` were absent. In the
+main loop at `0xA0811A0C`, the real key result is retained in `r4`: a nonzero
+value branches to the command shell at `0xA0811A98`, while the no-key path
+calls the unwanted updater at `0xA0811A9C`; the existing `bootcmd` block begins
+at `0xA0811AC8`. After QEMU's ROM reset restores U-Boot RAM, the board changes
+only that RAM call instruction to `b 0xA0811AC8` (`0xEA000009`). The original
+SPI dump is never written or modified. Thus no input executes the existing
+`kload`/`bootm` SPI flow, while a real input still enters the real shell and
+can use Ethernet. This compatibility instruction is re-applied after every
+guest reset.
+
+The U-Boot timer now uses QEMU's real-time clock after the private OEM gate is
+opened and while the PC remains inside U-Boot. This prevents the genuine
+one-second countdown from running faster than wall time under fast TCG. Linux
+automatically returns to the virtual 1 MHz clocksource after the handoff. A
+timed test measured 1.05 seconds from the visible countdown text to
+`Starting kernel`, and a key sent only after that text reliably entered the
+real `>` prompt.
+
+The `openwrt-build-tools` TFTP container uses host networking and serves:
+
+```text
+/media/dados_2tb/opw/openwrt/bin/targets/qualcommax/ipq50xx
+```
+
+On the tested host its address was `192.168.2.10`. QEMU user networking uses
+guest `10.0.2.15` and gateway `10.0.2.2`; `10.0.2.2` must not be used as
+`serverip`, because libslirp treats its special host address as its own TFTP
+endpoint and returns error 2 instead of forwarding to dnsmasq. `run.sh`
+detects and prints the host source address, and
+`IM7CAM_TFTP_SERVER_IP=address` can override it. The tested U-Boot commands
+were:
+
+```text
+setenv ipaddr 10.0.2.15
+setenv netmask 255.255.255.0
+setenv gatewayip 10.0.2.2
+setenv serverip 192.168.2.10
+tftpboot 0xA1000000 direct-memcpy-test.elf
+```
+
+The final allocated-TTY regression performed both cycles in one QEMU process.
+The first key produced `>`, and the ELF transfer reported
+`Bytes transferred = 66418`. The real `reset` command then produced a second
+U-Boot banner and countdown; a second key produced a second prompt, and
+`direct-memcpy-test.bin` reported `Bytes transferred = 124`. A separate
+unattended run showed the real countdown followed directly by the original
+kernel image verification and `Starting kernel`, with no `Download Filename`
+or automatic TFTP attempt.
+
+## Status (updated again, section 25)
+
+Ordinary invocation now preserves the board-like U-Boot countdown and normal
+SPI kernel path. Interrupting that same run exposes a working FH EMAC path to
+the existing host TFTP server, and both Ethernet activation and the full
+U-Boot initialization repeat correctly after `reset`. The SPI image remains
+the unmodified original; automatic reset-button recovery and an initramfs are
+the next, separate task.

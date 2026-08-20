@@ -31,6 +31,11 @@
 # interactive terminal, which reads as a hang even though the emulator
 # itself is fine. Use --trace only when actually hunting a new register,
 # same as this file's own bringup sessions did - not for normal use.
+#
+# The emulated FH EMAC is always connected to QEMU user networking. The
+# runner prints the exact U-Boot variables needed to reach the host's
+# recovery-lab TFTP server. IM7CAM_TFTP_SERVER_IP overrides automatic
+# host-IP detection.
 # Ctrl-A X quits QEMU.
 
 set -euo pipefail
@@ -107,6 +112,21 @@ if [[ "$TRACE" -eq 1 ]]; then
     QEMU_TRACE_ARGS=(-d unimp)
     echo "Tracing on (-d unimp) - expect a lot of retry-loop noise, see this script's own comments."
 fi
+QEMU_NET_ARGS=(-nic "user,model=im7cam-gmac,net=10.0.2.0/24,host=10.0.2.2")
+TFTP_SERVER_IP="${IM7CAM_TFTP_SERVER_IP:-$(
+    ip -4 route get 1.1.1.1 2>/dev/null |
+        awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }'
+)}"
+echo "Ethernet connected through the 10.0.2.2 user-network gateway."
+if [[ -n "$TFTP_SERVER_IP" ]]; then
+    echo "For the host recovery-lab TFTP server, enter in U-Boot:"
+    echo "  setenv ipaddr 10.0.2.15"
+    echo "  setenv netmask 255.255.255.0"
+    echo "  setenv gatewayip 10.0.2.2"
+    echo "  setenv serverip ${TFTP_SERVER_IP}"
+else
+    echo "Could not detect the host TFTP IP; set IM7CAM_TFTP_SERVER_IP explicitly." >&2
+fi
 
 echo "Booting the im7cam machine."
 echo "Console below IS the UART. Ctrl-A X to quit."
@@ -118,9 +138,11 @@ if [[ -t 0 && -t 1 ]]; then
 fi
 
 exec docker run --rm "${DOCKER_STDIN_ARGS[@]}" \
+    --network host \
     "${DOCKER_VOLUMES[@]}" \
     "${DOCKER_ENV[@]}" \
     "$IMAGE" \
     /build/qemu-9.1.0/build/qemu-system-arm -M im7cam -nographic -monitor none \
     -serial stdio "${QEMU_TRACE_ARGS[@]}" \
+    "${QEMU_NET_ARGS[@]}" \
     "${QEMU_BOOT_ARGS[@]}"
