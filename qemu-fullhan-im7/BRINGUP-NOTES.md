@@ -1596,3 +1596,77 @@ previous endless voltage-switch diagnostics. Full boot is still not claimed:
 the Linux SPI/MTD read path does not yet supply a mountable SquashFS image from
 the real flash-backed `mtdblock4`, and missing clock-tree values still produce
 non-fatal division-by-zero diagnostics during probe.
+
+## 19. Linux SPI word width and the first real userspace boot
+
+The `mtdblock4` failure was data corruption at the FIFO width boundary, not a
+bad SquashFS image. A trace of Linux's mount attempt showed valid FAST_READ
+commands at flash offsets `0x1D0000` and `0x1D0200`; the backing image returned
+the expected first bytes (`0x68` and `0x5A`). Unlike U-Boot's large reads,
+Linux did not start the already modeled external DMA engine for these blocks.
+It drained the SPI FIFO through its PIO transfer loop.
+
+Disassembly of the vendor SPI routine at `0xC01AD3D0`--`0xC01AD738` exposes
+three distinct FIFO paths selected by the software bits-per-word value:
+
+```text
+8 bits:  ldr FIFO; strb to buffer
+16 bits: ldr FIFO; strh to buffer
+32 bits: ldr FIFO; str  to buffer
+```
+
+The previous QEMU model always consumed and returned one real flash byte per
+32-bit MMIO read. That behavior remains necessary for U-Boot's proven 8-bit
+path, but it corrupts a 16-bit transfer by making every stored halfword
+`real_byte, 0x00`.
+
+A hardware breakpoint at `0xC01AD470`, after the kernel computes the transfer
+width but before it enters the receive loop, captured the first rootfs read:
+
+```text
+r1 = 0x200       receive mode
+r4 + 0x60 = 0x200 bytes pending
+r6 = 0xC2590000  destination buffer
+r5 = 0x10        16 bits per word
+```
+
+The driver's own configuration routines provide an exact hardware encoding:
+CTRL0's low nibble is `0xF` for 16-bit words, while advanced-control register
+`+0xF4` bit 16 selects 32-bit words. Both registers are programmed with
+read-modify-write sequences, so the model now preserves them. A FIFO read
+packs one, two, or four sequential flash bytes in little-endian order based on
+that live configuration. U-Boot's 8-bit behavior is retained; Linux's 16-bit
+SquashFS reads now deliver intact halfwords.
+
+After rebuilding, the exact non-trace runner command was tested for 90
+seconds. It produced 1,224 visible serial lines and passed the former panic:
+
+```text
+card0 disconnected!
+card1 disconnected!
+VFS: Mounted root (squashfs filesystem) readonly on device 31:4.
+devtmpfs: mounted
+Freeing unused kernel memory: 104K
+Video Memory Manager
+[OSA-DRV] Char device create OK !
+[DH_Binder] Binder Initial OK !
+[prc] Success to init module!
+[pdc] hwidName:IPC-S21F-imou, default:666 , please check!!!
+[pdc] Wifi init: powerGpioCfg = 14
+```
+
+This is the first confirmed execution of the real vendor userspace, not just
+the kernel. The run remains intentionally incomplete as a hardware replica:
+proprietary media modules report unresolved dependencies, JFFS2 configuration
+reads encounter erased-looking data, sensor/motor operations fail, and the
+vendor watchdog counts down because those peripherals are not modeled. These
+messages occur after PID 1 and substantial vendor initialization, so they are
+new peripheral-fidelity targets rather than a bootloader/kernel/rootfs wall.
+
+## Status (updated again, section 19)
+
+The documented command now boots the extracted U-Boot, real Linux 4.9.129,
+the flash-backed SquashFS root on `mtdblock4`, and substantial IPC-S21F vendor
+userspace. This is a working analysis boot, but not a claim of complete camera
+emulation: configuration JFFS2, clocks, media hardware, GPIO/sensor/motor and
+watchdog behavior remain incomplete and visibly report errors.

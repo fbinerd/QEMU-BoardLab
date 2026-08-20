@@ -1,11 +1,11 @@
 #!/bin/bash
 # Boots the extracted im7 (Imou IPC-S21F) U-Boot partition in the im7cam
 # QEMU skeleton machine. Not a finished boot yet - see BRINGUP-NOTES.md
-# for exactly what's confirmed vs. still a probe (section 18 as of this
+# for exactly what's confirmed vs. still a probe (section 19 as of this
 # writing: SPI DMA loads the real Linux/rootfs; the 1 MHz periodic timer,
 # interrupt controller and vendor-kernel console are sufficient for visible
-# Linux device initialization; both unattached MMC hosts are reported absent,
-# and mounting the SquashFS root from mtdblock4 is the next wall).
+# Linux and vendor-userspace initialization; both unattached MMC hosts are
+# reported absent and SquashFS mounts from the real flash-backed mtdblock4).
 #
 # Usage:
 #   ./run.sh [--spi-image PATH] [--trace] [path-to-0_U-Boot.bin]

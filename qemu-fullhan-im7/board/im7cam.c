@@ -280,6 +280,9 @@
  * to the response-side state machine (section 9) provably changed
  * nothing: the copy loop that would have consulted them never ran. */
 #define IM7CAM_SPI_REG_AVAIL 0x24
+#define IM7CAM_SPI_REG_CONTROL 0x00
+#define IM7CAM_SPI_REG_ADV_CONTROL 0xf4
+#define IM7CAM_SPI_ADV_32BIT (1 << 16)
 
 /* Experimental memory-mapped ("XIP") flash window. Registers 0x100/0x104
  * are programmed with 0xB0000000 on every transaction, so this was a
@@ -487,6 +490,8 @@ typedef struct Im7camSpiState {
     const uint8_t *resp_buf;
     unsigned resp_len;
     unsigned resp_pos;
+    uint32_t control;
+    uint32_t advanced_control;
 } Im7camSpiState;
 
 /* Real chip is an Eon/cFeon EN25QH64A (confirmed by the device-level
@@ -580,24 +585,37 @@ static uint64_t im7cam_spi_read(void *opaque, hwaddr offset, unsigned size)
          * needed for anything seen so far. */
         return 1;
     }
+    if (offset == IM7CAM_SPI_REG_CONTROL) {
+        return s->control;
+    }
+    if (offset == IM7CAM_SPI_REG_ADV_CONTROL) {
+        return s->advanced_control;
+    }
     if (offset == IM7CAM_SPI_REG_DATA) {
-        /* Exactly ONE FIFO byte per access, regardless of `size` - found
-         * the hard way (section 10): the real byte-mode read loop
+        unsigned word_bytes = 1;
+        uint64_t value = 0;
+        unsigned i;
+
+        /* Section 10 proved one byte per access for U-Boot's byte-mode
+         * read loop
          * (file offset 0x9e80, `ldr r0,[fp]; strb r0,[r5],#1`) does a
          * full 32-bit `ldr` per byte but only ever keeps the low 8 bits,
-         * discarding the other 24 and issuing a fresh `ldr` for the next
-         * real byte - not one word-sized access consuming 4 new FIFO
-         * bytes at once the way the *other* read path (file offset
-         * 0x9e14, `sl==32`, genuinely 32-bit-wide FIFO draining) does.
-         * The old code called im7cam_spi_next_byte() `size` times per
-         * access unconditionally, silently burning 3 real response bytes
-         * per guest read in exactly this byte-mode case - the actual
-         * cause of the JEDEC ID coming back as `1c ff ff ff ff` instead
-         * of `1c 70 17 ff ff` even after the response buffer itself was
-         * confirmed correct (section 9). Upper bytes are irrelevant
-         * here (the guest never reads them), so zero-filling instead of
-         * replicating is an arbitrary but harmless choice. */
-        return im7cam_spi_next_byte(s);
+         * discarding the upper bits. Section 19 then captured Linux's
+         * 512-byte SquashFS read with bits-per-word r5=16: that path does
+         * one FIFO `ldr` followed by `strh`, so returning one byte there
+         * inserted a zero after every real byte. The driver's own setup
+         * writes CTRL0 low nibble 0xf for 16-bit words and ADV_CONTROL
+         * bit16 for 32-bit words. Pack exactly that many sequential flash
+         * bytes into the low little-endian part of the MMIO result. */
+        if (s->advanced_control & IM7CAM_SPI_ADV_32BIT) {
+            word_bytes = 4;
+        } else if ((s->control & 0xf) == 0xf) {
+            word_bytes = 2;
+        }
+        for (i = 0; i < word_bytes; i++) {
+            value |= (uint64_t)im7cam_spi_next_byte(s) << (i * 8);
+        }
+        return value;
     }
     qemu_log_mask(LOG_UNIMP,
                   "im7cam: unimplemented READ  region=im7cam.spi "
@@ -742,6 +760,14 @@ static void im7cam_spi_write(void *opaque, hwaddr offset, uint64_t value,
          * RDID above, so fixed here too rather than waiting to hit it
          * for real. */
         im7cam_spi_write_byte(s, (uint8_t)value);
+        return;
+    }
+    if (offset == IM7CAM_SPI_REG_CONTROL) {
+        s->control = value;
+        return;
+    }
+    if (offset == IM7CAM_SPI_REG_ADV_CONTROL) {
+        s->advanced_control = value;
         return;
     }
     qemu_log_mask(LOG_UNIMP,
