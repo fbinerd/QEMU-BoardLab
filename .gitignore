@@ -2,3 +2,7 @@
 qemu-ipq5018/vendor/
 qemu-ipq5018/out/
 qemu-ipq5018/images/
+qemu-fullhan-im7/vendor/
+qemu-fullhan-im7/out/
+qemu-fullhan-im7/images/
+__pycache__/

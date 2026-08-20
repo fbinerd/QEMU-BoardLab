@@ -1,0 +1,5 @@
+
+config IM7CAM
+    bool
+    default y
+    depends on TCG && ARM
