@@ -1129,3 +1129,136 @@ written, if they exist at all outside of `0xE0300000`'s fixed-looking
 sequence - possibly in a RAM-resident descriptor structure built
 *before* the register pokes rather than in the registers themselves,
 which this session didn't check.
+
+## 13. FAST_READ DMA reconstructed; partition loading fixed; Linux reaches its ARM11 entry
+
+Continued directly from section 12's open question. This round replaces
+the last speculative `0xE0300000` workaround with a descriptor-driven
+model based on the actual U-Boot execution path, then follows the newly
+loaded kernel far enough to overturn the remaining CPU placeholder.
+
+### 13a. The loader's real call chain and buffers
+
+The earlier interpretation of the loader entry at runtime address
+`0xA0821814` was partly wrong: `r0=0xA0398160` is a request/status object,
+not the destination data buffer. Its other arguments are the filename
+in `r1` and flash offset `0x60000` in `r2`; it tries
+`partitionV3.txt`, `partitionV2.txt`, then `partition.txt`. The actual
+4 KiB destinations observed dynamically are `0xA03B8208`,
+`0xA03B82A8`, and `0xA03B8348`.
+
+The complete read path, using runtime addresses (the 8 KiB image header
+means runtime address = file offset - `0x2000` + `0xA0800000`), is:
+
+1. generic read dispatcher `0xA0804314`, handle `0xA083E364`;
+2. handle callback `0xA0803CC8`, context `0xA083E414`;
+3. flash read implementation `0xA08065D8`, which builds opcode `0x0B`
+   (FAST_READ) and calls `0xA0804C60`;
+4. `spi_xfer` at `0xA0808398`, whose transfer implementation
+   `0xA08080FC` selects PIO at `0xA0807D78` for at most 255 units and
+   the large-transfer path `0xA0808028` otherwise;
+5. `0xA0808028` builds an 84-byte stack configuration and calls the DMA
+   helpers around `0xA0823B60`.
+
+The pre-conversion configuration exposes destination at `+0x30`, count
+at `+0x40`, width shift at `+0x10`, and the SPI DMA port
+`0xF0E01000` at `+0x18`. For a partition-table transfer the observed
+values were destination `0xA03B8208`, count `0x800`, width shift 1:
+exactly 4096 bytes.
+
+### 13b. `0xE0300000` is the DMA controller
+
+Helper `0xA0823BCC` converts that configuration into linked, five-word
+hardware descriptors in guest RAM:
+
+| Offset | Meaning |
+|---:|---|
+| `+0x00` | source address |
+| `+0x04` | destination address |
+| `+0x08` | next descriptor |
+| `+0x0C` | control, including transfer-width shift |
+| `+0x10` | transfer count |
+
+The previously mysterious block is consequently confirmed as DMA. Its
+channel stride is `0x58`; channel-relative offset `0x10` receives the
+descriptor address; global offset `0x3A0` starts enabled channels;
+`0x2C0` reports completion bits; and writing those bits to `0x338`
+acknowledges/clears them. The old catch-all behavior that returned
+`0xFFFFFFFF` at `0x2C0` has been removed rather than retained beside the
+real model.
+
+`im7cam.c` now implements only the proven peripheral-to-memory case. It
+reads little-endian descriptors from guest RAM, accepts the confirmed
+SPI port as source, copies bytes from the currently latched flash
+address to each validated RAM destination, advances along `next`, sets
+the channel completion bit, and implements the acknowledge. Bounds,
+width/count, source, and a 4096-descriptor chain cap are checked so a bad
+guest descriptor cannot turn into an arbitrary host access.
+
+The first version executed only the head descriptor. That was sufficient
+for every 4 KiB partition-table attempt and removed `fail to load
+partition.txt from 60000`, proving the original wall was fixed, but the
+kernel load exposed the missing link traversal: U-Boot represents each
+64 KiB read as sixteen linked 4 KiB descriptors. Following the chain
+fixed that second issue. Trace verification now reports, among others:
+
+```text
+SPI DMA ch=0 flash=0x050000 bytes=0x10000 descs=16
+SPI DMA ch=0 flash=0x060000 bytes=0x1000 descs=1
+SPI DMA ch=0 flash=0x070000 bytes=0x10000 descs=16
+...
+SPI DMA ch=0 flash=0x1a0000 bytes=0xb500 descs=12
+```
+
+That final range completes the uImage whose header at flash `0x70000`
+names `Linux-4.9.129`, data size `0x13AC08`, load/entry address
+`0xA0008000`, and no compression at the uImage layer.
+
+### 13c. Small PIO reads need dummy clocks to preserve FAST_READ state
+
+Once partition parsing worked, U-Boot performed a small PIO read at
+flash `0x70000`. The controller brackets command and receive phases with
+the same offset-8 toggles already discussed in section 12, resetting
+`cmd_len`; the receive phase then writes `0xFF` solely to generate SPI
+clocks. Treating that filler as a new opcode cleared `addr_latched` and
+lost the read. `im7cam_spi_write_byte()` now recognizes `0xFF` in this
+specific state as a dummy clock and preserves the address. The trace
+then produced the correct first uImage byte (`read_addr=0x70000
+byte=0x27`) and proceeded into all bulk kernel reads above.
+
+### 13d. The kernel proves ARM11/ARMv6; `cortex-a7` was the wrong placeholder
+
+With DMA fixed, U-Boot copies the image to `0xA0008000` and enters it.
+Under the old `cortex-a7`, gdb finds PC in the deliberate zImage error
+loop at `0xA0009478`. The path is unambiguous: entry code reads MIDR into
+`r9` (`0x410FC075`), calls the lookup routine at `0xA0009430`, receives
+zero in `r5`, then branches to that loop from `0xA000803C`.
+
+The embedded `proc_info` range contains exactly one 52-byte entry at
+`0xA032CCA0`: ID `0x0007B000`, mask `0x0007F000`. This is the ARM11 /
+ARMv6 identification pattern, not Cortex-A7/ARMv7. Running the same
+machine with QEMU's `arm1176` model satisfies it and reaches the linked
+kernel proper (live PC observed at `0xC01F44CC`, rather than the zImage
+error loop). The board default is therefore changed from `cortex-a7` to
+`arm1176`; this is now evidence from the device's own kernel, while still
+supporting the VBAR access that ruled out `arm926` in section 4.
+
+### 13e. New wall
+
+There is no readable Linux console output yet. With `arm1176`, a
+15-second `-d unimp` run grows to millions of repeated reads from timer
+block `0xF0C00000`, offset `0x18`, while the existing minimal timer only
+advances offset `0x04`. A live PC in the linked kernel plus its virtual
+mapping confirms Linux itself is now executing; the next task is to
+disassemble the offset-`0x18` consumer and model the register semantics
+(very likely another/current timer channel) from the poll condition.
+
+## Status (updated again, section 13)
+
+The original partition-table failure and the entire SPI bulk-read path
+are resolved. U-Boot reads the real partition metadata, loads the full
+Linux uImage through linked DMA descriptors, and enters its zImage. The
+kernel's own `proc_info` table identifies ARM11/ARMv6 and the `arm1176`
+QEMU model reaches linked kernel code. The current first kernel-side wall
+is the unmapped behavior of timer offset `0x18`; this is the next focused
+bring-up target.

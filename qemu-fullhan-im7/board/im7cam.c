@@ -35,6 +35,8 @@
 #include "sysemu/sysemu.h"
 #include "chardev/char-fe.h"
 #include "qemu/timer.h"
+#include "qemu/bswap.h"
+#include "exec/cpu-common.h"
 #include "cpu.h"
 #include "qom/object.h"
 
@@ -135,17 +137,20 @@
 #define IM7CAM_GPIO0_BASE 0xF0300000
 #define IM7CAM_SPI0_LABELED_BASE  0xF0500000  /* fh8852v201-dump's SPI0 label - see IM7CAM_SPI_BASE below, this chip's real one turned out to be elsewhere */
 #define IM7CAM_UNK_D_BASE 0xF0D00000
-/* Section 10: first thing hit past the fixed RDID/flash-probe wall - a
- * completely different peripheral prefix (not 0xF0xxxxxx like every
- * other block in this file). Disassembly around the hang
- * (`bics r1,r0,r2; bne back` polling offset 0x2c0 for a `1<<N` bit,
- * writing back to offset 0x338 once satisfied) reads like a generic
- * interrupt/sync-primitive wait, not confirmed what it really is yet -
- * mapped as a plain logging stub first (this file's own established
- * first move for anything new) specifically to observe real access
- * patterns before modeling it, same as UART/SPI/timer/reset-ctrl all
- * started. */
-#define IM7CAM_UNK_E0300000_BASE 0xE0300000
+/* Section 13: Fullhan DMA controller, identified from the complete
+ * FAST_READ call chain rather than the fixed-looking register writes
+ * alone. U-Boot builds a RAM descriptor containing the SPI DMA port,
+ * real destination and transfer count, writes its address to channel
+ * offset 0x10, starts enabled channels via global offset 0x3a0, then
+ * polls completion bits at 0x2c0 and acknowledges them at 0x338. */
+#define IM7CAM_DMA_BASE 0xE0300000
+#define IM7CAM_DMA_SIZE 0x10000
+#define IM7CAM_DMA_CHANNEL_STRIDE 0x58
+#define IM7CAM_DMA_REG_DESC 0x10
+#define IM7CAM_DMA_REG_COMPLETE 0x2c0
+#define IM7CAM_DMA_REG_ACK 0x338
+#define IM7CAM_DMA_REG_START 0x3a0
+#define IM7CAM_DMA_MAX_CHANNELS 8
 #define IM7CAM_PERIPH_STUB_SIZE 0x10000
 
 /* Free-running timer/counter - found via gdbstub, not the trace log this
@@ -243,20 +248,6 @@
 static uint64_t im7cam_unimp_read(void *opaque, hwaddr offset, unsigned size)
 {
     const char *name = (const char *)opaque;
-
-    /* Cheap "make the poll succeed and see what happens next" probe -
-     * same technique section 5/6 used to get past the very first
-     * timer-adjacent hang, explicitly NOT a modeled register (unlike
-     * every other special-cased offset in this file, which all have a
-     * disassembly citation backing the exact value). File offset
-     * 0x25bb8's `bics r1,r0,r2; bne back` wants offset 0x2c0 to contain
-     * whatever bit(s) r0 needs set - 0xFFFFFFFF trivially satisfies any
-     * single/multi-bit test, at the cost of not knowing what the real
-     * bit layout is. Revisit properly once real trace output shows what
-     * this code does *after* getting past this point. */
-    if (name && !strcmp(name, "im7cam.unk-0xe0300000") && offset == 0x2c0) {
-        return 0xFFFFFFFF;
-    }
 
     qemu_log_mask(LOG_UNIMP,
                   "im7cam: unimplemented READ  region=%s off=0x%" HWADDR_PRIx
@@ -568,6 +559,21 @@ static uint64_t im7cam_spi_read(void *opaque, hwaddr offset, unsigned size)
 static void im7cam_spi_write_byte(Im7camSpiState *s, uint8_t byte)
 {
     if (s->cmd_len == 0) {
+        /* A read transfer clocks data out by writing 0xFF to the same
+         * FIFO after the command phase has ended. The controller's
+         * offset-8 phase bracket resets cmd_len between those phases,
+         * so this filler arrives looking superficially like a new
+         * opcode. It is not one: preserve the latched address and let
+         * the following PIO reads (or DMA engine) consume flash data.
+         * This distinction became load-bearing once partition parsing
+         * succeeded and bootargsParametersV2.txt used the small PIO path
+         * at flash offset 0x70000; bulk partition reads use DMA and had
+         * hidden the bug. A real recognized opcode below still starts a
+         * new transaction and replaces the old address normally. */
+        if (s->addr_latched && byte == 0xFF) {
+            return;
+        }
+
         /* First byte of a new transaction: the opcode. RDID (0x9F) and
          * RDSR (0x05) have no address phase at all - the flash starts
          * shifting a canned response back on the very next clock, unlike
@@ -697,7 +703,8 @@ static const MemoryRegionOps im7cam_spi_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
-static void im7cam_add_spi(MemoryRegion *sysmem, const char *image_path)
+static Im7camSpiState *im7cam_add_spi(MemoryRegion *sysmem,
+                                      const char *image_path)
 {
     Im7camSpiState *s = g_new0(Im7camSpiState, 1);
 
@@ -729,6 +736,174 @@ static void im7cam_add_spi(MemoryRegion *sysmem, const char *image_path)
         memory_region_set_readonly(&s->xip, true);
         memory_region_add_subregion(sysmem, IM7CAM_SPI_XIP_BASE, &s->xip);
     }
+
+    return s;
+}
+
+/* ============================================================
+ * Minimal DMA engine for the SPI bulk-read path. This is intentionally
+ * descriptor-driven: it consumes the exact five-word descriptor U-Boot
+ * built in guest RAM, rather than smuggling the destination through a
+ * board-specific side channel. Only peripheral-to-memory transfers from
+ * the confirmed SPI DMA port are implemented so far.
+ * ============================================================ */
+
+typedef struct Im7camDmaState {
+    MemoryRegion iomem;
+    Im7camSpiState *spi;
+    uint32_t regs[IM7CAM_DMA_SIZE / sizeof(uint32_t)];
+    uint32_t desc_addr[IM7CAM_DMA_MAX_CHANNELS];
+    uint32_t complete;
+} Im7camDmaState;
+
+static void im7cam_dma_run_channel(Im7camDmaState *s, unsigned channel)
+{
+    uint32_t raw[5];
+    uint32_t desc_addr;
+    uint32_t src;
+    uint32_t dst;
+    uint32_t next;
+    uint32_t control;
+    uint32_t count;
+    unsigned width_shift;
+    size_t byte_count;
+    size_t available;
+    size_t total = 0;
+    size_t total_available = 0;
+    uint32_t flash_start;
+    unsigned desc_count = 0;
+    uint8_t *buf;
+
+    if (channel >= IM7CAM_DMA_MAX_CHANNELS || !s->desc_addr[channel]) {
+        return;
+    }
+
+    desc_addr = s->desc_addr[channel];
+    flash_start = s->spi->read_addr;
+    do {
+        if (desc_addr < IM7CAM_RAM_BASE ||
+            (uint64_t)desc_addr + sizeof(raw) >
+                IM7CAM_RAM_BASE + IM7CAM_RAM_SIZE || desc_count++ >= 4096) {
+            qemu_log_mask(LOG_UNIMP,
+                          "im7cam: rejected DMA descriptor chain ch=%u "
+                          "desc=0x%08x count=%u\n", channel, desc_addr,
+                          desc_count);
+            return;
+        }
+
+        cpu_physical_memory_read(desc_addr, raw, sizeof(raw));
+        src = le32_to_cpu(raw[0]);
+        dst = le32_to_cpu(raw[1]);
+        next = le32_to_cpu(raw[2]);
+        control = le32_to_cpu(raw[3]);
+        count = le32_to_cpu(raw[4]);
+        width_shift = (control >> 4) & 0x7;
+
+        if (src != IM7CAM_SPI_BASE + 0x1000 || width_shift > 3 || !count) {
+            qemu_log_mask(LOG_UNIMP,
+                          "im7cam: unsupported DMA descriptor ch=%u "
+                          "desc=0x%08x src=0x%08x dst=0x%08x "
+                          "control=0x%08x count=0x%x\n",
+                          channel, desc_addr, src, dst, control, count);
+            return;
+        }
+
+        byte_count = (size_t)count << width_shift;
+        if (byte_count > IM7CAM_RAM_SIZE || dst < IM7CAM_RAM_BASE ||
+            (uint64_t)dst + byte_count >
+                IM7CAM_RAM_BASE + IM7CAM_RAM_SIZE) {
+            qemu_log_mask(LOG_UNIMP,
+                          "im7cam: rejected DMA outside RAM ch=%u "
+                          "dst=0x%08x bytes=0x%zx\n", channel, dst,
+                          byte_count);
+            return;
+        }
+
+        buf = g_malloc(byte_count);
+        memset(buf, 0xFF, byte_count);
+        available = 0;
+        if (s->spi->flash_data && s->spi->read_addr < s->spi->flash_size) {
+            available = MIN(byte_count,
+                            s->spi->flash_size - s->spi->read_addr);
+            memcpy(buf, s->spi->flash_data + s->spi->read_addr, available);
+        }
+        cpu_physical_memory_write(dst, buf, byte_count);
+        g_free(buf);
+
+        s->spi->read_addr += byte_count;
+        total += byte_count;
+        total_available += available;
+        desc_addr = next;
+    } while (desc_addr);
+
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: SPI DMA ch=%u flash=0x%06x bytes=0x%zx "
+                  "descs=%u (backed=0x%zx)\n",
+                  channel, flash_start, total, desc_count, total_available);
+    s->complete |= 1U << channel;
+}
+
+static uint64_t im7cam_dma_read(void *opaque, hwaddr offset, unsigned size)
+{
+    Im7camDmaState *s = opaque;
+
+    if (offset == IM7CAM_DMA_REG_COMPLETE) {
+        return s->complete;
+    }
+    if (offset < IM7CAM_DMA_SIZE && !(offset & 3)) {
+        return s->regs[offset / sizeof(uint32_t)];
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "im7cam: unimplemented READ region=im7cam.dma "
+                  "off=0x%" HWADDR_PRIx " size=%u\n", offset, size);
+    return 0;
+}
+
+static void im7cam_dma_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    Im7camDmaState *s = opaque;
+    unsigned channel;
+
+    if (offset < IM7CAM_DMA_SIZE && !(offset & 3)) {
+        s->regs[offset / sizeof(uint32_t)] = value;
+    }
+    if (offset < IM7CAM_DMA_CHANNEL_STRIDE * IM7CAM_DMA_MAX_CHANNELS &&
+        offset % IM7CAM_DMA_CHANNEL_STRIDE == IM7CAM_DMA_REG_DESC) {
+        channel = offset / IM7CAM_DMA_CHANNEL_STRIDE;
+        s->desc_addr[channel] = value;
+        return;
+    }
+    if (offset == IM7CAM_DMA_REG_ACK) {
+        s->complete &= ~(uint32_t)value;
+        return;
+    }
+    if (offset == IM7CAM_DMA_REG_START) {
+        for (channel = 0; channel < IM7CAM_DMA_MAX_CHANNELS; channel++) {
+            if (value & (1U << channel)) {
+                im7cam_dma_run_channel(s, channel);
+            }
+        }
+        return;
+    }
+}
+
+static const MemoryRegionOps im7cam_dma_ops = {
+    .read = im7cam_dma_read,
+    .write = im7cam_dma_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static void im7cam_add_dma(MemoryRegion *sysmem, Im7camSpiState *spi)
+{
+    Im7camDmaState *s = g_new0(Im7camDmaState, 1);
+
+    s->spi = spi;
+    memory_region_init_io(&s->iomem, NULL, &im7cam_dma_ops, s,
+                           "im7cam.dma", IM7CAM_DMA_SIZE);
+    memory_region_add_subregion(sysmem, IM7CAM_DMA_BASE, &s->iomem);
 }
 
 /* ============================================================
@@ -877,7 +1052,9 @@ static void im7cam_init(MachineState *machine)
     memory_region_add_subregion(sysmem, IM7CAM_RAM_BASE, machine->ram);
 
     im7cam_add_uart(sysmem);
-    im7cam_add_spi(sysmem, getenv("IM7CAM_SPI_IMAGE"));
+    Im7camSpiState *spi = im7cam_add_spi(sysmem,
+                                         getenv("IM7CAM_SPI_IMAGE"));
+    im7cam_add_dma(sysmem, spi);
     im7cam_add_timer(sysmem);
     im7cam_add_reset_ctrl(sysmem);
     im7cam_add_unimp_region(sysmem, "im7cam.i2c0-guess", IM7CAM_I2C0_BASE,
@@ -889,9 +1066,6 @@ static void im7cam_init(MachineState *machine)
                              IM7CAM_PERIPH_STUB_SIZE);
     im7cam_add_unimp_region(sysmem, "im7cam.unk-0xf0d00000",
                              IM7CAM_UNK_D_BASE, IM7CAM_PERIPH_STUB_SIZE);
-    im7cam_add_unimp_region(sysmem, "im7cam.unk-0xe0300000",
-                             IM7CAM_UNK_E0300000_BASE,
-                             IM7CAM_PERIPH_STUB_SIZE);
 
     if (!machine->kernel_filename) {
         error_report("im7cam: no -kernel given - pass the extracted "
@@ -938,17 +1112,15 @@ static void im7cam_machine_class_init(ObjectClass *oc, void *data)
     mc->desc = "Fullhan im7 / Imou IPC-S21F research machine "
                "(skeleton only - see BRINGUP-NOTES.md)";
     mc->init = im7cam_init;
-    /* Was arm926 (ARMv5) - real evidence overturned that guess almost
-     * immediately: with IM7CAM_ENTRY_OFFSET pointed at real code, the very
-     * first thing it did was write cp15 c12,c0,0 (VBAR, the exception
-     * vector base register) - a real ARMv7-A/ARMv6+Security-Extensions
-     * register that doesn't exist at all on ARMv5, so arm926 logged
-     * "unsupported AArch32 system register" on real guest code, not
-     * garbage. cortex-a7 is the new placeholder: a real ARMv7-A core,
-     * common in exactly this class/era of cheap embedded SoC, and QEMU's
-     * best-supported ARMv7-A model. Still not chip-confirmed - see
-     * BRINGUP-NOTES.md section 3. */
-    mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a7");
+    /* Section 13 finally supplies image-internal evidence for the CPU
+     * family. The loaded Linux-4.9.129 zImage contains exactly one
+     * proc_info entry: CPU ID 0x0007b000 under mask 0x0007f000, the ARM11
+     * / ARMv6 signature. cortex-a7 reaches the zImage but is rejected by
+     * that table and branches to the decompressor's deliberate error
+     * loop at 0xa0009478. QEMU arm1176 matches it and reaches the linked
+     * kernel at 0xc01fxxxx. This also retains the VBAR support whose
+     * absence proved the original arm926 placeholder wrong. */
+    mc->default_cpu_type = ARM_CPU_TYPE_NAME("arm1176");
     mc->default_ram_size = IM7CAM_RAM_SIZE;
     mc->default_ram_id = "im7cam.ram";
     mc->ignore_memory_transaction_failures = true;

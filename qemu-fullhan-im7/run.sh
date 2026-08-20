@@ -1,9 +1,9 @@
 #!/bin/bash
 # Boots the extracted im7 (Imou IPC-S21F) U-Boot partition in the im7cam
 # QEMU skeleton machine. Not a finished boot yet - see BRINGUP-NOTES.md
-# for exactly what's confirmed vs. still a probe (section 12 as of this
-# writing: UART and the JEDEC-ID SPI path work; bulk FAST_READ transfer
-# is still unidentified and partition-table loading therefore fails).
+# for exactly what's confirmed vs. still a probe (section 13 as of this
+# writing: SPI DMA loads the partition table and Linux image; the ARM11
+# kernel starts and next waits on timer register offset 0x18).
 #
 # Usage:
 #   ./run.sh [--spi-image PATH] [--trace] [path-to-0_U-Boot.bin]
