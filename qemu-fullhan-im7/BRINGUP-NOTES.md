@@ -1940,3 +1940,42 @@ displays the complete genuine U-Boot boot log, provides the real timed
 keypress window and automatically reaches kernel/rootfs when no key is
 pressed. Sections 21 and 22 remain the investigation history; their synthetic
 countdown implementation is superseded by this section.
+
+## 24. The U-Boot `reset` command now resets the emulated board
+
+Entering `reset` at the real U-Boot prompt printed `resetting ...` and then
+froze. Disassembly of the original binary showed that this is the expected
+software side of a hardware reset, not a command-parser failure:
+
+```text
+0xA0821190  U-Boot reset command handler
+0xA08211B0  call 0xA0800798 (board reset hook, returns)
+0xA08211B8  call 0xA081BAB8
+0xA081BAC8  store 0x7fffffff at 0xF0000000 + 0x4c
+0xA081BACC  branch to itself while hardware resets the SoC
+```
+
+The reset-controller model previously knew only offset `0x54`, used to
+acknowledge individual peripheral-reset operations. It silently ignored the
+global-reset request at offset `0x4c`, leaving the CPU in U-Boot's intentional
+wait loop forever. A write to the disassembly-confirmed `0xF000004C` register
+now requests a QEMU guest reset.
+
+The machine reset callback was also upgraded from CPU-only behavior. QEMU's
+standard ROM reset reloads the unchanged U-Boot blob into RAM; the board
+callback now clears the mutable SPI transaction, DMA, interrupt-controller
+and timer state, resets the boot-log cursor and re-arms its polling timer,
+then re-creates the private OEM `'*'` unlock byte before resetting the CPU to
+`0xA0800000`. Flash backing and its read-only contents are preserved.
+
+The interactive regression test entered the prompt during the first boot,
+issued `reset`, observed a second `U-Boot 2010.06` banner and the complete
+`DRAM:  64 MiB` log, then interrupted the second real countdown and obtained
+the `>` prompt again. This verifies reset across two complete U-Boot
+initializations in the same QEMU/container instance.
+
+## Status (updated again, section 24)
+
+The original U-Boot `reset` command now restarts the emulated board rather
+than hanging in its hardware-wait loop. The next requested work is a real FH
+EMAC data path connected to the TFTP service in `openwrt-build-tools`.

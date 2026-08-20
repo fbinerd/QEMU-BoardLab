@@ -33,6 +33,7 @@
 #include "hw/boards.h"
 #include "hw/loader.h"
 #include "sysemu/reset.h"
+#include "sysemu/runstate.h"
 #include "sysemu/sysemu.h"
 #include "chardev/char-fe.h"
 #include "qemu/timer.h"
@@ -254,6 +255,7 @@
  * unmapped reads as 0, which never satisfies the == -1 check. */
 #define IM7CAM_RESET_BASE 0xF0000000
 #define IM7CAM_RESET_SIZE 0x10000
+#define IM7CAM_RESET_REG_SYSTEM 0x4C
 #define IM7CAM_RESET_REG_ACK 0x54
 
 /* This chip's REAL SPI (flash) controller - confirmed by live disassembly
@@ -559,6 +561,28 @@ static Im7camUartState *im7cam_add_uart(MemoryRegion *sysmem, ARMCPU *cpu)
                               im7cam_uart_receive, NULL, NULL, s, NULL,
                               true);
     return s;
+}
+
+static void im7cam_uart_reset(Im7camUartState *s)
+{
+    static const uint8_t autoboot_unlock[] = { '*' };
+
+    s->rx_valid = false;
+    s->rx_byte = 0;
+    s->autoboot_unlock_pending = false;
+    s->bootlog_ready = false;
+    s->bootlog_seen = false;
+    s->early_log_pos = 0;
+    s->bootlog_buffer = 0;
+    s->bootlog_pos = 0;
+    timer_mod(s->bootlog_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              IM7CAM_UBOOT_LOG_POLL_NS);
+
+    /* Re-create the physical-board console contract on every cold or
+     * guest-requested reset, not only on the first machine start. */
+    im7cam_uart_receive(s, autoboot_unlock, sizeof(autoboot_unlock));
+    s->autoboot_unlock_pending = true;
 }
 
 /* ============================================================
@@ -943,6 +967,19 @@ static Im7camSpiState *im7cam_add_spi(MemoryRegion *sysmem,
     return s;
 }
 
+static void im7cam_spi_reset(Im7camSpiState *s)
+{
+    memset(s->cmd_buf, 0, sizeof(s->cmd_buf));
+    s->cmd_len = 0;
+    s->addr_latched = false;
+    s->read_addr = 0;
+    s->resp_buf = NULL;
+    s->resp_len = 0;
+    s->resp_pos = 0;
+    s->control = 0;
+    s->advanced_control = 0;
+}
+
 /* ============================================================
  * Minimal DMA engine for the SPI bulk-read path. This is intentionally
  * descriptor-driven: it consumes the exact five-word descriptor U-Boot
@@ -1099,7 +1136,8 @@ static const MemoryRegionOps im7cam_dma_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
-static void im7cam_add_dma(MemoryRegion *sysmem, Im7camSpiState *spi)
+static Im7camDmaState *im7cam_add_dma(MemoryRegion *sysmem,
+                                      Im7camSpiState *spi)
 {
     Im7camDmaState *s = g_new0(Im7camDmaState, 1);
 
@@ -1107,6 +1145,14 @@ static void im7cam_add_dma(MemoryRegion *sysmem, Im7camSpiState *spi)
     memory_region_init_io(&s->iomem, NULL, &im7cam_dma_ops, s,
                            "im7cam.dma", IM7CAM_DMA_SIZE);
     memory_region_add_subregion(sysmem, IM7CAM_DMA_BASE, &s->iomem);
+    return s;
+}
+
+static void im7cam_dma_reset(Im7camDmaState *s)
+{
+    memset(s->regs, 0, sizeof(s->regs));
+    memset(s->desc_addr, 0, sizeof(s->desc_addr));
+    s->complete = 0;
 }
 
 /* ============================================================
@@ -1415,7 +1461,8 @@ static const MemoryRegionOps im7cam_timer_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
-static void im7cam_add_timer(MemoryRegion *sysmem, Im7camIntcState *intc)
+static Im7camTimerState *im7cam_add_timer(MemoryRegion *sysmem,
+                                          Im7camIntcState *intc)
 {
     Im7camTimerState *s = g_new0(Im7camTimerState, 1);
 
@@ -1424,6 +1471,7 @@ static void im7cam_add_timer(MemoryRegion *sysmem, Im7camIntcState *intc)
     memory_region_init_io(&s->iomem, NULL, &im7cam_timer_ops, s,
                            "im7cam.timer", IM7CAM_TIMER_SIZE);
     memory_region_add_subregion(sysmem, IM7CAM_TIMER_BASE, &s->iomem);
+    return s;
 }
 
 /* ============================================================
@@ -1452,6 +1500,12 @@ static uint64_t im7cam_reset_ctrl_read(void *opaque, hwaddr offset,
 static void im7cam_reset_ctrl_write(void *opaque, hwaddr offset,
                                      uint64_t value, unsigned size)
 {
+    if (offset == IM7CAM_RESET_REG_SYSTEM) {
+        /* Exact U-Boot reset path: 0xA081BAB8 writes 0x7fffffff here,
+         * then waits forever for the SoC to restart. */
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        return;
+    }
     if (offset == IM7CAM_RESET_REG_ACK) {
         return;
     }
@@ -1478,13 +1532,17 @@ static void im7cam_add_reset_ctrl(MemoryRegion *sysmem)
     memory_region_add_subregion(sysmem, IM7CAM_RESET_BASE, mr);
 }
 
-/* ---- reset: just points the CPU at the hypothesized entry point.
- * No RAM re-population on reset yet (unlike mr80x_reset()) - this
- * skeleton is meant for a single boot attempt per QEMU invocation, not
- * guest-triggered reboots. Add that once there's an actual reason to. */
+/* ---- machine reset: ROM blobs repopulate U-Boot RAM through QEMU's
+ * standard rom_reset(); this callback resets the CPU and all mutable state
+ * held by this board's hand-written peripheral models. */
 
 typedef struct IM7CamResetState {
     ARMCPU *cpu;
+    Im7camUartState *uart;
+    Im7camSpiState *spi;
+    Im7camDmaState *dma;
+    Im7camIntcState *intc;
+    Im7camTimerState *timer;
 } IM7CamResetState;
 
 /* The first 0x2000 bytes of the *file* (header + relocation table,
@@ -1511,6 +1569,16 @@ static void im7cam_reset(void *opaque)
     IM7CamResetState *rs = opaque;
     CPUState *cs = CPU(rs->cpu);
 
+    timer_del(rs->timer->timer0);
+    memset(rs->timer->load, 0, sizeof(rs->timer->load));
+    memset(rs->timer->control, 0, sizeof(rs->timer->control));
+    rs->timer->irq_status = 0;
+    rs->timer->console_index_fixed = false;
+    rs->intc->pending = 0;
+    im7cam_intc_update(rs->intc);
+    im7cam_dma_reset(rs->dma);
+    im7cam_spi_reset(rs->spi);
+    im7cam_uart_reset(rs->uart);
     cpu_reset(cs);
     cpu_set_pc(cs, IM7CAM_IMAGE_LOAD_ADDR);
 }
@@ -1526,21 +1594,13 @@ static void im7cam_init(MachineState *machine)
     memory_region_add_subregion(sysmem, IM7CAM_RAM_BASE, machine->ram);
 
     Im7camUartState *uart = im7cam_add_uart(sysmem, cpu);
-    /* The physical board exposes the ordinary interactive bootdelay, but
-     * this vendor binary hides it behind an internal '*' gate.  Satisfy
-     * only that private gate before execution.  No countdown-stop key is
-     * injected: the next byte must come from the user, and no byte means
-     * U-Boot proceeds to bootcmd/kernel normally. */
-    static const uint8_t autoboot_unlock[] = { '*' };
-    im7cam_uart_receive(uart, autoboot_unlock, sizeof(autoboot_unlock));
-    uart->autoboot_unlock_pending = true;
     Im7camSpiState *spi = im7cam_add_spi(sysmem,
                                          getenv("IM7CAM_SPI_IMAGE"));
-    im7cam_add_dma(sysmem, spi);
+    Im7camDmaState *dma = im7cam_add_dma(sysmem, spi);
     im7cam_add_mmc(sysmem, IM7CAM_MMC0_BASE, "im7cam.mmc0");
     im7cam_add_mmc(sysmem, IM7CAM_MMC1_BASE, "im7cam.mmc1");
     Im7camIntcState *intc = im7cam_add_intc(sysmem, cpu);
-    im7cam_add_timer(sysmem, intc);
+    Im7camTimerState *timer = im7cam_add_timer(sysmem, intc);
     im7cam_add_reset_ctrl(sysmem);
     im7cam_add_unimp_region(sysmem, "im7cam.i2c0-guess", IM7CAM_I2C0_BASE,
                              IM7CAM_PERIPH_STUB_SIZE);
@@ -1603,6 +1663,11 @@ static void im7cam_init(MachineState *machine)
 
     IM7CamResetState *rs = g_new0(IM7CamResetState, 1);
     rs->cpu = cpu;
+    rs->uart = uart;
+    rs->spi = spi;
+    rs->dma = dma;
+    rs->intc = intc;
+    rs->timer = timer;
     qemu_register_reset(im7cam_reset, rs);
 }
 
