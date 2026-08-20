@@ -3,7 +3,7 @@
 # QEMU skeleton machine. Not a finished boot yet - see BRINGUP-NOTES.md
 # for exactly what's confirmed vs. still a probe (section 14 as of this
 # writing: SPI DMA loads the partition table and Linux image; the ARM11
-# kernel clocksource now advances; the next wall is the absent timer IRQ).
+# 1 MHz kernel clocksource now advances; timer0 IRQ 19 is the next wall).
 #
 # Usage:
 #   ./run.sh [--spi-image PATH] [--trace] [path-to-0_U-Boot.bin]

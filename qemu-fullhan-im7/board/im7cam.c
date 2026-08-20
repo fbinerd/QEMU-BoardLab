@@ -930,7 +930,8 @@ typedef struct Im7camTimerState {
 static uint64_t im7cam_timer_read(void *opaque, hwaddr offset, unsigned size)
 {
     Im7camTimerState *s = opaque;
-    uint32_t ticks = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /* The live kernel log identifies timer1 as a 1000 kHz clocksource. */
+    uint32_t ticks = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000;
 
     if (offset == IM7CAM_TIMER_REG_COUNT) {
         return (s->control[0] & 1) ? ticks : 0;

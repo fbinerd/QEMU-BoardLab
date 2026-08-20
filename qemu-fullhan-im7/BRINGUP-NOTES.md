@@ -1345,3 +1345,57 @@ the real boot path demonstrates. Linux completes its timer setup and
 reaches delay calibration. Boot is presently blocked waiting for its
 first timer interrupt; interrupt-controller discovery and timer IRQ
 wiring are the next focused target.
+
+## 15. Hidden printk log recovered: FH8626V100, 1 MHz timer, IRQ 19
+
+The serial console is not yet a reliable way to see Linux output, but
+the messages already accumulated in RAM. Attached gdb to the running
+kernel and dumped virtual range `0xC0000000`--`0xC0800000`; printable
+records in the in-memory printk ring provide several new facts from the
+guest itself:
+
+```text
+Hardware name: FH8626V100
+Switching to timer-based delay loop, resolution 1000ns
+clocksource: timer1: mask: 0xffffffff ...
+sched_clock: 32 bits at 1000kHz, resolution 1000ns, ...
+console [tty0] enabled
+console [ttyS-1] enabled
+```
+
+This corrects another approximation: timer ticks are 1 MHz, not raw
+nanoseconds. Both emulated current-value registers now derive ticks as
+`QEMU_CLOCK_VIRTUAL / 1000`, preserving the already-proven directions
+and enable gating while matching the frequency Linux registered.
+
+The clock-event allocation is also directly inspectable. The object at
+`0xC2013000` contains `name=0xC02D7D89` (`"timer0"`), rating 300, and
+IRQ field `0x13` (19), using the Linux 4.9
+`struct clock_event_device` layout. Its Fullhan-private tail contains
+MMIO base `0xFE010000` and frequency `0x000F4240` (1,000,000), an
+independent confirmation of both findings.
+
+One diagnostic dead end is worth preserving. `-d guest_errors` exposed
+large volumes of otherwise suppressed unmapped traffic at physical
+`0xE2000000`, `0xE0600000`, and a few accesses at `0xE0200000`.
+The million-read `0xE2000044` loop is not the Linux interrupt
+controller: a reset-to-boot gdb read watchpoint catches it in U-Boot at
+`0xA082587C`, testing status bit 2 with a one-million-iteration timeout.
+The sibling FH8852 register map further identifies `0xE0600000` as
+GMAC, so neither address should be promoted to an interrupt-controller
+model from access shape alone.
+
+The in-RAM log also contains repeated `Division by zero in kernel`
+backtraces during early clock calculations. Linux survives them and
+registers the 1 MHz fallback/derived timer correctly, but they remain a
+separate clock-tree fidelity problem to revisit after interrupts allow
+normal boot diagnostics.
+
+## Status (updated again, section 15)
+
+The SoC identity is now device-confirmed as FH8626V100, timer frequency
+as 1 MHz, and the first required clock-event interrupt as IRQ 19. The
+kernel remains in `calibrate_delay()` waiting for the global tick to
+change. Next step: recover the Fullhan interrupt-controller dispatch and
+mask/ack protocol from the live kernel, wire timer0 to IRQ 19, and then
+use the newly functional tick to continue boot.
