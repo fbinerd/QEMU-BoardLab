@@ -1670,3 +1670,61 @@ the flash-backed SquashFS root on `mtdblock4`, and substantial IPC-S21F vendor
 userspace. This is a working analysis boot, but not a claim of complete camera
 emulation: configuration JFFS2, clocks, media hardware, GPIO/sensor/motor and
 watchdog behavior remain incomplete and visibly report errors.
+
+## 20. Default full-SPI boot, matching the mr80x workflow
+
+The user requested the same interface as `qemu-ipq5018`: provide one complete
+flash dump, start at its bootloader partition, and let that real bootloader
+load the kernel and rootfs from the same emulated flash. Until this section,
+`im7cam` already executed the latter chain but still required the extracted
+`0_U-Boot.bin` as a positional `-kernel` bootstrap. That was equivalent to
+mr80x's explicit development override, not its default full-flash mode.
+
+The im7 physical dump begins with the exact `0x50000`-byte U-Boot partition.
+When no positional override is supplied, the machine now performs the final
+handoff normally supplied by pre-U-Boot mask-ROM/SPL stages:
+
+1. keep the complete, unmodified 8 MiB file attached to the SPI controller;
+2. take partition 0 (`0x00000`--`0x4FFFF`) from that same backing buffer;
+3. skip its proven `0x2000`-byte vendor header and load the remaining
+   319,488 bytes at U-Boot's linked address `0xA0800000`;
+4. enter U-Boot, which itself reads partition metadata, boot arguments,
+   kernel and rootfs through the modeled SPI controller.
+
+The proprietary pre-U-Boot stages are not claimed to be emulated, just as
+mr80x models the final SBL/QSEE-to-APPSBL handoff. A positional
+`0_U-Boot.bin` remains available as an explicit development override.
+
+The runner no longer manufactures a default positional filename. It mounts
+only the SPI dump and omits QEMU `-kernel` in normal mode. If neither a usable
+SPI dump nor an explicit override exists, it stops with a clear error.
+
+The requested full-SPI-only command was tested for 75 seconds:
+
+```sh
+./qemu-fullhan-im7/run.sh \
+  --spi-image /media/dados_2tb/opw/openwrt-build-tools/tools/firmware-lab/work/miboim7-tudo-sobre/miboim7-spi-en25qh64-8mb-20260819.bin
+```
+
+It produced 1,228 serial lines and confirmed the complete chain:
+
+```text
+Boot source: U-Boot partition inside ...miboim7-spi...bin
+im7cam: loaded 'SPI partition 0' (319488 of 327680 bytes, skipped 8192-byte header) at 0xa0800000
+U-Boot 2010.06 (Sep 27 2024 - 18:56:13)
+VFS: Mounted root (squashfs filesystem) readonly on device 31:4.
+Freeing unused kernel memory: 104K
+[pdc] hwidName:IPC-S21F-imou, default:666 , please check!!!
+[pdc] Wifi init: powerGpioCfg = 14
+```
+
+Because this workspace's real dump path is also the runner's auto-detected
+fallback, plain `./qemu-fullhan-im7/run.sh` selects the same full-SPI boot.
+
+## Status (updated again, section 20)
+
+Normal invocation now takes only the complete SPI dump and follows the real
+observable chain from its U-Boot partition through kernel and SquashFS vendor
+userspace. The separately extracted U-Boot is no longer required for normal
+use. Pre-U-Boot ROM/SPL execution and the peripheral limitations listed in
+section 19 remain outside the currently confirmed model.

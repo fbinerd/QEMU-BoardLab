@@ -1,7 +1,7 @@
 /*
  * Fullhan `im7` (Imou IPC-S21F camera) QEMU machine model - research/bringup
  *
- * Deliberately minimal - a first skeleton, not a working boot yet. See
+ * Deliberately minimal research model, not a complete hardware replica. See
  * BRINGUP-NOTES.md in this directory for the full reasoning and the
  * evidence (or explicit lack of it) behind every address below. Unlike
  * qemu-ipq5018/board/mr80x.c, there's no vendor GPL source to transcribe
@@ -1377,6 +1377,7 @@ typedef struct IM7CamResetState {
  * offset. Every other pool constant found so far (BSS bounds, board_init_f
  * address) is an absolute address already, so this doesn't affect them. */
 #define IM7CAM_HEADER_SKIP 0x2000
+#define IM7CAM_UBOOT_PARTITION_SIZE 0x50000
 
 static void im7cam_reset(void *opaque)
 {
@@ -1416,37 +1417,53 @@ static void im7cam_init(MachineState *machine)
     im7cam_add_unimp_region(sysmem, "im7cam.unk-0xf0d00000",
                              IM7CAM_UNK_D_BASE, IM7CAM_PERIPH_STUB_SIZE);
 
-    if (!machine->kernel_filename) {
-        error_report("im7cam: no -kernel given - pass the extracted "
-                      "0_U-Boot.bin (see BRINGUP-NOTES.md)");
-        exit(1);
-    }
-
     gchar *filebuf = NULL;
     gsize filelen = 0;
     GError *gerr = NULL;
+    const uint8_t *uboot_buf;
+    const char *uboot_source;
 
-    if (!g_file_get_contents(machine->kernel_filename, &filebuf, &filelen,
-                              &gerr)) {
-        error_report("im7cam: could not read '%s': %s",
-                      machine->kernel_filename, gerr->message);
-        exit(1);
+    if (machine->kernel_filename) {
+        if (!g_file_get_contents(machine->kernel_filename, &filebuf, &filelen,
+                                 &gerr)) {
+            error_report("im7cam: could not read '%s': %s",
+                         machine->kernel_filename, gerr->message);
+            exit(1);
+        }
+        uboot_buf = (const uint8_t *)filebuf;
+        uboot_source = machine->kernel_filename;
+    } else {
+        /* Match mr80x's normal full-flash mode: the real mask-ROM/SPL
+         * stages are outside this machine's scope, so perform their final
+         * handoff by copying partition 0 from the already attached SPI
+         * dump into U-Boot's linked RAM address. The same untouched full
+         * dump remains behind the SPI controller for U-Boot to read the
+         * partition table, kernel and rootfs itself. */
+        if (!spi->flash_data || spi->flash_size < IM7CAM_UBOOT_PARTITION_SIZE) {
+            error_report("im7cam: no -kernel override and SPI image is too "
+                         "small for the 0x%x-byte U-Boot partition",
+                         IM7CAM_UBOOT_PARTITION_SIZE);
+            exit(1);
+        }
+        uboot_buf = spi->flash_data;
+        filelen = IM7CAM_UBOOT_PARTITION_SIZE;
+        uboot_source = "SPI partition 0";
     }
     if (filelen <= IM7CAM_HEADER_SKIP) {
         error_report("im7cam: '%s' is only %zu bytes - smaller than the "
                       "%u-byte header this board strips before loading "
                       "(section 1/4 of BRINGUP-NOTES.md). Wrong file?",
-                      machine->kernel_filename, filelen,
+                      uboot_source, filelen,
                       (unsigned)IM7CAM_HEADER_SKIP);
         exit(1);
     }
 
     size_t codelen = filelen - IM7CAM_HEADER_SKIP;
-    rom_add_blob_fixed("im7cam.uboot", filebuf + IM7CAM_HEADER_SKIP, codelen,
+    rom_add_blob_fixed("im7cam.uboot", uboot_buf + IM7CAM_HEADER_SKIP, codelen,
                         IM7CAM_IMAGE_LOAD_ADDR);
     info_report("im7cam: loaded '%s' (%zu of %zu bytes, skipped %u-byte "
                 "header) at 0x%" PRIx32,
-                machine->kernel_filename, codelen, filelen,
+                uboot_source, codelen, filelen,
                 (unsigned)IM7CAM_HEADER_SKIP, (uint32_t)IM7CAM_IMAGE_LOAD_ADDR);
 
     IM7CamResetState *rs = g_new0(IM7CamResetState, 1);
@@ -1459,7 +1476,7 @@ static void im7cam_machine_class_init(ObjectClass *oc, void *data)
     MachineClass *mc = MACHINE_CLASS(oc);
 
     mc->desc = "Fullhan im7 / Imou IPC-S21F research machine "
-               "(skeleton only - see BRINGUP-NOTES.md)";
+               "(boots real flash userspace; incomplete peripherals)";
     mc->init = im7cam_init;
     /* Section 13 finally supplies image-internal evidence for the CPU
      * family. The loaded Linux-4.9.129 zImage contains exactly one

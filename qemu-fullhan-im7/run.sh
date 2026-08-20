@@ -10,9 +10,9 @@
 # Usage:
 #   ./run.sh [--spi-image PATH] [--trace] [path-to-0_U-Boot.bin]
 #
-# With no positional argument, looks for images/0_U-Boot.bin (gitignored -
-# copy it in yourself from the source investigation, see BRINGUP-NOTES.md
-# "Where the firmware came from").
+# With no positional argument, boots partition 0 directly from the full SPI
+# dump, matching qemu-ipq5018's default full-NAND mode. A positional
+# 0_U-Boot.bin remains an explicit development override.
 #
 # --spi-image: backs the SPI flash controller with a real flash dump
 # (mirrors qemu-ipq5018/run.sh's --nand-image) so U-Boot's own flash
@@ -57,15 +57,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-KERNEL="${KERNEL:-${SCRIPT_DIR}/images/0_U-Boot.bin}"
-
-if [[ ! -f "$KERNEL" ]]; then
-    echo "error: no U-Boot image found." >&2
-    echo "usage: $0 [--spi-image PATH] [path-to-0_U-Boot.bin]" >&2
-    echo "default location: ${SCRIPT_DIR}/images/0_U-Boot.bin (gitignored)" >&2
-    exit 1
-fi
-
 if [[ -z "$SPI_IMAGE" ]]; then
     LOCAL_SPI_IMAGE="${SCRIPT_DIR}/images/spi-flash.bin"
     FALLBACK_SPI_IMAGE="/media/dados_2tb/opw/openwrt-build-tools/tools/firmware-lab/work/miboim7-tudo-sobre/miboim7-spi-en25qh64-8mb-20260819.bin"
@@ -80,14 +71,31 @@ if [[ -z "$SPI_IMAGE" ]]; then
     fi
 fi
 
+if [[ -n "${KERNEL:-}" && ! -f "$KERNEL" ]]; then
+    echo "error: U-Boot development override not found: ${KERNEL}" >&2
+    exit 1
+fi
+if [[ -z "${KERNEL:-}" && -z "$SPI_IMAGE" ]]; then
+    echo "error: no full SPI image or U-Boot development override found." >&2
+    echo "usage: $0 [--spi-image PATH] [path-to-0_U-Boot.bin]" >&2
+    exit 1
+fi
+
 echo "Building ${IMAGE} (cheap after the first run - only board/im7cam.c changes invalidate the ninja step)..."
 docker build -t "$IMAGE" "$SCRIPT_DIR"
 
-KERNEL_DIR="$(cd "$(dirname "$KERNEL")" && pwd)"
-KERNEL_FILE="$(basename "$KERNEL")"
-
-DOCKER_VOLUMES=(-v "${KERNEL_DIR}:/fw:ro")
+DOCKER_VOLUMES=()
 DOCKER_ENV=()
+QEMU_BOOT_ARGS=()
+if [[ -n "${KERNEL:-}" ]]; then
+    KERNEL_DIR="$(cd "$(dirname "$KERNEL")" && pwd)"
+    KERNEL_FILE="$(basename "$KERNEL")"
+    DOCKER_VOLUMES+=(-v "${KERNEL_DIR}:/fw:ro")
+    QEMU_BOOT_ARGS+=(-kernel "/fw/${KERNEL_FILE}")
+    echo "Development override: booting U-Boot from ${KERNEL}"
+else
+    echo "Boot source: U-Boot partition inside ${SPI_IMAGE}"
+fi
 if [[ -n "$SPI_IMAGE" ]]; then
     SPI_DIR="$(cd "$(dirname "$SPI_IMAGE")" && pwd)"
     SPI_FILE="$(basename "$SPI_IMAGE")"
@@ -101,7 +109,7 @@ if [[ "$TRACE" -eq 1 ]]; then
     echo "Tracing on (-d unimp) - expect a lot of retry-loop noise, see this script's own comments."
 fi
 
-echo "Booting ${KERNEL} in the im7cam skeleton machine."
+echo "Booting the im7cam machine."
 echo "Console below IS the UART. Ctrl-A X to quit."
 echo
 
@@ -116,4 +124,4 @@ exec docker run --rm "${DOCKER_STDIN_ARGS[@]}" \
     "$IMAGE" \
     /build/qemu-9.1.0/build/qemu-system-arm -M im7cam -nographic -monitor none \
     -serial stdio "${QEMU_TRACE_ARGS[@]}" \
-    -kernel "/fw/${KERNEL_FILE}"
+    "${QEMU_BOOT_ARGS[@]}"
