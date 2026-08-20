@@ -194,6 +194,22 @@
 #define IM7CAM_SPI_REG_STATUS 0x28
 #define IM7CAM_SPI_STATUS_IDLE 0x4
 
+/* THE actual root cause of the whole "SF: Unsupported manufacturer"
+ * saga (BRINGUP-NOTES.md sections 6/8/9) - found by getting real, public
+ * U-Boot 2010.06 source for the generic drivers/mtd/spi/spi_flash.c this
+ * device's SPI_FLASH_MAX_ID_LEN=5/`idcode[5]` exactly matches (see
+ * section 10), then re-reading this file's *own* driver
+ * (`0x9d78`) with that as a map instead of guessing blind. `[r4,#0x24]`
+ * is read once per "chunk" of a read loop and used directly as the byte
+ * count to copy out of the FIFO this pass (`r3 = r5 + *(r4+0x24)`, then
+ * `cmp r5,r3; bne copy_loop`) - with the old catch-all stub returning 0
+ * here, every single read chunk copied **zero bytes**, every time,
+ * regardless of what the FIFO itself (`IM7CAM_SPI_REG_DATA`) or
+ * `resp_buf` contained - which is exactly why two separate, real fixes
+ * to the response-side state machine (section 9) provably changed
+ * nothing: the copy loop that would have consulted them never ran. */
+#define IM7CAM_SPI_REG_AVAIL 0x24
+
 /* ============================================================
  * Catch-all logging stub for every peripheral - literally everything
  * right now, this board has no real device models yet. Reads always
@@ -463,14 +479,37 @@ static uint64_t im7cam_spi_read(void *opaque, hwaddr offset, unsigned size)
     if (offset == IM7CAM_SPI_REG_STATUS) {
         return IM7CAM_SPI_STATUS_IDLE;
     }
+    if (offset == IM7CAM_SPI_REG_AVAIL) {
+        /* Always "1 byte available this chunk" - the simplest value that
+         * makes the driver's own copy loop always progress by exactly
+         * one real byte per poll and naturally terminate after the
+         * right number of iterations (whatever the caller actually
+         * asked for), with no risk of it ever reading further than
+         * intended the way returning a large/guessed count could. Real
+         * hardware almost certainly reports something closer to "how
+         * full the FIFO actually is right now" - fine to refine later
+         * if a real multi-byte-per-chunk case ever needs modeling, not
+         * needed for anything seen so far. */
+        return 1;
+    }
     if (offset == IM7CAM_SPI_REG_DATA) {
-        uint32_t word = 0;
-        unsigned i;
-
-        for (i = 0; i < size; i++) {
-            word |= (uint32_t)im7cam_spi_next_byte(s) << (8 * i);
-        }
-        return word;
+        /* Exactly ONE FIFO byte per access, regardless of `size` - found
+         * the hard way (section 10): the real byte-mode read loop
+         * (file offset 0x9e80, `ldr r0,[fp]; strb r0,[r5],#1`) does a
+         * full 32-bit `ldr` per byte but only ever keeps the low 8 bits,
+         * discarding the other 24 and issuing a fresh `ldr` for the next
+         * real byte - not one word-sized access consuming 4 new FIFO
+         * bytes at once the way the *other* read path (file offset
+         * 0x9e14, `sl==32`, genuinely 32-bit-wide FIFO draining) does.
+         * The old code called im7cam_spi_next_byte() `size` times per
+         * access unconditionally, silently burning 3 real response bytes
+         * per guest read in exactly this byte-mode case - the actual
+         * cause of the JEDEC ID coming back as `1c ff ff ff ff` instead
+         * of `1c 70 17 ff ff` even after the response buffer itself was
+         * confirmed correct (section 9). Upper bytes are irrelevant
+         * here (the guest never reads them), so zero-filling instead of
+         * replicating is an arbitrary but harmless choice. */
+        return im7cam_spi_next_byte(s);
     }
     qemu_log_mask(LOG_UNIMP,
                   "im7cam: unimplemented READ  region=im7cam.spi "
@@ -571,11 +610,24 @@ static void im7cam_spi_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
     if (offset == IM7CAM_SPI_REG_DATA) {
-        unsigned i;
-
-        for (i = 0; i < size; i++) {
-            im7cam_spi_write_byte(s, (uint8_t)(value >> (8 * i)));
-        }
+        /* Same fix as the read side (see the big comment in
+         * im7cam_spi_read()): one real FIFO byte per access, not `size`.
+         * The confirmed byte-mode write loop (file offset 0xa18c:
+         * `ldrb r1,[r2],#1; str r1,[r4,#0x60]`) zero-extends one real
+         * byte into r1 and does a plain 32-bit `str` per real byte -
+         * treating that as 4 accumulator bytes (1 real + 3 phantom
+         * zeros) hadn't visibly broken anything yet only because the ID
+         * probe's opcode byte happens to survive 3 harmless trailing
+         * zero-bytes in the accumulator, but a real multi-byte
+         * READ/FAST_READ command (opcode + 3 address bytes, each its
+         * own separate `str` this same way) would have filled cmd_len
+         * to its 4-byte cap after just the *first* real byte, silently
+         * dropping bytes 2-4 (the actual address) - not yet observed
+         * because nothing has exercised a real flash READ command this
+         * way yet, but the exact same bug class as the one that broke
+         * RDID above, so fixed here too rather than waiting to hit it
+         * for real. */
+        im7cam_spi_write_byte(s, (uint8_t)value);
         return;
     }
     qemu_log_mask(LOG_UNIMP,

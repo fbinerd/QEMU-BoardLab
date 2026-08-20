@@ -804,3 +804,85 @@ another guess:
    genuinely slowed things down enough to be worth spending time
    searching for an exception, even though section 7 already looked and
    didn't find one for the SoC as a whole.
+
+## 10. RDID: root cause found and fixed - real vendor source was the key
+
+Directly asked to keep going, in a loop, until the kernel boots, always
+documenting. Followed section 9's own second suggestion: searched for
+real source for the generic-looking `spi_flash` probe layer instead of
+continuing pure black-box tracing.
+
+**It exists, publicly, and matches exactly.** `"SF: Unsupported
+manufacturer"` plus a `u8 idcode[5]` buffer is real, stock U-Boot
+2010.06 (`drivers/mtd/spi/spi_flash.c` at the actual `v2010.06` tag,
+fetched from `github.com/u-boot/u-boot` - not a guess, this device's own
+banner date-matches that exact release). Confirmed the real, generic
+protocol: `spi_flash_cmd()` sends the opcode via one `spi_xfer()` call,
+then reads the response via a second, separate `spi_xfer()` call into
+`idcode[5]` - `SPI_FLASH_MAX_ID_LEN` really is 5 in this vintage, not 3,
+exactly matching `"len is 5"`.
+
+**Re-read this device's own `0x9d78` with that as a map, not a guess,
+and found the actual bug**: `[r4,#0x24]` (a register this file had
+*never* modeled - the old catch-all stub silently returned 0 for it) is
+read once per read "chunk" and used *directly* as the byte count to
+copy that pass (`r3 = r5 + *(r4+0x24)`, then the copy loop runs while
+`r5 != r3`). With the stub returning 0, every chunk copied **zero
+bytes**, unconditionally - the actual reason two separate, real fixes to
+the response-side state machine in section 9 provably changed nothing:
+the copy loop that would have consulted `resp_buf` never ran at all.
+Fixed with `IM7CAM_SPI_REG_AVAIL` (offset `0x24`) always reporting `1` -
+the simplest value that makes the copy loop advance exactly one real
+byte per poll and terminate correctly regardless of how many bytes were
+actually requested, with no risk of an overread the way returning a
+guessed larger count could carry.
+
+**First rebuild+test after that fix**: the manufacturer-mismatch garbage
+was gone (no more `"SF: Unsupported manufacturer"` at all - progress!),
+but `"Fail probe spi flash."` still printed, and a live `x/5xb` on the
+confirmed destination buffer showed `1c ff ff ff ff` - the first byte
+(the real Eon manufacturer ID) now correct, but bytes 2-3 (should be
+`70 17`, this chip's real memory-type/capacity per its own datasheet -
+section 6/7) still wrong. Traced with a temporary debug print inside
+`im7cam_spi_next_byte()` itself (not more guessing - direct visibility
+into the response buffer's own position) and found the real second bug
+immediately: the read handler pulled `size` bytes (4, for the guest's
+32-bit `ldr`) per single guest access, but the *real* byte-mode read
+loop (`0x9e80`: `ldr r0,[fp]; strb r0,[r5],#1`) does a full 32-bit load
+per real byte and keeps only the low 8 bits, issuing a fresh `ldr` for
+the *next* real byte - not one 32-bit access draining 4 new FIFO bytes
+at once (that's the *other* read path, `0x9e14`, genuinely 32-bit-wide,
+used only when `sl==32`, not the `sl==8` byte-mode case this probe
+actually takes). The old code silently burned 3 real response bytes per
+guest read - exactly enough to explain `1c ff ff ff ff` (byte 0 correct,
+then the response was already exhausted). Fixed: `IM7CAM_SPI_REG_DATA`
+reads now pull exactly one byte from `im7cam_spi_next_byte()`
+regardless of access size. Applied the identical fix to the write side
+too (`im7cam_spi_write_byte()` was symmetrically over-consuming `size`
+bytes per real byte written) - not yet observed breaking anything, but
+the same bug class, and a real multi-byte `READ`/`FAST_READ` command
+(opcode + 3 address bytes, each its own separate `str` in the confirmed
+copy-loop idiom) would eventually hit it the exact same way RDID did.
+
+**Result - the real breakthrough**: `"SF: Unsupported manufacturer"`
+gone entirely (the JEDEC ID now reads correctly - `EN25QH64A` genuinely
+exists as a named entry in a real parts table found in this binary's own
+`.rodata`, right next to `XM25QH64C`/`EN25QH128A`, so this vendor fork
+does recognize Eon parts despite the generic mainline source's stock
+6-manufacturer switch not including it). U-Boot now issues **real
+FAST_READ commands with real addresses** -
+`opcode=0x0b addr=0x050000` (`0x0B` = FAST_READ, address `0x050000` -
+exactly the `hwid`/env partition boundary per the confirmed partition
+table, device-level investigation) - genuine forward progress past every
+wall documented in sections 6-9 combined.
+
+**New wall, further down than ever reached before**: the *very next*
+run after this fix hangs at a **new** address, `0xE0300000` -
+`bics r1,r0,r2; bne back`, an ordinary bit-test spin, but on a
+peripheral base this file has never mapped at all (a different prefix
+entirely from every `0xF0xxxxxx` block modeled so far). Not yet
+investigated beyond confirming its existence - next step, same method
+as every fix in this file: disassemble around the frozen PC's file
+offset once its exact meaning is understood, don't guess. Recorded here
+so this session's log doesn't lose the thread if it gets interrupted
+before finishing that investigation.
