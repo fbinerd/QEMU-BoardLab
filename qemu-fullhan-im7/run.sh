@@ -8,7 +8,8 @@
 # reported absent and SquashFS mounts from the real flash-backed mtdblock4).
 #
 # Usage:
-#   ./run.sh [--spi-image PATH] [--trace] [path-to-0_U-Boot.bin]
+#   ./run.sh [--spi-image PATH] [--trace] [--reset-button] [--boot-from-spi]
+#            [path-to-0_U-Boot.bin]
 #
 # With no positional argument, boots partition 0 directly from the full SPI
 # dump, matching qemu-ipq5018's default full-NAND mode. A positional
@@ -32,10 +33,13 @@
 # itself is fine. Use --trace only when actually hunting a new register,
 # same as this file's own bringup sessions did - not for normal use.
 #
-# The emulated FH EMAC is always connected to QEMU user networking. The
-# runner prints the exact U-Boot variables needed to reach the host's
-# recovery-lab TFTP server. IM7CAM_TFTP_SERVER_IP overrides automatic
-# host-IP detection.
+# The emulated FH EMAC is always connected to QEMU user networking. Its
+# virtual host is 192.168.2.10 and serves IM7CAM_TFTP_ROOT (the same output
+# directory used by openwrt-build-tools/recovery-lab by default).
+# --reset-button models GPIO 23 held low when power is applied and selects
+# the generated recovery U-Boot when no positional override is supplied.
+# --boot-from-spi suppresses that development override, allowing a complete
+# modified SPI image to be tested with GPIO 23 held low.
 # Ctrl-A X quits QEMU.
 
 set -euo pipefail
@@ -44,6 +48,8 @@ IMAGE=im7cam-qemu:9.1.0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPI_IMAGE=""
 TRACE=0
+RESET_BUTTON=0
+BOOT_FROM_SPI=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -55,12 +61,29 @@ while [[ $# -gt 0 ]]; do
             TRACE=1
             shift
             ;;
+        --reset-button)
+            RESET_BUTTON=1
+            shift
+            ;;
+        --boot-from-spi)
+            BOOT_FROM_SPI=1
+            shift
+            ;;
         *)
             KERNEL="$1"
             shift
             ;;
     esac
 done
+
+if [[ "$RESET_BUTTON" -eq 1 && "$BOOT_FROM_SPI" -eq 0 && -z "${KERNEL:-}" ]]; then
+    KERNEL="${SCRIPT_DIR}/recovery/output/0_U-Boot-reset-recovery.bin"
+    if [[ ! -f "$KERNEL" ]]; then
+        echo "error: recovery U-Boot not built: ${KERNEL}" >&2
+        echo "run recovery/patch-uboot.py first (see recovery/README.md)." >&2
+        exit 1
+    fi
+fi
 
 if [[ -z "$SPI_IMAGE" ]]; then
     LOCAL_SPI_IMAGE="${SCRIPT_DIR}/images/spi-flash.bin"
@@ -107,26 +130,30 @@ if [[ -n "$SPI_IMAGE" ]]; then
     DOCKER_VOLUMES+=(-v "${SPI_DIR}:/spi:ro")
     DOCKER_ENV+=(-e "IM7CAM_SPI_IMAGE=/spi/${SPI_FILE}")
 fi
+if [[ "$RESET_BUTTON" -eq 1 ]]; then
+    DOCKER_ENV+=(-e "IM7CAM_RESET_BUTTON=pressed")
+    echo "Power-on state: reset button held (GPIO 23 low)."
+fi
 QEMU_TRACE_ARGS=()
 if [[ "$TRACE" -eq 1 ]]; then
     QEMU_TRACE_ARGS=(-d unimp)
     echo "Tracing on (-d unimp) - expect a lot of retry-loop noise, see this script's own comments."
 fi
-QEMU_NET_ARGS=(-nic "user,model=im7cam-gmac,net=10.0.2.0/24,host=10.0.2.2")
-TFTP_SERVER_IP="${IM7CAM_TFTP_SERVER_IP:-$(
-    ip -4 route get 1.1.1.1 2>/dev/null |
-        awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }'
-)}"
-echo "Ethernet connected through the 10.0.2.2 user-network gateway."
-if [[ -n "$TFTP_SERVER_IP" ]]; then
-    echo "For the host recovery-lab TFTP server, enter in U-Boot:"
-    echo "  setenv ipaddr 10.0.2.15"
-    echo "  setenv netmask 255.255.255.0"
-    echo "  setenv gatewayip 10.0.2.2"
-    echo "  setenv serverip ${TFTP_SERVER_IP}"
-else
-    echo "Could not detect the host TFTP IP; set IM7CAM_TFTP_SERVER_IP explicitly." >&2
+DEFAULT_TFTP_ROOT="/media/dados_2tb/opw/openwrt/bin/targets/qualcommax/ipq50xx"
+TFTP_ROOT="${IM7CAM_TFTP_ROOT:-$DEFAULT_TFTP_ROOT}"
+if [[ ! -d "$TFTP_ROOT" ]]; then
+    echo "error: TFTP root does not exist: ${TFTP_ROOT}" >&2
+    echo "set IM7CAM_TFTP_ROOT to the recovery-lab TFTP directory." >&2
+    exit 1
 fi
+DOCKER_VOLUMES+=(-v "${TFTP_ROOT}:/tftp:ro")
+QEMU_NET_ARGS=(-nic "user,model=im7cam-gmac,net=192.168.2.0/24,host=192.168.2.10,tftp=/tftp")
+echo "Ethernet connected; virtual TFTP server 192.168.2.10 serves: ${TFTP_ROOT}"
+echo "Manual U-Boot network variables:"
+echo "  setenv ipaddr 192.168.2.108"
+echo "  setenv netmask 255.255.255.0"
+echo "  setenv gatewayip 192.168.2.10"
+echo "  setenv serverip 192.168.2.10"
 
 echo "Booting the im7cam machine."
 echo "Console below IS the UART. Ctrl-A X to quit."

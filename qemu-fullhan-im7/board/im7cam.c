@@ -123,9 +123,11 @@
 #define IM7CAM_UART_REG_TX     IM7CAM_UART_REG_DATA
 #define IM7CAM_UART_REG_RX     IM7CAM_UART_REG_DATA
 #define IM7CAM_UART_REG_STATUS 0x7c
-#define IM7CAM_UART_STATUS_TXRDY (1 << 1)
+#define IM7CAM_UART_STATUS_UBOOT_TXRDY (1 << 1)
+#define IM7CAM_UART_STATUS_LINUX_TXRDY (1 << 2)
 #define IM7CAM_UART_REG_RX_STATUS 0x14
 #define IM7CAM_UART_RXSTATUS_READY (1 << 0)
+#define IM7CAM_UART_LINESTATUS_TX_EMPTY ((1 << 5) | (1 << 6))
 
 /* The production environment (`dh_keyboard=1`) keeps the early U-Boot log
  * in RAM instead of sending its text to UART.  These addresses and layouts
@@ -229,9 +231,12 @@
  * enables bit 3 by writing 0x8 at INTC +0x00. */
 #define IM7CAM_INTC_BASE 0xE0200000
 #define IM7CAM_INTC_SIZE 0x1000
+#define IM7CAM_INTC_REG_ENABLE_LO 0x00
+#define IM7CAM_INTC_REG_ENABLE_HI 0x04
+#define IM7CAM_INTC_REG_MASK_LO 0x08
+#define IM7CAM_INTC_REG_MASK_HI 0x0c
 #define IM7CAM_INTC_REG_PENDING_LO 0x30
 #define IM7CAM_INTC_REG_PENDING_HI 0x34
-#define IM7CAM_INTC_REG_ACK_LO 0x08
 #define IM7CAM_TIMER0_HWIRQ 3
 
 /* Section 18: the vendor MMC host object's mapped base was captured live
@@ -387,6 +392,7 @@ static void im7cam_add_unimp_region(MemoryRegion *sysmem, const char *name,
 typedef struct Im7camGpioState {
     MemoryRegion iomem;
     uint32_t regs[IM7CAM_PERIPH_STUB_SIZE / sizeof(uint32_t)];
+    bool reset_button_pressed;
 } Im7camGpioState;
 
 static uint64_t im7cam_gpio_read(void *opaque, hwaddr offset, unsigned size)
@@ -399,7 +405,11 @@ static uint64_t im7cam_gpio_read(void *opaque, hwaddr offset, unsigned size)
     }
     value = s->regs[offset / 4];
     if (offset == IM7CAM_GPIO_INPUT) {
-        value |= 1U << IM7CAM_RESET_BUTTON_GPIO;
+        if (s->reset_button_pressed) {
+            value &= ~(1U << IM7CAM_RESET_BUTTON_GPIO);
+        } else {
+            value |= 1U << IM7CAM_RESET_BUTTON_GPIO;
+        }
     }
     return value;
 }
@@ -422,19 +432,31 @@ static const MemoryRegionOps im7cam_gpio_ops = {
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
-static void im7cam_add_gpio(MemoryRegion *sysmem)
+static Im7camGpioState *im7cam_add_gpio(MemoryRegion *sysmem)
 {
     Im7camGpioState *s = g_new0(Im7camGpioState, 1);
+    const char *button = getenv("IM7CAM_RESET_BUTTON");
+
+    s->reset_button_pressed = !g_strcmp0(button, "pressed") ||
+                              !g_strcmp0(button, "1") ||
+                              !g_strcmp0(button, "on");
 
     memory_region_init_io(&s->iomem, NULL, &im7cam_gpio_ops, s,
                            "im7cam.gpio0", IM7CAM_PERIPH_STUB_SIZE);
     memory_region_add_subregion(sysmem, IM7CAM_GPIO0_BASE, &s->iomem);
+    info_report("im7cam: reset button is %s at power-on (GPIO 23 %s)",
+                s->reset_button_pressed ? "pressed" : "released",
+                s->reset_button_pressed ? "low" : "high");
+    return s;
 }
 
 /* ============================================================
  * Real (if minimal) UART model, replacing the logging stub once the
  * trace revealed the actual TX protocol (see the big comment above
- * IM7CAM_UART_BASE). Status register always reports TX-ready - real
+ * IM7CAM_UART_BASE). Status register always reports both TX-ready bits used
+ * by the OEM U-Boot (bit 1) and the GPL Linux driver (bit 2). The difference
+ * was confirmed by stopping the Linux zImage decompressor's polling loop.
+ * Real
  * hardware's actual ready/busy timing isn't modeled, just "always go",
  * which is fine for a polled bootloader console. Everything other than
  * the TX data/status offsets still logs via the same im7cam_unimp_*
@@ -449,6 +471,7 @@ typedef struct Im7camUartState {
     ARMCPU *cpu;
     QEMUTimer *bootlog_timer;
     MemoryRegion *interactive_gmac;
+    bool *reset_button_pressed;
     bool rx_valid;
     uint8_t rx_byte;
     bool autoboot_unlock_pending;
@@ -552,7 +575,8 @@ static uint64_t im7cam_uart_read(void *opaque, hwaddr offset, unsigned size)
     Im7camUartState *s = opaque;
 
     if (offset == IM7CAM_UART_REG_STATUS) {
-        return IM7CAM_UART_STATUS_TXRDY;
+        return IM7CAM_UART_STATUS_UBOOT_TXRDY |
+               IM7CAM_UART_STATUS_LINUX_TXRDY;
     }
     if (offset == IM7CAM_UART_REG_RX_STATUS) {
         /* Supply the private OEM unlock only to the tstc() call immediately
@@ -564,7 +588,8 @@ static uint64_t im7cam_uart_read(void *opaque, hwaddr offset, unsigned size)
             s->rx_valid = true;
             s->autoboot_unlock_pending = true;
         }
-        return s->rx_valid ? IM7CAM_UART_RXSTATUS_READY : 0;
+        return IM7CAM_UART_LINESTATUS_TX_EMPTY |
+               (s->rx_valid ? IM7CAM_UART_RXSTATUS_READY : 0);
     }
     if (offset == IM7CAM_UART_REG_RX) {
         uint8_t c = s->rx_byte;
@@ -660,7 +685,8 @@ static void im7cam_uart_reset(Im7camUartState *s)
     s->autoboot_unlock_pending = false;
     s->user_input_seen = false;
     if (s->interactive_gmac) {
-        memory_region_set_enabled(s->interactive_gmac, false);
+        memory_region_set_enabled(s->interactive_gmac,
+                                  *s->reset_button_pressed);
     }
     s->bootlog_ready = false;
     s->bootlog_seen = false;
@@ -1315,11 +1341,13 @@ typedef struct Im7camIntcState {
     MemoryRegion iomem;
     qemu_irq cpu_irq;
     uint64_t pending;
+    uint64_t enabled;
+    uint64_t masked;
 } Im7camIntcState;
 
 static void im7cam_intc_update(Im7camIntcState *s)
 {
-    qemu_set_irq(s->cpu_irq, s->pending != 0);
+    qemu_set_irq(s->cpu_irq, (s->pending & s->enabled & ~s->masked) != 0);
 }
 
 static void im7cam_intc_raise(Im7camIntcState *s, unsigned irq)
@@ -1337,6 +1365,18 @@ static void im7cam_intc_lower(Im7camIntcState *s, unsigned irq)
 static uint64_t im7cam_intc_read(void *opaque, hwaddr offset, unsigned size)
 {
     Im7camIntcState *s = opaque;
+    uint64_t value;
+
+    if (offset >= IM7CAM_INTC_REG_ENABLE_LO &&
+        offset + size <= IM7CAM_INTC_REG_ENABLE_LO + sizeof(s->enabled)) {
+        unsigned shift = (offset - IM7CAM_INTC_REG_ENABLE_LO) * 8;
+        return (s->enabled >> shift) & ((1ULL << (size * 8)) - 1);
+    }
+    if (offset >= IM7CAM_INTC_REG_MASK_LO &&
+        offset + size <= IM7CAM_INTC_REG_MASK_LO + sizeof(s->masked)) {
+        unsigned shift = (offset - IM7CAM_INTC_REG_MASK_LO) * 8;
+        return (s->masked >> shift) & ((1ULL << (size * 8)) - 1);
+    }
     if (offset >= IM7CAM_INTC_REG_PENDING_LO &&
         offset + size <= IM7CAM_INTC_REG_PENDING_LO + sizeof(s->pending)) {
         unsigned shift = (offset - IM7CAM_INTC_REG_PENDING_LO) * 8;
@@ -1345,7 +1385,8 @@ static uint64_t im7cam_intc_read(void *opaque, hwaddr offset, unsigned size)
         /* find_first_bit() scans this MMIO bitmap with byte loads, so all
          * naturally aligned byte/halfword/word slices must work. Pending
          * remains asserted until the timer's own status is consumed. */
-        return (s->pending >> shift) & mask;
+        value = s->pending & s->enabled & ~s->masked;
+        return (value >> shift) & mask;
     }
     qemu_log_mask(LOG_UNIMP,
                   "im7cam: unimplemented READ  region=im7cam.intc "
@@ -1357,13 +1398,24 @@ static void im7cam_intc_write(void *opaque, hwaddr offset, uint64_t value,
                               unsigned size)
 {
     Im7camIntcState *s = opaque;
+    uint64_t access_mask = (1ULL << (size * 8)) - 1;
+    unsigned shift;
 
-    if (offset == IM7CAM_INTC_REG_ACK_LO) {
-        /* The kernel's IRQ-chip callback reads this register, ORs in
-         * BIT(hwirq), and writes it back. The deliberately wrong first
-         * routing through hwirq 19 produced 0x00080000 here on every
-         * interrupt, identifying this as the low-word acknowledge. */
-        s->pending &= ~(uint32_t)value;
+    if (offset >= IM7CAM_INTC_REG_ENABLE_LO &&
+        offset + size <= IM7CAM_INTC_REG_ENABLE_LO + sizeof(s->enabled)) {
+        shift = (offset - IM7CAM_INTC_REG_ENABLE_LO) * 8;
+        access_mask <<= shift;
+        s->enabled = (s->enabled & ~access_mask) |
+                     ((value << shift) & access_mask);
+        im7cam_intc_update(s);
+        return;
+    }
+    if (offset >= IM7CAM_INTC_REG_MASK_LO &&
+        offset + size <= IM7CAM_INTC_REG_MASK_LO + sizeof(s->masked)) {
+        shift = (offset - IM7CAM_INTC_REG_MASK_LO) * 8;
+        access_mask <<= shift;
+        s->masked = (s->masked & ~access_mask) |
+                    ((value << shift) & access_mask);
         im7cam_intc_update(s);
         return;
     }
@@ -1401,6 +1453,8 @@ typedef struct Im7camTimerState {
     Im7camIntcState *intc;
     ARMCPU *cpu;
     bool *uboot_console_ready;
+    unsigned clockevent_channel;
+    bool timer0_irq_capable;
     bool console_index_fixed;
 } Im7camTimerState;
 
@@ -1431,37 +1485,49 @@ static void im7cam_fix_kernel_console_index(Im7camTimerState *s)
 static void im7cam_timer0_expire(void *opaque)
 {
     Im7camTimerState *s = opaque;
+    unsigned channel = s->clockevent_channel;
 
     qemu_log_mask(LOG_UNIMP,
                   "im7cam: timer0 expire load=0x%x control=0x%x\n",
-                  s->load[0], s->control[0]);
-    if (!(s->control[0] & 1)) {
+                  s->load[channel], s->control[channel]);
+    if (!(s->control[channel] & 1)) {
         return;
     }
-    im7cam_fix_kernel_console_index(s);
-    s->irq_status |= 1;
+    if (s->timer0_irq_capable) {
+        im7cam_fix_kernel_console_index(s);
+        s->irq_status |= 1U << channel;
+    }
     /* Linux's set_state_periodic() writes control=3 after loading
      * freq/HZ, proving bit 1 is auto-reload. Its one-shot path preserves
      * bit 2 instead. */
-    if (!(s->control[0] & 2)) {
-        s->control[0] &= ~1;
+    if (!(s->control[channel] & 2)) {
+        s->control[channel] &= ~1;
     }
-    im7cam_intc_raise(s->intc, IM7CAM_TIMER0_HWIRQ);
+    if (s->timer0_irq_capable) {
+        im7cam_intc_raise(s->intc, IM7CAM_TIMER0_HWIRQ);
+    }
 
-    if (s->control[0] & 1) {
+    if (s->control[channel] & 1) {
+        uint64_t ns_per_tick = channel == 1 ? 20 : 1000;
+
         timer_mod(s->timer0, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  MAX((uint64_t)s->load[0] * 1000, UINT64_C(1000)));
+                  MAX((uint64_t)s->load[channel] * ns_per_tick,
+                      UINT64_C(1000)));
     }
 }
 
 static void im7cam_timer0_arm(Im7camTimerState *s)
 {
-    if (!(s->control[0] & 1)) {
+    unsigned channel = s->clockevent_channel;
+    uint64_t ns_per_tick = channel == 1 ? 20 : 1000;
+
+    if (!(s->control[channel] & 1)) {
         timer_del(s->timer0);
         return;
     }
     timer_mod(s->timer0, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              MAX((uint64_t)s->load[0] * 1000, UINT64_C(1000)));
+              MAX((uint64_t)s->load[channel] * ns_per_tick,
+                  UINT64_C(1000)));
 }
 
 static uint64_t im7cam_timer_read(void *opaque, hwaddr offset, unsigned size)
@@ -1503,7 +1569,7 @@ static uint64_t im7cam_timer_read(void *opaque, hwaddr offset, unsigned size)
         qemu_log_mask(LOG_UNIMP,
                       "im7cam: timer IRQ status read -> 0x%x\n", status);
         s->irq_status = 0;
-        if (status & 1) {
+        if (status) {
             im7cam_intc_lower(s->intc, IM7CAM_TIMER0_HWIRQ);
         }
         return status;
@@ -1529,10 +1595,21 @@ static void im7cam_timer_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (offset == IM7CAM_TIMER_REG_LOAD_1) {
         s->load[1] = value;
+        if (s->clockevent_channel == 1) {
+            im7cam_timer0_arm(s);
+        }
         return;
     }
     if (offset == IM7CAM_TIMER_REG_CONTROL) {
+        vaddr pc = s->cpu->env.regs[15];
+
         s->control[0] = value;
+        if (pc < IM7CAM_IMAGE_LOAD_ADDR || pc >= IM7CAM_UBOOT_IMAGE_END) {
+            if ((value & 3) == 3) {
+                s->clockevent_channel = 0;
+            }
+            s->timer0_irq_capable = true;
+        }
         qemu_log_mask(LOG_UNIMP,
                       "im7cam: timer0 control=0x%x load=0x%x\n",
                       s->control[0], s->load[0]);
@@ -1540,7 +1617,15 @@ static void im7cam_timer_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
     if (offset == IM7CAM_TIMER_REG_CONTROL_1) {
+        vaddr pc = s->cpu->env.regs[15];
+
         s->control[1] = value;
+        if ((pc < IM7CAM_IMAGE_LOAD_ADDR || pc >= IM7CAM_UBOOT_IMAGE_END) &&
+            (value & 3) == 3) {
+            s->clockevent_channel = 1;
+            s->timer0_irq_capable = true;
+            im7cam_timer0_arm(s);
+        }
         return;
     }
     qemu_log_mask(LOG_UNIMP,
@@ -1591,6 +1676,7 @@ struct Im7camGmacState {
     NICConf conf;
     bool link_up;
     bool *uboot_interactive;
+    bool *recovery_button_pressed;
     uint32_t regs[IM7CAM_GMAC_SIZE / sizeof(uint32_t)];
     uint16_t phy_regs[32];
     hwaddr tx_desc;
@@ -1613,7 +1699,8 @@ static bool im7cam_gmac_link_active(Im7camGmacState *s)
      * recovery TFTP. Once the user has actually interrupted autoboot,
      * expose the attached cable normally. Linux Ethernet needs its own
      * register/IRQ validation and is intentionally not claimed here. */
-    return s->link_up && *s->uboot_interactive;
+    return s->link_up && (*s->uboot_interactive ||
+                          *s->recovery_button_pressed);
 }
 
 static void im7cam_gmac_desc_write(hwaddr addr, uint32_t value)
@@ -1954,8 +2041,12 @@ static void im7cam_reset(void *opaque)
     memset(rs->timer->load, 0, sizeof(rs->timer->load));
     memset(rs->timer->control, 0, sizeof(rs->timer->control));
     rs->timer->irq_status = 0;
+    rs->timer->clockevent_channel = 0;
+    rs->timer->timer0_irq_capable = false;
     rs->timer->console_index_fixed = false;
     rs->intc->pending = 0;
+    rs->intc->enabled = 0;
+    rs->intc->masked = 0;
     im7cam_intc_update(rs->intc);
     im7cam_dma_reset(rs->dma);
     im7cam_spi_reset(rs->spi);
@@ -1989,6 +2080,7 @@ static void im7cam_init(MachineState *machine)
     Im7camIntcState *intc = im7cam_add_intc(sysmem, cpu);
     Im7camTimerState *timer = im7cam_add_timer(sysmem, intc, cpu,
                                                &uart->bootlog_ready);
+    Im7camGpioState *gpio = im7cam_add_gpio(sysmem);
     im7cam_add_reset_ctrl(sysmem);
     {
         DeviceState *gmac = qdev_new(TYPE_IM7CAM_GMAC);
@@ -1997,15 +2089,18 @@ static void im7cam_init(MachineState *machine)
 
         qdev_prop_set_bit(gmac, "link-up", link_up);
         gmac_state->uboot_interactive = &uart->user_input_seen;
+        gmac_state->recovery_button_pressed =
+            &gpio->reset_button_pressed;
+        uart->reset_button_pressed = &gpio->reset_button_pressed;
         sysbus_realize_and_unref(SYS_BUS_DEVICE(gmac), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(gmac), 0, IM7CAM_GMAC_BASE);
         uart->interactive_gmac =
             sysbus_mmio_get_region(SYS_BUS_DEVICE(gmac), 0);
-        memory_region_set_enabled(uart->interactive_gmac, false);
+        memory_region_set_enabled(uart->interactive_gmac,
+                                  gpio->reset_button_pressed);
     }
     im7cam_add_unimp_region(sysmem, "im7cam.i2c0-guess", IM7CAM_I2C0_BASE,
                              IM7CAM_PERIPH_STUB_SIZE);
-    im7cam_add_gpio(sysmem);
     im7cam_add_unimp_region(sysmem, "im7cam.spi0-guess-unused",
                              IM7CAM_SPI0_LABELED_BASE,
                              IM7CAM_PERIPH_STUB_SIZE);

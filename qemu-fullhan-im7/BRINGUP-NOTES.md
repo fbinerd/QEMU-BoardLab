@@ -2071,3 +2071,36 @@ the existing host TFTP server, and both Ethernet activation and the full
 U-Boot initialization repeat correctly after `reset`. The SPI image remains
 the unmodified original; automatic reset-button recovery and an initramfs are
 the next, separate task.
+
+## 26. Reset-button TFTP recovery and complete SPI image
+
+The OEM board parameter identifies the active-low update/reset input as GPIO
+23. `recovery/patch-uboot.py` preserves the original conditional branch and
+replaces only its obsolete pressed-button update body. When GPIO 23 is low at
+power-on, the replacement calls the OEM command interpreter with a command
+embedded in the U-Boot binary. It assigns client `192.168.2.108`, TFTP server
+`192.168.2.10`, requests `im7-recovery-initramfs.uImage`, and boots the image
+at `0xA1000000`.
+
+The recovery kernel is unsigned because the device's private OEM signing key
+is unavailable. A RAM-only flag is set immediately around this recovery
+command, and the verifier hook returns success only while that flag is set.
+With GPIO 23 high, the original verifier prologue and its remaining body run
+normally. An emulation test using the complete modified SPI image confirmed
+both outcomes: released RESET reached the OEM `Linux-4.9.129` image, while
+held RESET reached `Linux version 3.0.8 (im7cam@recovery)` after TFTP.
+
+UART was not newly enabled by this patch because it is already enabled in the
+OEM U-Boot. The physical-hardware binary initializes UART0 at `0xF0700000`,
+prints the U-Boot banner and board log, and reports `In`, `Out`, and `Err` as
+`serial`. The recovery modifications do not touch that initialization, and
+the recovery kernel uses `console=ttyS0,115200`.
+
+`recovery/build-full-spi.py` accepts only the exact known inputs by size and
+SHA-256. It produced the 8 MiB file
+`recovery/output/miboim7-spi-8mb-reset-tftp-192.168.2.10.bin`, SHA-256
+`6207bc4b48c254bb4bc36770b2db5ef2d2d5d88b04c66bcd01ceb3b0d56161ca`.
+Partition 0 (`0x000000-0x04ffff`) exactly equals the modified U-Boot; a direct
+comparison verifies that `0x050000-0x7fffff` is identical to the OEM dump.
+Generated images remain ignored by Git; the checked-in builders and exact
+input hashes make the operation auditable.
