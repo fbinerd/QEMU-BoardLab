@@ -205,3 +205,84 @@ regression unrelated to this patch (see `BRINGUP-NOTES.md`). Confirmed the
 is expected given the same underlying QEMU issue, not new evidence about the
 real-hardware failure. QEMU is not currently a reliable gate for these two
 images; the real chip is the only test that matters here.
+
+### Real-hardware result 1: `verify-only` also fails identically
+
+Written and verified byte-perfect (`gravar_spi_ch341a.sh`, readback SHA-256
+`7109c728a50935fe479ce3fb90596e13df9c284c61ff6c391974cfebfa5b8a26`) on the
+same EN25QH64, then tested with the reset button released. Result: **same
+failure as the full combined patch** - weak red LED, green never lit. A
+live UART monitor (`conectar_ttl.sh`, broker on the recovery-lab TCP port)
+was attached before power-on and captured **zero bytes**, not even the
+U-Boot banner, which prints before DRAM init and long before this patch's
+touched code (`SECURITY_VERIFY_ADDRESS`, called only much later during an
+actual `bootm`) would ever execute.
+
+This is a significant update to the leading hypothesis. `verify-only`
+changes only ~40 bytes total, in two small, isolated spots (4 bytes at the
+hook site, file offset `0x15680`; a ~40-byte trampoline in confirmed virgin
+`0xFF` padding at file offset `0x48000`, nowhere near any real code/data).
+If a patch this minimal and this far from early-boot code already prevents
+even the banner from reaching UART, the most likely explanation is no
+longer a logic bug in either trampoline - it's an integrity check in a
+stage *before* U-Boot's own code starts (boot ROM / SPL; the `"2BL*OABD"`
+header magic at file offset 0 is consistent with "second bootloader,"
+implying a first stage that validates it) that rejects the whole partition
+on any byte difference, checksum/signature unknown. An exhaustive-ish brute
+force (CRC32 with default parameters, plain word-sum LE/BE, XOR, over ~20
+candidate start/end combinations spanning the header, reloc table and code
+region) found no matching field in the header - inconclusive, not a
+disproof; the real algorithm may use different CRC parameters, a seed, or
+be a cryptographic signature that isn't brute-forceable from the ciphertext
+side at all.
+
+### Real-hardware result 2: `cave-only` also fails identically - conclusive
+
+Written and verified byte-perfect (readback SHA-256
+`e5e9ee0fe2212a0ec5623338945c4ceb998aba4bfd845a0b4cad2b4b6bc9f562`), tested
+with the reset button released. **Same failure again**: weak red LED, green
+never lit, zero bytes on a live UART monitor.
+
+This is the decisive result, not just another data point. `cave-only`
+touches *only* the recovery cave at `RECOVERY_ADDRESS` - code that is
+disassembly-confirmed (section above, and the original patch-uboot.py's own
+comment) to be reachable *exclusively* when GPIO 23 reads active-low. With
+the button released, the CPU never executes a single one of those changed
+bytes - the original OEM `beq` before the cave skips over it unconditionally
+on this exact boot path. A runtime logic bug in code that never runs cannot
+produce a symptom. Something is validating the *content* of the partition
+before ever executing it, not just failing on a control-flow path we
+patched.
+
+**Conclusion**: all three tested images (full patch, verify-only, cave-only)
+fail identically and silently (no UART output at all, not even the banner)
+on real hardware, while all three run correctly in QEMU (which loads bytes
+directly with no integrity check of any kind). The common factor across all
+three is simply "the U-Boot partition's bytes differ from the OEM original."
+The most consistent explanation is an integrity check - checksum or,
+more likely given the `"2BL*OABD"`/second-bootloader naming convention, a
+cryptographic signature - validated by a stage before U-Boot's own code
+starts (mask ROM or SPL), which this repository has no visibility into and
+which QEMU does not model at all (it loads the image unconditionally, see
+`board/im7cam.c`'s own `rom_add_blob_fixed()` call). The exact algorithm was
+not identified by brute-forcing common CRC32/checksum variants over the
+header.
+
+**Practical implication**: in-place binary patching of this U-Boot partition
+is not a viable recovery-boot strategy on this specific device as currently
+understood. Any single-byte change anywhere in the 320 KB partition, whether
+executed or not, is rejected before boot. Making the reset-button-to-TFTP
+feature work would require either (a) identifying and correctly satisfying
+whatever the pre-U-Boot stage validates - hard to do without the vendor's
+signing key if it *is* a signature, not just a checksum - or (b) a different
+mechanism entirely that doesn't modify the validated partition, e.g. relying
+on U-Boot's *own*, already-present, unmodified SD-card update path (the
+exact code the cave patch replaced) instead of hijacking it, or using the
+already-confirmed-working interactive TFTP path (the OEM `'*'` unlock +
+manual `tftpboot`/`bootm`, proven in section "The hidden OEM U-Boot console"
+of `BRINGUP-NOTES.md`) as a manual recovery procedure instead of an
+automatic GPIO-triggered one.
+
+The OEM image was restored to the physical chip immediately after this
+result and independently reread/verified - the device is back to its known
+good, original state.
