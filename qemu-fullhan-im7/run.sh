@@ -8,11 +8,17 @@
 # reported absent and SquashFS mounts from the real flash-backed mtdblock4).
 #
 # Usage:
-#   ./run.sh [--spi-image PATH] [--trace] [path-to-0_U-Boot.bin]
+#   ./run.sh [--spi-image PATH] [--stop-autoboot] [--trace] [path-to-0_U-Boot.bin]
 #
 # With no positional argument, boots partition 0 directly from the full SPI
 # dump, matching qemu-ipq5018's default full-NAND mode. A positional
 # 0_U-Boot.bin remains an explicit development override.
+#
+# --stop-autoboot: pre-seeds the vendor-specific '*' console-unlock byte,
+# followed by a second countdown-stop byte, and reliably stops at U-Boot's
+# interactive `>` prompt.
+# This firmware discards Enter/space at its private gate before the standard
+# countdown, so an ordinary "press any key" race is not sufficient.
 #
 # --spi-image: backs the SPI flash controller with a real flash dump
 # (mirrors qemu-ipq5018/run.sh's --nand-image) so U-Boot's own flash
@@ -39,6 +45,7 @@ IMAGE=im7cam-qemu:9.1.0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPI_IMAGE=""
 TRACE=0
+STOP_AUTOBOOT=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -48,6 +55,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --trace)
             TRACE=1
+            shift
+            ;;
+        --stop-autoboot)
+            STOP_AUTOBOOT=1
             shift
             ;;
         *)
@@ -101,6 +112,10 @@ if [[ -n "$SPI_IMAGE" ]]; then
     SPI_FILE="$(basename "$SPI_IMAGE")"
     DOCKER_VOLUMES+=(-v "${SPI_DIR}:/spi:ro")
     DOCKER_ENV+=(-e "IM7CAM_SPI_IMAGE=/spi/${SPI_FILE}")
+fi
+if [[ "$STOP_AUTOBOOT" -eq 1 ]]; then
+    DOCKER_ENV+=(-e IM7CAM_STOP_AUTOBOOT=1)
+    echo "Autoboot stop requested: U-Boot will receive OEM '*' unlock and stop keys."
 fi
 
 QEMU_TRACE_ARGS=()

@@ -1728,3 +1728,85 @@ observable chain from its U-Boot partition through kernel and SquashFS vendor
 userspace. The separately extracted U-Boot is no longer required for normal
 use. Pre-U-Boot ROM/SPL execution and the peripheral limitations listed in
 section 19 remain outside the currently confirmed model.
+
+## 21. The hidden OEM U-Boot console and reliable `--stop-autoboot`
+
+The full-SPI path exposed a misleading console symptom: after the U-Boot
+banner, only several blank CR/LF pairs appeared and Linux output began
+immediately. The flash environment itself is valid and explicitly contains
+`bootdelay=1`, `stdin=serial`, `stdout=serial`, and `stderr=serial`; it has no
+`silent` variable. Nevertheless, continuously feeding Enter did not stop the
+boot and the expected `Hit any key to stop autoboot` text never appeared.
+
+Two independent problems were identified. First, the emulated one-byte UART
+correctly stopped accepting host input while full, but failed to call
+`qemu_chr_fe_accept_input()` after the guest consumed that byte. Consequently,
+an early rejected key permanently prevented later input from reaching QEMU.
+The RX data read now re-enables its chardev frontend as soon as the buffer is
+empty.
+
+Second, this is not an unmodified upstream U-Boot autoboot path. Disassembly
+of the exact partition around `0xA0811A6C`--`0xA0811B4C` shows an OEM gate:
+
+```text
+0xA0811A6C  call tstc
+0xA0811A70  compare result with zero
+0xA0811B40  call getc
+0xA0811B48  compare character with 42 ('*')
+```
+
+Any byte other than ASCII `*` is discarded by that first gate. The familiar
+`Hit any key to stop autoboot: %2d` string does exist, and its standard
+countdown routine is visible later at `0xA0811B50`, but the production path
+does not expose it as the user's first interaction. This explains why Enter,
+space, and the banner-based expectation all failed.
+
+The conclusion was tested against the unmodified full SPI dump after fixing
+RX re-arming. Feeding `*` followed by newline (the first byte opens the OEM
+gate; the second aborts the following standard countdown) immediately
+produced the real vendor console:
+
+```text
+U-Boot 2010.06 (Sep 27 2024 - 18:56:13)
+disable wdt
+>
+```
+
+Continued input was parsed by the genuine command interpreter (`Unknown
+command '*' - try 'help'`), confirming this was not fabricated output.
+
+`run.sh --stop-autoboot` now mirrors mr80x's timing-independent analysis
+option while respecting this firmware's actual two-stage protocol: the board
+pre-seeds `*` in UART RX before the CPU starts and, when U-Boot consumes it,
+queues a second stop byte for the immediately following countdown. It logs
+both guest reads. The SPI dump remains read-only and unchanged.
+Normal invocation does not seed input and retains the complete automatic
+U-Boot -> kernel -> SquashFS userspace chain.
+
+Use:
+
+```sh
+./qemu-fullhan-im7/run.sh --stop-autoboot \
+  --spi-image /media/dados_2tb/opw/openwrt-build-tools/tools/firmware-lab/work/miboim7-tudo-sobre/miboim7-spi-en25qh64-8mb-20260819.bin
+```
+
+At the `>` prompt, commands such as `help`, `printenv`, and the environment's
+`kload 0xA1000000; bootm 0xA1000000` can be exercised interactively.
+
+Final validation used that exact public runner command after a clean image
+rebuild. Both staged-byte consumption messages appeared, `disable wdt` and
+the `>` prompt followed, and neither Linux `BogoMIPS` nor `Starting kernel`
+appeared during the test window. Piping `version` afterward reached the real
+parser and returned this build's expected `Unknown command 'version'` plus a
+fresh prompt, proving post-stop RX re-arming. A separate 25-second run without
+`--stop-autoboot` still reached `VFS: Mounted root (squashfs filesystem)` and
+vendor userspace (`[pdc] hwidName:IPC-S21F-imou`), so the explicit analysis
+mode does not alter the default production boot.
+
+## Status (updated again, section 21)
+
+The production boot remains automatic by default. A separate, explicit
+analysis mode now enters the real U-Boot command prompt deterministically,
+and repeated terminal input works after each byte is consumed. The missing
+visible countdown is documented as OEM firmware behavior, not emulated timer
+speed or a missing environment variable.
