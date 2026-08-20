@@ -493,3 +493,100 @@ JEDEC ID probe is the current known-wrong piece; next session should
 start there (walk `0x9d78`'s caller to find what `r0` really points to,
 rather than extending the current `IM7CAM_SPI_BASE` model further on a
 guess).
+
+## 7. Physical board inventory (external research) - what's relevant here
+
+The user had someone do a physical inspection of the real board (chip
+markings, no photos shared with this file yet) and shared a component
+table. Cross-referenced each item against public sources and against
+what this board actually needs. Full table, for the record:
+
+| Component | Marking read | Relevance to this QEMU board |
+|---|---|---|
+| Main SoC | Fullhan FH8623V100 / "UKR466-1" | High - see below |
+| SPI NOR | cFeon QH64A-104HIP / EN25QH64A | **Already modeled** (section 6) |
+| SPI NOR capacity | 64 Mbit / 8 MiB | Already confirmed (device-level investigation) |
+| Wi-Fi | iComm/SSV SV6155P, USB-attached | Low for now - see below |
+| Motor driver | marked ULN2008 | None for U-Boot/kernel bringup |
+| PAN/TILT motors, IR, Ethernet port | present | None for U-Boot/kernel bringup |
+| CMOS sensor | unidentified | None for U-Boot/kernel bringup |
+| RAM | unidentified chip | **Already confirmed indirectly** (section 6/this section) |
+| Ethernet PHY | unidentified | Matters only once real network I/O is attempted |
+| UART | assumed present | **Already confirmed** (sections 2/4/5 - it's how this board boots at all) |
+
+**FH8623V100 SoC**: searched fullhan.com's own product listings, the
+OpenIPC Fullhan SoC list (`openipc.org/cameras/vendors/fullhan` - covers
+FH8626/8632/8652/8833/8852/8856/8858, several generations), and
+`github.com/pingumacpenguin/FH86XX_Cameras` (FH8616-specific, explicitly
+warns other "FH86XX-looking" cameras use different, incompatible SoCs
+underneath). **FH8623 doesn't appear in any of these** - no independent
+public register map, datasheet, or GPL source drop found. Not surprising
+given how fragmented/OEM-specific this vendor's part numbering is (the
+device-level investigation already found the *same firmware image*
+serves a whole family of differently-branded/differently-optioned camera
+models - see that repo's README `bootargsParametersV2.txt` findings).
+Practical effect on this file: **no change** - this board's approach has
+never depended on an FH8623-specific datasheet existing; every address
+modeled so far (sections 1-6) came from disassembling *this exact
+device's own* U-Boot binary, cross-checked where possible against a
+different Fullhan chip's independent RE (`fh8852v201-dump`) rather than
+official FH8623 documentation. That remains the only reliable method -
+confirmed again this session (the UART address match held, the RDID
+mismatch section 6 flagged did *not* resolve by assuming a shared FH86xx
+convention, consistent with "trust this device's own disassembly over
+family-wide assumptions").
+
+**RAM**: no chip marking identified by the physical inspection either,
+but section 6 (above, in this same file) already independently confirmed
+64 MiB is correct - not from this external research, from watching this
+board's own U-Boot print a real `gd`/`bd`-struct-sourced value during an
+actual boot. Cross-referencing external hardware research would only
+matter here if it *contradicted* that - it doesn't (the table above
+lists RAM as "unidentified" from the physical side, no conflict).
+
+**SPI flash / JEDEC ID**: the physical marking (`cFeon QH64A-104HIP`)
+and the datasheet-confirmed manufacturer ID (`0x1C`) match exactly what
+`IM7CAM_SPI_JEDEC_ID` already used, itself independently derived from
+flashrom's own database entry (see the updated comment on that array in
+`board/im7cam.c`) rather than this external research - two independent
+confirmations of the same three bytes now (flashrom's real hardware
+identification during the physical dump, and this session's datasheet/
+flashchips.h cross-check). No code change needed, just corroboration.
+
+**Why the rest (Wi-Fi, motors, sensor, Ethernet PHY) isn't being modeled
+right now**: all of it lives past where this board currently gets stuck
+(section 6's SPI/JEDEC gap, blocking a real kernel/rootfs load) or past
+where U-Boot even runs code for it at all:
+- **CMOS sensor / motors / IR-cut relay**: exclusively Linux-userspace
+  concerns (ISP driver, GPIO/PWM userspace control) - completely
+  unreachable until a kernel actually boots, which needs the SPI gap
+  closed first. Zero U-Boot-stage relevance.
+- **Wi-Fi (SV6155P)**: USB-attached per the physical inspection - would
+  need a modeled USB host controller *and* a full USB device model for
+  the SV6155P itself before it could matter at all, and U-Boot on this
+  device doesn't appear to touch Wi-Fi (only the wired `Net:`/MAC path
+  logged so far, section 6) - Linux-stage-or-later, and a substantially
+  bigger undertaking than anything modeled so far when it does come up.
+  Noted for later: the user's own research found a public report of an
+  OpenIPC SSV615x-package Imou/SigmaStar camera hitting a Wi-Fi *auth*
+  failure specifically - worth remembering as a likely real obstacle
+  whenever this board gets that far, not something to pre-solve now.
+- **Ethernet PHY**: the one item on this list that's plausibly *soon*
+  relevant, not just eventually - U-Boot already reaches `Net:`/prints a
+  MAC (section 6) using this board's real Ethernet GMAC/MDIO path
+  somehow, without this file modeling a PHY at all (every GMAC/MDIO
+  MMIO access is presumably landing on `ignore_memory_transaction_
+  failures`-silenced unmapped space or an already-mapped stub that
+  hasn't been specifically checked yet). Worth a real trace-driven look
+  (same method as every other peripheral in this file) *if/when* the
+  next goal becomes "get a TFTP transfer working," matching the
+  device-level investigation's own documented TFTP recovery mechanism -
+  not blocking right now since nothing yet requires actual network I/O
+  to succeed.
+
+**Net effect on this session's code**: two comments updated (JEDEC ID
+and RAM size, both in `board/im7cam.c`) to cite the now-independently-
+confirmed sources instead of "not verified"/"just a placeholder" hedges.
+No behavioral change - both values were already correct, this just
+upgrades the paper trail behind them, consistent with this file's
+standing rule of citing evidence over asserting confidence.

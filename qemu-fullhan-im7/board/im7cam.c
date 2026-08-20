@@ -71,9 +71,18 @@
  * computed SP - not derived from any real evidence *for that specific
  * value*, just "clearly far enough below 0xA037FF80". */
 #define IM7CAM_RAM_BASE   0xA0000000
-/* Needs to cover [0xA0000000, past 0xA08D0840] (BSS end, section 4) with
- * real margin - not confirmed as the chip's real DRAM size, just picked
- * generously now that the base moved down by 8 MB. */
+/* Was a placeholder ("needs to cover BSS end with margin"), now
+ * corroborated by a real boot-log value (section 7): U-Boot prints
+ * "DRAM:  " followed by a size pulled from a runtime gd/bd struct field
+ * (`ldr r4,[r3,#24]` off a pointer this build keeps in r8 - the classic
+ * global_data convention - then a print_size()-style call), not a
+ * literal baked into the print itself. That field is set once, early,
+ * from this exact board's own compiled-in DRAM config - QEMU has no
+ * mechanism this code could be querying instead, so the "64 MiB" this
+ * machine's boot log actually shows is this real board's own configured
+ * size, not an artifact of this file's IM7CAM_RAM_SIZE choice reflecting
+ * back. Confirms the earlier guess was right, doesn't independently
+ * re-derive it from first principles. */
 #define IM7CAM_RAM_SIZE   (64 * MiB)
 
 /* Section 2: 0xF0700000 appears in our own U-Boot binary's literal pool
@@ -312,13 +321,17 @@ typedef struct Im7camSpiState {
     unsigned resp_pos;
 } Im7camSpiState;
 
-/* Real chip is an Eon EN25QH64 (confirmed by the device-level
+/* Real chip is an Eon/cFeon EN25QH64A (confirmed by the device-level
  * investigation - see qemu-fullhan-im7/BRINGUP-NOTES.md's "where the
- * firmware came from" section). JEDEC ID (manufacturer 0x1C = Eon,
- * memory type 0x70, capacity 0x17 = 64 Mbit) is from general knowledge
- * of this part, not re-verified against a datasheet in this session -
- * only matters if U-Boot's probe actually checks it against a known-part
- * table rather than just logging it (not confirmed either way yet). */
+ * firmware came from" section). JEDEC ID: manufacturer 0x1C (Eon) is
+ * datasheet-confirmed; the 0x7017 memory-type+capacity pair is
+ * independently cross-checked against flashrom's own flashchips.h
+ * database entry for EN25QH64 (the same real-hardware EN25QH64A this
+ * board's flash was actually dumped from was identified via flashrom
+ * during the physical extraction, in the sibling openwrt-build-tools
+ * investigation) - not a guess. Still unconfirmed whether U-Boot's probe
+ * on *this* board checks it against a known-part table or just logs it
+ * either way. */
 static const uint8_t IM7CAM_SPI_JEDEC_ID[3] = { 0x1C, 0x70, 0x17 };
 /* SPI NOR status register 1, all bits clear: not busy (WIP=0), write
  * enable latch clear, no block protection, no error - the standard idle
