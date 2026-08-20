@@ -713,3 +713,94 @@ into the unconditional recovery flow instead of the normal, keypress-
 interruptible `bootdelay` path. Next session should pick up exactly
 where section 8 left off - forward-tracing from the confirmed opcode
 write, not another attempt at guessing the response side.
+
+## 9. RDID: two more disproven hypotheses, and a real methodology dead-end
+
+Directly asked to resolve section 8's open RDID mismatch. Two more
+concrete, testable fixes attempted this session; both disproven by
+result, not by reasoning - genuinely tested against the real boot each
+time, not assumed.
+
+**Attempt A**: forward-traced from the confirmed opcode-write
+instruction (`0xa0807db4`, single-stepped ~35 instructions with a
+register dump per step) instead of working backward from the print
+statement, per section 8's own stated next step. Found something
+unexpected: the very next thing the driver does after writing the
+opcode is call into a generic elapsed-time/delay helper - reads
+`IM7CAM_TIMER_BASE+4` (this file's own timer, section 6) twice, computes
+a delta via a NOT-based subtraction trick, and the very first delta
+computed came out enormous (`0xFF5F7E1A`) because the "previous
+timestamp" field it compared against was `0xFFFFFFFF` - an
+uninitialized-looking sentinel, not a real prior reading. Stepped
+further (60 more instructions) into what's recognizably a textbook
+software `fls()`/count-leading-zeros bit-scan (successive `>>16/>>8/>>4`
+threshold checks + a lookup table for the last nibble) - standard
+generic C library code for turning a large tick count into a bit
+position, almost certainly part of a `udelay()`-style tick-to-loop-count
+conversion. Not itself proven broken - genuinely can't tell from this
+alone whether a huge input here is normal (e.g. "wait until timeout"
+math that's supposed to see a large distant target) or the actual bug.
+Did not chase this further - it's deep inside U-Boot's own generic
+timing library, not SPI-specific, and single-stepping through generic
+library internals with no symbols has a very poor time-spent-to-insight
+ratio compared to every other finding in this file, all of which came
+from short, targeted disassembly windows around a specific known
+address.
+
+**Attempt B (tested, disproven)**: reasoned that the outer retry loop
+(`0xa304`'s `bl 0x9d78 ... bne 0xa2e8`) likely calls the byte-transmit
+path multiple times per probe, each bracketed by the offset-8 toggle
+(which resets `cmd_len`), and that a *later*, unrelated first-byte in
+one of those calls was hitting `im7cam_spi_write_byte()`'s `default:`
+case, which (from section 8's own earlier fix) explicitly cleared
+`resp_buf` - same root problem as section 8's offset-8 fix, just
+reached through a different call. Removed the clear from the `default:`
+case too. Rebuilt, reran: **byte-for-byte identical output**,
+`b0 e4 83 a0 00` / `02 00 00 00 9f`, unchanged. Ruled out.
+
+**The real finding, and why this needs a different method going
+forward**: with both response-side fixes disproven, watched the
+*destination* buffer directly instead of the FIFO - a hardware
+watchpoint on `0xA037FF10` (the exact address confirmed live as the
+`r1` destination-buffer argument at `0x9d78`'s own entry, via `x/1xw
+$r0` at the breakpoint). Its value **before any of this session's
+traced code even ran** was already `0xB0` - the literal first byte of
+the printed "manufacturer" garbage. The two writes the watchpoint went
+on to catch came from two unrelated-looking addresses
+(`0xa080ed74`, `0xa080fd40`) with register state that doesn't
+resemble anything SPI-related (r0/r1/r2/r3 values matching neither the
+`IM7CAM_SPI_BASE` pointer nor any address this file has ever mapped).
+Most likely reading: `0xA037FF10` is ordinary stack space genuinely
+reused by unrelated functions between calls (completely normal - it's
+just a stack address), and the *actual* RDID readback either targets a
+different buffer than the one this session assumed, or the real
+call chain the "SF: Unsupported manufacturer" message reports from
+isn't the `0x9d78` function this file has been tracing at all - meaning
+the working assumption connecting the confirmed-correct opcode write
+(section 8) to the printed failure (section 6) may itself be wrong,
+not just some detail of the response mechanism.
+
+**Where this leaves things**: every concrete, testable hypothesis tried
+so far (three total across sections 8-9) has been disproven by actually
+rebuilding and rerunning against the real boot, not just reasoned about
+- a real, honest track record, not a stall. But blind single-stepping
+has now demonstrably hit diminishing returns for this specific problem:
+each attempt costs a full gdbstub session plus a rebuild, and the last
+two produced zero new information about *where the bug actually is*,
+only where it isn't. Next session should change method, not just try
+another guess:
+1. **Confirm which call actually produces the printed message** first,
+   before touching the device model again - find `"SF: Unsupported
+   manufacturer"`'s real call site (the string's own runtime address
+   didn't resolve via the direct literal-pool search used successfully
+   for every other string in this file, per section 6 - that itself is
+   a clue worth understanding, not a dead end to route around again).
+2. Consider whether a **real vendor GPL source drop exists** for this
+   specific driver (a generic-looking `spi_flash` probe layer, not
+   obviously Fullhan-specific in its structure) rather than continuing
+   pure black-box disassembly - this is the one place in this whole
+   file where the "no GPL source, disassemble everything" constraint
+   (unlike `qemu-ipq5018/board/mr80x.c`'s real vendor source) has
+   genuinely slowed things down enough to be worth spending time
+   searching for an exception, even though section 7 already looked and
+   didn't find one for the SoC as a whole.

@@ -509,13 +509,20 @@ static void im7cam_spi_write_byte(Im7camSpiState *s, uint8_t byte)
             qemu_log_mask(LOG_UNIMP, "im7cam: spi RDSR opcode received\n");
             break;
         default:
-            /* Genuinely new, unrecognized opcode - drop any stale
-             * RDID/RDSR response a *previous* transaction left pending
-             * (see the offset-8 comment in im7cam_spi_write() for why
-             * that can't safely happen at the offset-8 toggle anymore). */
-            s->resp_buf = NULL;
-            s->resp_len = 0;
-            s->resp_pos = 0;
+            /* Deliberately does NOT clear a pending resp_buf here
+             * anymore (an earlier version of this comment/code did).
+             * Live gdbstub tracing (single-stepped ~90 instructions past
+             * the confirmed opcode write) found the real caller is a
+             * loop that re-invokes this same byte-transmit path multiple
+             * times per probe, toggling the offset-8 open/close bracket
+             * (which resets cmd_len) between calls - so a *later*,
+             * unrelated byte in the same overall probe was hitting this
+             * default case and wiping the RDID response before U-Boot's
+             * own read-back loop ran, same root problem as the offset-8
+             * fix below just reached through a different call, not
+             * fixed by that change alone. Still unconfirmed whether this
+             * fully resolves the "SF: Unsupported manufacturer" symptom
+             * - see BRINGUP-NOTES.md section 8/9 for the current status. */
             qemu_log_mask(LOG_UNIMP,
                           "im7cam: spi first-byte opcode=0x%02x "
                           "(unrecognized)\n", byte);
