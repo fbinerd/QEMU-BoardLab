@@ -945,3 +945,187 @@ wall in partition-table loading. Likely the same *class* of bug
 (chunk-size/available-count handling) hitting a different, larger-read
 code path, not yet confirmed. Next step: real trace of the
 `0x9e14`/32-bit-word path specifically.
+
+## 12. `addr_latched` lifecycle chased through three bugs, a real ROM-mapping bug found and fixed, the "32-bit FIFO path" theory disproven, FAST_READ's *real* data path still not found
+
+Autonomous continuation of section 11's open item, same `/loop` task
+(bring the kernel up, document everything). Three separate sub-threads
+this session, in the order they actually happened:
+
+### 12a. `addr_latched` persistence - three fixes, the third one right
+
+Section 11 left `addr_latched` never reset (stuck true forever once a
+FAST_READ latched an address), which section 10's bug already showed
+blocks the *next* transaction's address bytes from accumulating at all.
+Chased through three attempts:
+
+1. Reset `addr_latched` at the same offset-8 "routine bracket" toggle
+   that section 9/10 already knew was NOT a real transaction boundary
+   for `resp_buf` - wrong for the identical reason: this toggle fires
+   constantly mid-transaction, so it cleared `addr_latched` before the
+   real read-back loop ever ran. A live per-byte debug log in
+   `im7cam_spi_next_byte()`'s `addr_latched` branch confirmed it: zero
+   fires during an entire attempted 4096-byte partition read, even
+   though `"spi read command...addr=0x060000"` had genuinely logged
+   moments earlier.
+2. Moved the reset to the *start* of a genuinely new opcode byte
+   (`cmd_len == 0` in `im7cam_spi_write_byte()`) instead - correct
+   *if* every byte reaching that branch really is a new opcode, which
+   turned out to be false (see 12b): the controller's own dummy/filler
+   clock bytes reach this exact branch too (their value doesn't matter
+   to real hardware, only that a clock pulses), and treating every one
+   of them as "transaction start" wiped `addr_latched` after exactly
+   one real byte of the FAST_READ response - regression confirmed live
+   (`read_addr=0x50000 byte=0xd2` logged once, then never again for the
+   second command).
+3. This is as far as the byte-FIFO path was pushed this session before
+   12b's finding made the whole question moot for FAST_READ specifically
+   - see below. The fix from attempt 2 is left in place (a real
+   improvement over attempt 1 either way) but doesn't matter for the
+   actual bulk-read wall, because...
+
+### 12b. FAST_READ never touches the byte-FIFO at all - the "32-bit path" theory from section 11 is wrong
+
+Section 11 guessed the stuck partition-table read might be hitting the
+*other*, 32-bit-wide FIFO drain loop (file offset `0x9e14`) instead of
+the byte-mode one section 10 fixed. Live PC-tagged tracing (see 12c for
+why that took two attempts) disproves this directly: after a FAST_READ
+command latches a real address (`addr=0x050000` or `addr=0x060000`,
+both confirmed correctly decoded), **zero** subsequent accesses to
+`IM7CAM_SPI_REG_AVAIL` (0x24) or `IM7CAM_SPI_REG_DATA` (0x60) ever
+happen - not the byte-mode path, not a 32-bit-wide variant of it,
+nothing. Confirmed two ways: a full instruction-by-instruction PC trace
+from the command latch onward never revisits either offset, and a
+*conditional* hardware breakpoint (`break *0xa0807e80 if $r11 !=
+0xf0e00060`) on the one real byte-copy loop this binary is confirmed to
+use (the one RDID's response drains through, `r11`/`fp` always pinned
+to `0xf0e00060`, the DATA register) never fires across a full boot-to-
+reset cycle - i.e. that shared copy routine is *only* ever invoked with
+the FIFO as its source, RDID/RDSR bytes only, never for a FAST_READ's
+bulk data.
+
+What the trace shows instead, immediately after the address latches:
+a short, fixed sequence (`off=0x54=7`, `off=0x4=<some length-shaped
+value>`, an interrupt-enable-style bit toggle at `off=0x4c`, then a
+single write of `0xFFFFFFFF` to a completely different peripheral block
+at `0xE0300000+0x338`) with **no observed poll loop of any kind
+afterward** - not of `0xE0300000`, not of the SPI block's own status
+registers. The sequence is bit-for-bit identical (same fixed
+`0xa08a0540` destination-looking value, same `0x18000000` and `0x208`
+constants) regardless of which flash address or how large the requested
+read is, which rules out it being a real per-transfer DMA descriptor
+setup - a real one would encode the actual target address/length
+somewhere in that sequence, and this doesn't. Genuinely inconclusive
+- either this is an unrelated generic cache/sync primitive that
+happens to run at a fixed point in the driver's flow (most likely,
+given the "always identical values" evidence), or it's a DMA kickoff
+whose real descriptor lives in a RAM structure this session didn't
+locate. **Not fixed.** This is the actual open item now, not the
+byte-FIFO.
+
+One dead end explicitly ruled out to save future time: it is **not**
+a memory-mapped ("XIP") flash-read window either, despite `im7cam.spi`
+offsets `0x100`/`0x104` being programmed with the fixed constant
+`0xB0000000` on *every* single transaction (RDID included) - looked
+exactly like a hard-wired XIP base register at first. A real backing
+RAM region was built at `0xB0000000` for this theory (see 12c for why
+the first attempt at that was itself buggy) and independently confirmed
+byte-correct via the HMP monitor (`xp /16xb 0xb0060000` → `45 3d cd 28
+...`, the real CramFS magic, byte-for-byte matching the flash dump).
+But a hardware watchpoint on a read of that exact address never fires
+across a full boot-to-reset cycle - the guest genuinely never reads
+from there. The region is left in place (harmless, and correctly built
+this time - see 12c), but it is not the mechanism this driver uses.
+
+Also traced, and also a dead end: the loader function's real arguments
+(found by breaking on its entry, `0xa0821814`, rather than reusing a
+now-stale destination-buffer address from an earlier session -
+`r0`=dest buffer, `r2`=flash offset, both confirmed matching across two
+calls for `partition.txt`/`partitionV2.txt`) point at buffer
+`0xa0398160`. A write-watchpoint on it shows it oscillating between a
+self-referential pointer value and `0`, then finally landing on
+`0x80000003` (bit 31 set - reads as an explicit error/status code, not
+data) - this buffer is a small request/status descriptor, not the
+actual data destination. The real per-byte destination buffer is
+further indirected through it and wasn't reached this session.
+
+### 12c. A real, confirmed, independent bug: `rom_add_blob_fixed()` doesn't create a memory region
+
+Found while chasing 12b's XIP-window theory, and worth its own
+sub-heading because it's a genuine fix, unlike 12b's still-open
+question. `rom_add_blob_fixed()` (the same call this file already uses
+to load the U-Boot image itself at `IM7CAM_RAM_BASE`) only *queues* the
+blob; the actual bytes get written into whatever `MemoryRegion` already
+backs that address at machine-reset time
+(`hw/core/loader.c`'s `rom_reset()` → `address_space_write_rom()`) - it
+does **not** create a region itself. That's harmless when the target
+address is already RAM (true for the U-Boot image), but a first attempt
+at the section 12b XIP window called it against `0xB0000000` with
+nothing mapped there at all, so it silently wrote nowhere - the HMP
+monitor's `xp` confirmed "Cannot access memory" at that address even
+after the "fix" was in place and had rebuilt cleanly. Fixed by building
+a real backing region first (`memory_region_init_ram()` + a direct
+`memcpy()` of the flash bytes + `memory_region_set_readonly()`) and
+*then* adding it as a subregion, the same pattern `im7cam_add_uart()`
+etc. already use for every other device in this file. Confirmed correct
+per 12b above. Kept in the tree even though 12b shows it isn't (yet)
+what unblocks boot, since it's real and cheap and may matter once the
+real bulk-read mechanism is found (a legitimate memory-mapped fast path
+is a very plausible *part* of the real answer, just not triggered the
+way this session assumed).
+
+### 12d. A gdbstub attach gotcha worth recording so it doesn't cost an hour again
+
+Several watchpoint/breakpoint attempts this session hung until the
+external `timeout` killed them, all producing the exact same misleading
+symptom: gdb prints `Cannot execute this command while the target is
+running` for every command after `continue`, even `printf`. Spent real
+effort suspecting a broken/slow software-watchpoint single-step penalty
+before finding the actual cause: `qemu-system-arm` was started **without
+`-S`** (free-running) and gdb attached to it already-running via `target
+remote`. Attaching gdb to an already-running QEMU target this way
+doesn't reliably leave it in a state where `continue` behaves
+synchronously in `-batch` scripts - every subsequent scripted command
+races ahead of the still-running target and fails with that message.
+Always start the target with `-S` (paused at the reset vector) for any
+scripted gdbstub session in this file's workflow, even when the
+breakpoint of interest is deep into boot - a plain software breakpoint
+reached fast (this session's were all reached within a couple of real
+seconds) costs nothing by starting from the very first instruction
+instead of attaching mid-flight.
+
+### 12e. Continuation checkpoint reproduced before new work
+
+Before starting the next investigation, rebuilt the Docker image from
+the exact working tree recorded in this section and booted it for 20
+seconds with the original `0_U-Boot.bin` plus the real 8 MiB SPI dump.
+The build completed cleanly and the runtime result reproduced the known
+wall exactly: real U-Boot banner, 64 MiB DRAM, then `fail to load
+partition.txt from 60000` / `fail to init partinfo`, followed by the TFTP
+fallback. This is the baseline against which the next instrumentation
+will be compared.
+
+Also corrected two source comments and `run.sh`'s header while making
+this checkpoint: the source had accidentally promoted the already-
+disproved XIP hypothesis to fact, and the runner still described the old
+section-6 JEDEC-ID failure. The XIP mapping itself remains in place for
+the reasons in 12b/12c; only the claim about what the guest actually does
+was corrected.
+
+## Status (updated again, section 12)
+
+UART and the SPI ID probe remain solid. The partition-table wall is
+now understood precisely enough to rule out two plausible theories
+(32-bit FIFO path, memory-mapped XIP window) with real evidence rather
+than guesswork, and a real independent bug (`rom_add_blob_fixed()`
+needing a pre-existing backing region) was found and fixed along the
+way - confirmed harmless/correct, kept in the tree. The actual
+mechanism FAST_READ uses to move bulk data - almost certainly *some*
+kind of DMA/descriptor hand-off through `0xE0300000`, given the driver
+demonstrably does something there right after every FAST_READ command
+and before giving up - is still not identified. Next step: find where
+the real per-transfer parameters (destination address, real length) get
+written, if they exist at all outside of `0xE0300000`'s fixed-looking
+sequence - possibly in a RAM-resident descriptor structure built
+*before* the register pokes rather than in the registers themselves,
+which this session didn't check.

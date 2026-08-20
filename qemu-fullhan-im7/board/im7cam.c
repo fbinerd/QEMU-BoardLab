@@ -221,6 +221,15 @@
  * nothing: the copy loop that would have consulted them never ran. */
 #define IM7CAM_SPI_REG_AVAIL 0x24
 
+/* Experimental memory-mapped ("XIP") flash window. Registers 0x100/0x104
+ * are programmed with 0xB0000000 on every transaction, so this was a
+ * plausible bulk-read path. Section 12b disproved it for the currently
+ * observed FAST_READ flow: a hardware read-watchpoint on
+ * 0xB0000000 + the requested flash offset never fires. Keep the correctly
+ * backed, read-only mapping as a cheap hardware feature candidate, but do
+ * not treat it as the mechanism that will unblock partition loading. */
+#define IM7CAM_SPI_XIP_BASE 0xB0000000
+
 /* ============================================================
  * Catch-all logging stub for every peripheral - literally everything
  * right now, this board has no real device models yet. Reads always
@@ -422,6 +431,7 @@ static void im7cam_add_uart(MemoryRegion *sysmem)
 
 typedef struct Im7camSpiState {
     MemoryRegion iomem;
+    MemoryRegion xip;
     uint8_t *flash_data;
     size_t flash_size;
     uint8_t cmd_buf[4];
@@ -493,6 +503,11 @@ static uint8_t im7cam_spi_next_byte(Im7camSpiState *s)
         if (s->flash_data && s->read_addr < s->flash_size) {
             byte = s->flash_data[s->read_addr];
         }
+        if (s->read_addr < 4 || (s->read_addr % 512) == 0) {
+            qemu_log_mask(LOG_UNIMP,
+                          "im7cam: spi flash byte read_addr=0x%x byte=0x%02x\n",
+                          s->read_addr, byte);
+        }
         s->read_addr++;
         return byte;
     }
@@ -559,7 +574,22 @@ static void im7cam_spi_write_byte(Im7camSpiState *s, uint8_t byte)
          * READ/FAST_READ's 3-byte address phase below. Both confirmed
          * needed by real trace output: without this, U-Boot's own flash
          * probe read garbage left over from a previous READ command's
-         * address-latched state and reported a bogus manufacturer ID. */
+         * address-latched state and reported a bogus manufacturer ID.
+         *
+         * addr_latched resets HERE now, not at the offset-8 toggle
+         * (section 11 moved it - that toggle turned out to be a routine
+         * per-phase bracket the driver hits constantly, not a real
+         * transaction boundary, and clearing state there broke both
+         * resp_buf, section 9, and addr_latched, section 11, before
+         * their respective read-back loops ever ran). This is the
+         * actual transaction boundary: a genuinely new opcode byte
+         * starting to arrive. Without this, a *second* real FAST_READ
+         * command (a different address than the first) never got its
+         * address bytes accumulated at all - the stale addr_latched=true
+         * from the *previous* successful read blocked the address-byte
+         * branch below unconditionally, so every read after the first
+         * one silently kept re-using the first read's address. */
+        s->addr_latched = false;
         s->cmd_buf[s->cmd_len++] = byte;
         switch (byte) {
         case 0x9F:
@@ -617,23 +647,19 @@ static void im7cam_spi_write(void *opaque, hwaddr offset, uint64_t value,
     Im7camSpiState *s = opaque;
 
     if (offset == 0x08 && value == 0) {
-        /* NOT a full protocol reset, despite looking like one at first
-         * (see the big comment above im7cam_spi_write_byte(), which
-         * originally cleared resp_buf here too). Live gdbstub tracing
-         * (a write watchpoint on the FIFO address, single-stepped)
-         * caught the real sequence: opcode 0x9F genuinely reaches this
-         * device (confirmed - "im7cam: spi RDID opcode received" logs),
-         * but offset 8 gets toggled 0-then-1 again immediately after,
-         * as a routine open/close bracket around a buffer op unrelated
-         * to the pending RDID response - clearing resp_buf here wiped
-         * the JEDEC ID before U-Boot's own read-back loop ever ran,
-         * which is exactly why "SF: Unsupported manufacturer" kept
-         * reporting stale/garbage bytes even after the opcode handling
-         * above was added. cmd_len/addr_latched (the READ/FAST_READ
-         * address-phase accumulator) still reset here - only resp_buf's
-         * lifetime changed. */
+        /* NOT a full protocol reset - a routine per-phase open/close
+         * bracket the driver toggles constantly (confirmed twice now,
+         * same bug class each time): first for resp_buf (RDID reply
+         * wiped before readback - section 9's fix), now for
+         * addr_latched too (section 11: a real FAST_READ command
+         * latched correctly - "spi read command, opcode=0x0b
+         * addr=0x060000" logged - but zero bytes were ever pulled from
+         * flash afterward, confirmed by a temporary per-byte debug log
+         * that never fired at all during a whole 4096-byte partition-
+         * table read). Only cmd_len resets here now - both resp_buf and
+         * addr_latched need to survive this toggle to reach the actual
+         * read-back loop the driver runs after it. */
         s->cmd_len = 0;
-        s->addr_latched = false;
         return;
     }
     if (offset == IM7CAM_SPI_REG_DATA) {
@@ -679,6 +705,30 @@ static void im7cam_add_spi(MemoryRegion *sysmem, const char *image_path)
     memory_region_init_io(&s->iomem, NULL, &im7cam_spi_ops, s,
                            "im7cam.spi", IM7CAM_SPI_SIZE);
     memory_region_add_subregion(sysmem, IM7CAM_SPI_BASE, &s->iomem);
+
+    /* See IM7CAM_SPI_XIP_BASE's comment: this remains an experimental
+     * mapping, not a confirmed bulk-read path. NOT rom_add_blob_fixed():
+     * that call only
+     * *writes into* whatever MemoryRegion already backs the target
+     * address at machine-reset time (see hw/core/loader.c's rom_reset(),
+     * which calls address_space_write_rom() - it never creates a region
+     * itself). Nothing was mapped at 0xB0000000, so an earlier version of
+     * this fix silently wrote nowhere - confirmed via the HMP monitor's
+     * `xp` returning "Cannot access memory" there even after the "fix".
+     * A real backing RAM region, populated directly, is required. Own
+     * copy (not aliased to s->flash_data) so the small RDID/RDSR PIO
+     * path's ownership of that buffer is untouched. Read-only: nothing
+     * in this bring-up writes flash. */
+    if (s->flash_data && s->flash_size) {
+        void *xip_ptr;
+
+        memory_region_init_ram(&s->xip, NULL, "im7cam.spi-xip",
+                                s->flash_size, &error_fatal);
+        xip_ptr = memory_region_get_ram_ptr(&s->xip);
+        memcpy(xip_ptr, s->flash_data, s->flash_size);
+        memory_region_set_readonly(&s->xip, true);
+        memory_region_add_subregion(sysmem, IM7CAM_SPI_XIP_BASE, &s->xip);
+    }
 }
 
 /* ============================================================
