@@ -286,3 +286,33 @@ automatic GPIO-triggered one.
 The OEM image was restored to the physical chip immediately after this
 result and independently reread/verified - the device is back to its known
 good, original state.
+
+### Confirmed: it is a signature check, not a checksum (2026-08-20)
+
+Separately, `/media/dados_2tb/opipc` (a from-scratch, modern GPL U-Boot
+2026.07 port for this board, built by a different tool the user runs -
+not a patch of the vendor binary at all) was also tested. Its first build
+targeted the wrong CPU (Cortex-A7/ARMv7-A; assumed `BPIALL` etc.) and hung
+identically for an unrelated, independently-confirmed reason (undefined
+instruction on ARMv6/ARM1176, the CPU this device's own extracted Linux
+kernel `proc_info` table actually identifies - see
+`arm-selfmod-lab/qemu-fullhan-im7/BRINGUP-NOTES.md` section 13d). Once
+retargeted to ARM1176JZF-S/ARMv6, that from-scratch U-Boot boots correctly
+in QEMU (real banner, correct CPU string, DRAM, UART, reaches the autoboot
+countdown) - but real hardware researched by that same tool independently
+confirmed the actual mechanism blocking every one of this repo's binary
+patches: **the SoC's boot ROM verifies the U-Boot partition's signature
+before executing it.** Not a checksum this repo could have brute-forced or
+reverse engineered around - a real cryptographic signature check, which
+requires the vendor's (Dahua/Fullhan's) private signing key to satisfy.
+
+This closes off *both* remaining strategies from this file's earlier
+"practical implication" paragraph: neither patching the existing signed
+U-Boot binary nor replacing it with an unsigned from-scratch build can
+boot on real hardware, regardless of how correct the code inside either
+one is. The only paths that remain viable on this device are ones that
+don't require the boot ROM to accept a different U-Boot at all - the
+already-confirmed-working interactive TFTP recovery (OEM `'*'` console
+unlock + manual `tftpboot`/`bootm`, no U-Boot modification needed), or
+some other entry point below the boot ROM's own verification (out of
+scope for anything discovered so far).
