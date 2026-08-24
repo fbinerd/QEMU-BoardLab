@@ -1,0 +1,45 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * The factory DT expects BL30's SCP firmware behind the MHU shared-memory
+ * window.  This board starts at BL33 and intentionally has no BL30, so do
+ * not let the vendor SCPI probe wait forever for a mailbox response.
+ */
+/ {
+	fragment@0 {
+		target-path = "/mhu@c883c400";
+
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	fragment@1 {
+		target-path = "/scpi_clocks";
+
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	fragment@2 {
+		target-path = "/emmc@d0074000";
+
+		__overlay__ {
+			/delete-property/ cap-sd-highspeed;
+			/delete-property/ cap-mmc-highspeed;
+			voltage-ranges = <3300 3400>;
+			max-frequency = <400000>;
+
+			emmc {
+				caps = "MMC_CAP_8_BIT_DATA",
+				       "MMC_CAP_NONREMOVABLE",
+				       "MMC_CAP_HW_RESET",
+				       "MMC_CAP_ERASE",
+				       "MMC_CAP_CMD23";
+				f_max = <400000>;
+			};
+		};
+	};
+};

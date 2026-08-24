@@ -5,4 +5,7 @@ qemu-ipq5018/images/
 qemu-fullhan-im7/vendor/
 qemu-fullhan-im7/out/
 qemu-fullhan-im7/images/
+qemu-amlogic-gxl/vendor/
+qemu-amlogic-gxl/out/
+qemu-amlogic-gxl/images/
 __pycache__/

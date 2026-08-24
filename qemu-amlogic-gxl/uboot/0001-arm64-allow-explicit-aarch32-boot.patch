@@ -1,0 +1,9 @@
+diff --git a/arch/arm/lib/bootm.c b/arch/arm/lib/bootm.c
+--- a/arch/arm/lib/bootm.c
++++ b/arch/arm/lib/bootm.c
+@@ -277,3 +277,4 @@ static void switch_to_el1(void)
+ 	if ((IH_ARCH_DEFAULT == IH_ARCH_ARM64) &&
+-	    (images.os.arch == IH_ARCH_ARM))
++	    ((images.os.arch == IH_ARCH_ARM) ||
++	     env_get_yesno("boot_aarch32") == 1))
+ 		armv8_switch_to_el1(0, (u64)gd->bd->bi_arch_number,

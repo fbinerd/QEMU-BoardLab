@@ -1,0 +1,4 @@
+config GXL_P211
+    bool
+    default y
+    depends on TCG && AARCH64
